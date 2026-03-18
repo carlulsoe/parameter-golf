@@ -2,7 +2,7 @@ Review exactly one just-finished Parameter Golf experiment in the current reposi
 
 Context to read before acting:
 - `results.tsv`
-- the latest relevant log under `logs/`
+- the fetched remote log under `remote_logs/`
 - `git log --oneline -n 5`
 - the diff and commit for the most recent experiment commit
 - `gpt-pro.md`, `ideas/README.md`, and `ideas_wild/README.md` if needed
@@ -25,7 +25,11 @@ Protocol:
    - `revert`
 5. If `keep`, leave the commit in place.
 6. If `revert`, revert only the latest experiment commit and leave the repo clean.
-7. Append one TSV row to `reviews.tsv` with:
+7. Update the latest row in `results.tsv`:
+   - set `decision`
+   - preserve existing fields
+   - append your short decision summary to `notes`
+8. Append one TSV row to `reviews.tsv` with:
    - `iteration`
    - `timestamp`
    - `model`
@@ -34,8 +38,10 @@ Protocol:
    - `commit`
    - `summary`
    - `findings`
-8. Also append a short review note onto the latest `results.tsv` row by updating its `notes` field, preserving the existing experiment notes and adding your decision summary.
-9. Stop after one completed review.
+9. Commit the ledger updates so the repo is clean at the end:
+   - if `keep`, make one commit that records the updated `results.tsv` and `reviews.tsv`
+   - if `revert`, first make the revert commit, then make one commit that records the updated `results.tsv` and `reviews.tsv`
+10. Stop after one completed review.
 
 Rules:
 - Do not run another training job.
