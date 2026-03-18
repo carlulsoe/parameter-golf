@@ -14,8 +14,8 @@ Goal:
 Protocol:
 1. Inspect `git status`, recent commits, `results.tsv`, and recent logs.
 2. Choose exactly one focused idea or ablation to test.
-3. Make only the code changes needed for that one idea.
-4. Commit your experiment before running it so it can be reverted cleanly if it loses.
+3. Make only the code changes needed for that one idea. You may edit `train_gpt.py` directly.
+4. Commit your experiment before running it so a later reviewer can revert it cleanly if it loses.
 5. Run exactly one training/eval command using the environment variables already provided by the harness.
 6. Parse the run log for:
    - `final_int8_zlib_roundtrip_exact`
@@ -32,8 +32,8 @@ Protocol:
    - `commit`
    - `idea`
    - `notes`
-8. If the run improves the best prior kept `val_bpb`, keep the commit.
-9. If it does not improve, revert only the commit you just made.
+8. Leave the repo with your experiment commit still checked out so a separate fresh reviewer instance can judge it.
+9. Stop after one completed experiment iteration.
 
 Rules:
 - Do not ask for confirmation.
@@ -41,5 +41,5 @@ Rules:
 - Do not change the tokenizer or dataset export path unless that is the explicit experiment.
 - Prefer bounded changes that can be evaluated in one run.
 - Keep the repo runnable after the iteration.
-- Only revert your own just-created commit, not unrelated history.
+- Do not revert the experiment commit yourself. The reviewer handles the keep/revert decision.
 - Stop after one completed experiment iteration.
