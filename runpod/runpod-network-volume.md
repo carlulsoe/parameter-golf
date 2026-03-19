@@ -1,0 +1,220 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.runpod.io/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Network volumes
+
+> Persistent, portable storage for your AI workloads.
+
+export const InstantClusterTooltip = () => {
+  return <Tooltip headline="Instant Cluster" tip="A managed compute cluster with high-speed networking for multi-node distributed workloads like training large AI models." cta="Learn more about Instant Clusters" href="/instant-clusters">Instant Cluster</Tooltip>;
+};
+
+export const ColdStartTooltip = () => {
+  return <Tooltip headline="Cold start" tip="The time between when an endpoint with no running workers receives a request, and when a worker is fully warmed up and ready to handle the request." cta="Learn more about cold starts" href="/serverless/overview#cold-starts">cold start</Tooltip>;
+};
+
+export const WorkersTooltip = () => {
+  return <Tooltip headline="Worker" tip="A container that runs your application code and processes requests to your Serverless endpoint. Workers are automatically started and stopped by Runpod to handle traffic spikes and ensure optimal resource utilization." cta="Learn more about workers" href="/serverless/workers/overview">workers</Tooltip>;
+};
+
+export const ServerlessTooltip = () => {
+  return <Tooltip headline="Serverless" tip="A cloud computing platform that allows you to deploy AI/ML applications without provisioning or managing servers." cta="Learn more about Serverless" href="/serverless/overview">Serverless</Tooltip>;
+};
+
+export const PodsTooltip = () => {
+  return <Tooltip headline="Pods" tip="Dedicated GPU or CPU instances for containerized AI/ML workloads." cta="Learn more about Pods" href="/pods/overview">Pods</Tooltip>;
+};
+
+Network volumes provide persistent storage that exists independently of your compute resources. Data is retained when <PodsTooltip /> terminate or <ServerlessTooltip /> <WorkersTooltip /> scale to zero. Use them to share data across multiple machines and Runpod products.
+
+Network volumes are backed by high-performance NVMe SSDs with transfer speeds of 200-400 MB/s (up to 10 GB/s peak).
+
+## Pricing
+
+* **First 1 TB**: \$0.07/GB/month
+* **Beyond 1 TB**: \$0.05/GB/month
+
+<Warning>
+  If your account lacks funds to cover storage costs, your network volume may be terminated, after which data cannot be recovered.
+</Warning>
+
+## Create a network volume
+
+<Note>
+  Volume size can be increased later but cannot be decreased. For volumes beyond 4 TB, [contact support](https://www.runpod.io/contact).
+</Note>
+
+<Tabs>
+  <Tab title="Web console">
+    1. Navigate to the [Storage page](https://www.console.runpod.io/user/storage).
+    2. Click **New Network Volume**.
+    3. Select a datacenter, enter a name, and specify size in GB.
+    4. Click **Create Network Volume**.
+  </Tab>
+
+  <Tab title="REST API">
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    curl --request POST \
+      --url https://rest.runpod.io/v1/networkvolumes \
+      --header 'Authorization: Bearer RUNPOD_API_KEY' \
+      --header 'Content-Type: application/json' \
+      --data '{
+      "name": "my-network-volume",
+      "size": 100,
+      "dataCenterId": "US-KS-2"
+    }'
+    ```
+
+    See [network volumes API reference](/api-reference/network-volumes/POST/networkvolumes) for details.
+  </Tab>
+</Tabs>
+
+## Network volumes for Serverless
+
+Network volumes mount at `/runpod-volume` within Serverless workers. Benefits include reduced <ColdStartTooltip /> times (no re-downloading models), lower costs, and centralized data management.
+
+**Attach to an endpoint:**
+
+1. Go to [Serverless](https://www.console.runpod.io/serverless/user/endpoints) and select your endpoint.
+2. Click **Manage** → **Edit Endpoint**.
+3. Expand **Advanced**, click **Network Volumes**, and select volumes to attach.
+4. Click **Save Endpoint**.
+
+<Warning>
+  Writing to the same volume from multiple workers simultaneously may cause data corruption. Handle concurrent write access in your application logic.
+</Warning>
+
+### Attach multiple volumes
+
+Attaching a single network volume constrains worker deployments to that volume's datacenter, which may limit GPU availability and reduce failover options.
+
+To improve availability and reduce downtime during datacenter maintenance, attach multiple network volumes from different datacenters. Workers are distributed across these datacenters, with each worker receiving exactly one volume based on its assigned location.
+
+<Note>
+  You can only select one network volume per datacenter.
+</Note>
+
+<Warning>
+  **Data does not sync automatically between volumes.** To make the same data available to all workers regardless of datacenter, manually copy data using the [S3-compatible API](/storage/s3-api) or [runpodctl](#using-runpodctl).
+</Warning>
+
+## Network volumes for Pods
+
+Network volumes replace the Pod's default volume disk, typically mounted at `/workspace`.
+
+<Note>
+  Network volumes are only available for Pods in the [Secure Cloud](/pods/overview#pod-types).
+</Note>
+
+**Attach to a Pod:**
+
+1. Navigate to [Pods](https://www.console.runpod.io/pods) and click **Deploy**.
+2. Select **Network Volume** and choose your volume.
+3. Select a GPU type (available options depend on volume location).
+4. Configure template and other settings, then click **Deploy On-Demand**.
+
+Network volumes must be attached during Pod deployment. They cannot be attached or detached later without deleting the Pod.
+
+## Network volumes for Instant Clusters
+
+Network volumes for <InstantClusterTooltip />s work like Pods. Attach during cluster creation; mounts at `/workspace` on each node.
+
+1. Go to [Instant Clusters](https://www.console.runpod.io/cluster) and click **Create Cluster**.
+2. Click **Network Volume** and select the volume to attach.
+3. Configure other settings and click **Deploy Cluster**.
+
+## S3-compatible API
+
+The [S3-compatible API](/storage/s3-api) lets you manage files on network volumes without launching compute resources. Upload datasets before launching Pods, automate workflows with standard S3 tools, or pre-populate volumes to improve cold start performance.
+
+## Migrate files between volumes
+
+### Using runpodctl
+
+The simplest way to migrate files between network volumes is to use `runpodctl send` and `receive` on two running Pods:
+
+<Steps>
+  <Step title="Deploy two Pods">
+    Deploy Pods with the source and destination volumes attached. Open web terminals on both.
+  </Step>
+
+  <Step title="Send from source">
+    On the source Pod:
+
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    cd /workspace
+    runpodctl send *
+    ```
+
+    Copy the receive command from the output.
+  </Step>
+
+  <Step title="Receive on destination">
+    On the destination Pod:
+
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    cd /workspace
+    runpodctl receive 8338-galileo-collect-fidel  # Use your code
+    ```
+  </Step>
+</Steps>
+
+### Using rsync over SSH
+
+For faster migration speed and more reliability for large transfers, you can use `rsync` over SSH on two running Pods:
+
+<Steps>
+  <Step title="Deploy two Pods">
+    Deploy Pods with source and destination volumes attached.
+  </Step>
+
+  <Step title="Generate SSH key on source">
+    On the source Pod, install required packages and generate an SSH key pair:
+
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    apt update && apt install -y rsync
+    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+    cat ~/.ssh/id_ed25519.pub
+    ```
+
+    Copy the public key.
+  </Step>
+
+  <Step title="Configure destination Pod">
+    On the destination Pod, install required packages and add the source Pod's public key to `authorized_keys`:
+
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    apt update && apt install -y vim rsync && \
+    ip=$(printenv RUNPOD_PUBLIC_IP) && \
+    port=$(printenv RUNPOD_TCP_PORT_22) && \
+    echo "rsync -avzP --inplace -e \"ssh -p $port\" /workspace/ root@$ip:/workspace" && \
+    vi ~/.ssh/authorized_keys
+    ```
+
+    In the editor that opens, paste the public key you copied from the source Pod, then save and exit (press `Esc`, type `:wq`, and press `Enter`).
+
+    The command above also displays the `rsync` command you'll need to run on the source Pod. Copy this command for the next step.
+  </Step>
+
+  <Step title="Run rsync on source Pod">
+    On the source Pod, run the `rsync` command from the previous step.
+
+    If you didn't copy it, you can construct it manually using the destination Pod's IP address and port number:
+
+    ```bash  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    # Replace DESTINATION_PORT and DESTINATION_IP with values from the destination Pod
+    rsync -avzP --inplace -e "ssh -p DESTINATION_PORT" /workspace/ root@DESTINATION_IP:/workspace
+
+    # Example:
+    rsync -avzP --inplace -e "ssh -p 18598" /workspace/ root@157.66.254.13:/workspace
+    ```
+
+    <Tip>
+      You can run the `rsync` command multiple times if the transfer is interrupted. The `--inplace` flag ensures that `rsync` resumes from where it left off rather than starting over.
+    </Tip>
+  </Step>
+</Steps>
+
+
+Built with [Mintlify](https://mintlify.com).
