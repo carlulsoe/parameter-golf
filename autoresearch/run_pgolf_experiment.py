@@ -1515,6 +1515,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "queued reviewed patches, remote execution, and post-review decisions."
         )
     )
+    parser.add_argument("--repo-dir", default=os.environ.get("REPO_DIR"))
     parser.add_argument("--proposer-model", default=os.environ.get("PROPOSER_MODEL", "gpt-5.4"))
     parser.add_argument("--pre-review-model", default=os.environ.get("PRE_REVIEW_MODEL"))
     parser.add_argument("--post-review-model", default=os.environ.get("POST_REVIEW_MODEL"))
@@ -1541,7 +1542,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    repo_dir = Path.cwd()
+    repo_dir = Path(args.repo_dir).expanduser() if args.repo_dir else Path.cwd()
     if shutil.which("codex") is None:
         raise ControllerError("codex CLI not found in PATH")
     if (
