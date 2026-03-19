@@ -888,11 +888,12 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 try:
-    _SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(
+    _SDPA_SIGNATURE_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(
         F.scaled_dot_product_attention
     ).parameters
 except (TypeError, ValueError):
-    _SDPA_SUPPORTS_ENABLE_GQA = False
+    _SDPA_SIGNATURE_SUPPORTS_ENABLE_GQA = False
+_SDPA_USE_ENABLE_GQA = _SDPA_SIGNATURE_SUPPORTS_ENABLE_GQA and bool(int(os.environ.get("SDPA_USE_ENABLE_GQA", "0")))
 
 
 class CausalSelfAttention(nn.Module):
@@ -934,7 +935,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if _SDPA_SUPPORTS_ENABLE_GQA:
+        if _SDPA_USE_ENABLE_GQA:
             y = F.scaled_dot_product_attention(
                 q,
                 k,
