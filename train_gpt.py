@@ -310,6 +310,11 @@ INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -319,8 +324,11 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -348,6 +356,71 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+def restore_passthrough_tensor(name: str, stored: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    out_t = stored.detach().to("cpu").contiguous()
+    orig_dtype = passthrough_orig_dtypes.get(name)
+    if isinstance(orig_dtype, str):
+        out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+    return out_t
+
+def dequantize_quantized_tensor(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
+    if s.ndim > 0:
+        s32 = s.to(dtype=torch.float32)
+        return (q.float() * s32.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+    return (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+
+def normalized_mae(reference: Tensor, reconstructed: Tensor) -> float:
+    ref32 = reference.float()
+    recon32 = reconstructed.float()
+    denom = max(float(ref32.abs().mean().item()), 1e-12)
+    return float((recon32 - ref32).abs().mean().item() / denom)
+
+def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
+    q, s = quantize_float_tensor(t)
+    quantized_recon = dequantize_quantized_tensor(q, s, dtype=t.dtype)
+    candidate_orig_dtypes: dict[str, str] = {}
+    kept = keep_float_tensor(name, t, candidate_orig_dtypes)
+    kept_recon = restore_passthrough_tensor(name, kept, candidate_orig_dtypes)
+    quantized_error = normalized_mae(t, quantized_recon)
+    keep_error = normalized_mae(t, kept_recon)
+    return {
+        "name": name,
+        "estimated_gain": quantized_error - keep_error,
+        "quantized_error": quantized_error,
+        "keep_error": keep_error,
+        "quantized_payload_bytes": tensor_nbytes(q) + tensor_nbytes(s),
+        "keep_payload_bytes": tensor_nbytes(kept),
+    }
+
+def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
+    if not INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
+        return None
+    candidates: list[dict[str, object]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point():
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
+            continue
+        if not matches_name_patterns(name, INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS):
+            continue
+        candidates.append(score_keep_float_candidate(name, t))
+    if not candidates:
+        return {
+            "candidate_count": 0,
+            "name": "",
+            "selected_name": "",
+            "estimated_gain": 0.0,
+            "quantized_error": 0.0,
+            "keep_error": 0.0,
+            "quantized_payload_bytes": 0,
+            "keep_payload_bytes": 0,
+        }
+    best = max(candidates, key=lambda item: (float(item["estimated_gain"]), -int(item["keep_payload_bytes"])))
+    best["candidate_count"] = len(candidates)
+    best["selected_name"] = str(best["name"])
+    return best
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -360,9 +433,34 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    auto_keep = select_auto_keep_float_tensor(state_dict)
+    selected_auto_keep_name = ""
+    if auto_keep is not None:
+        selected_auto_keep_name = str(auto_keep["selected_name"])
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "int8_payload_bytes",
+            "large_keep_tensor_count",
+            "large_keep_payload_bytes",
+            "auto_keep_tensor_count",
+            "auto_keep_payload_bytes",
+        ),
         0,
+    )
+    stats["auto_keep_candidate_count"] = int(auto_keep["candidate_count"]) if auto_keep is not None else 0
+    stats["auto_keep_selected_name"] = selected_auto_keep_name
+    stats["auto_keep_estimated_gain"] = float(auto_keep["estimated_gain"]) if auto_keep is not None else 0.0
+    stats["auto_keep_quantized_error"] = float(auto_keep["quantized_error"]) if auto_keep is not None else 0.0
+    stats["auto_keep_keep_error"] = float(auto_keep["keep_error"]) if auto_keep is not None else 0.0
+    stats["auto_keep_quantized_payload_bytes"] = int(auto_keep["quantized_payload_bytes"]) if auto_keep is not None else 0
+    stats["auto_keep_keep_payload_bytes"] = int(auto_keep["keep_payload_bytes"]) if auto_keep is not None else 0
+    stats["auto_keep_extra_payload_bytes"] = (
+        stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
     )
 
     for name, tensor in state_dict.items():
@@ -379,12 +477,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or any(
-            pattern in name for pattern in INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS
-        ):
+        keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
+        keep_auto = name == selected_auto_keep_name
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            if keep_large:
+                stats["large_keep_tensor_count"] += 1
+                stats["large_keep_payload_bytes"] += tensor_nbytes(kept)
+            if keep_auto:
+                stats["auto_keep_tensor_count"] += 1
+                stats["auto_keep_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         stats["num_float_tensors"] += 1
@@ -425,11 +529,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
+        out[name] = restore_passthrough_tensor(name, t, passthrough_orig_dtypes)
     return out
 
 
@@ -1122,6 +1222,24 @@ def main() -> None:
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        if INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
+            log0(
+                "Int8 auto-keep selector: "
+                f"candidates:{quant_stats['auto_keep_candidate_count']} "
+                f"selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
+                f"estimated_gain:{quant_stats['auto_keep_estimated_gain']:.8f} "
+                f"quantized_error:{quant_stats['auto_keep_quantized_error']:.8f} "
+                f"keep_error:{quant_stats['auto_keep_keep_error']:.8f}"
+            )
+            log0(
+                "Int8 auto-keep bytes: "
+                f"large_tensors:{quant_stats['large_keep_tensor_count']} "
+                f"large_payload:{quant_stats['large_keep_payload_bytes']} "
+                f"selected_tensors:{quant_stats['auto_keep_tensor_count']} "
+                f"selected_payload:{quant_stats['auto_keep_payload_bytes']} "
+                f"selected_quantized_payload:{quant_stats['auto_keep_quantized_payload_bytes']} "
+                f"selected_extra_payload:{quant_stats['auto_keep_extra_payload_bytes']}"
+            )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
