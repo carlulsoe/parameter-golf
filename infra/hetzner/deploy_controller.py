@@ -182,6 +182,7 @@ def remote_prepare_script(args: argparse.Namespace) -> str:
             require_uv,
             require_codex,
             f"git config --global --add safe.directory {repo_dir}",
+            f"git config --global --add safe.directory {repo_dir}/.git",
             f"systemctl --user stop {service_name} >/dev/null 2>&1 || true",
         ]
     )
@@ -191,6 +192,7 @@ def remote_finalize_script(args: argparse.Namespace) -> str:
     service_name = shlex.quote(args.service_name)
     remote_systemd_dir = remote_shell_path(args.remote_systemd_dir).rstrip("/")
     service_file = shlex.quote(f"{remote_systemd_dir}/{args.service_name}.service")
+    remote_repo_dir = shlex.quote(remote_shell_path(args.remote_repo_dir))
     export_path = f'export PATH="{SERVICE_PATH.replace("%h", "$HOME")}"'
     require_systemctl = (
         "command -v systemctl >/dev/null 2>&1 || "
@@ -201,6 +203,9 @@ def remote_finalize_script(args: argparse.Namespace) -> str:
         export_path,
         require_systemctl,
         f"test -f {service_file}",
+        f"chown -R \"$USER\":\"$USER\" {remote_repo_dir}",
+        f"git config --global --add safe.directory {remote_repo_dir}",
+        f"git config --global --add safe.directory {remote_repo_dir}/.git",
         "systemctl --user daemon-reload",
         f"systemctl --user enable {service_name}",
     ]
