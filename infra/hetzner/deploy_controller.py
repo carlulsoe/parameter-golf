@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import tempfile
@@ -188,6 +189,8 @@ def remote_prepare_script(args: argparse.Namespace) -> str:
             export_path,
             require_uv,
             require_codex,
+            f"git config --global user.name {shlex.quote(args.git_user_name)}",
+            f"git config --global user.email {shlex.quote(args.git_user_email)}",
             f"git config --global --add safe.directory {repo_dir}",
             f"git config --global --add safe.directory {repo_dir}/.git",
             f"systemctl --user stop {service_name} >/dev/null 2>&1 || true",
@@ -211,6 +214,8 @@ def remote_finalize_script(args: argparse.Namespace) -> str:
         require_systemctl,
         f"test -f {service_file}",
         f"chown -R \"$USER\":\"$USER\" {remote_repo_dir}",
+        f"git config --global user.name {shlex.quote(args.git_user_name)}",
+        f"git config --global user.email {shlex.quote(args.git_user_email)}",
         f"git config --global --add safe.directory {remote_repo_dir}",
         f"git config --global --add safe.directory {remote_repo_dir}/.git",
         "systemctl --user daemon-reload",
@@ -231,6 +236,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", required=True, help="SSH destination for the controller host")
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--identity", type=Path, default=None, help="Optional SSH identity file")
+    parser.add_argument(
+        "--git-user-name",
+        default=os.environ.get("PGOLF_GIT_USER_NAME", "carlulsoe"),
+        help="Git committer name configured on the controller host",
+    )
+    parser.add_argument(
+        "--git-user-email",
+        default=os.environ.get("PGOLF_GIT_USER_EMAIL", "carlulsoe@gmail.com"),
+        help="Git committer email configured on the controller host",
+    )
     parser.add_argument(
         "--env-file",
         type=Path,

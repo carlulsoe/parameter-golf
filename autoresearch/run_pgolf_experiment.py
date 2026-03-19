@@ -23,6 +23,10 @@ RESULTS_HEADER = (
 )
 REVIEWS_HEADER = "iteration\ttimestamp\tmodel\trun_id\tdecision\tcommit\tsummary\tfindings\n"
 RUN_ID_PATTERN = re.compile(r"^(?P<tag>.+)_(?P<num>\d+)$")
+BASELINE_IDEA = "baseline"
+BASELINE_HYPOTHESIS = "establish initial reference metric and verify the harness"
+BASELINE_EXPECTED_SIGNALS = "valid final metric line, valid size line, stable completion"
+BASELINE_NOTES = "bootstrap baseline run from the reviewed base commit"
 
 
 class ControllerError(RuntimeError):
@@ -93,6 +97,13 @@ class PreReviewDecision:
 
 @dataclass(frozen=True)
 class PostReviewDecision:
+    decision: str
+    summary: str
+    findings: str
+
+
+@dataclass(frozen=True)
+class BaselineReviewDecision:
     decision: str
     summary: str
     findings: str
@@ -233,6 +244,16 @@ def latest_kept_bpb(results_file: Path) -> str:
     if not values:
         return ""
     return f"{min(values):.8f}"
+
+
+def has_completed_result(results_file: Path) -> bool:
+    for line in read_lines(results_file)[1:]:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 8 or parts[5] not in {"keep", "revert"}:
+            continue
+        if parts[6] and parts[7]:
+            return True
+    return False
 
 
 def detect_next_iteration(results_file: Path) -> int:
@@ -384,6 +405,18 @@ def load_post_review_decision(path: Path) -> PostReviewDecision:
     )
 
 
+def load_baseline_review_decision(path: Path) -> BaselineReviewDecision:
+    values = parse_shell_assignments(path)
+    decision = values.get("DECISION", "")
+    if decision not in {"keep", "invalid_baseline"}:
+        raise ControllerError(f"invalid baseline review decision in {path}: {decision}")
+    return BaselineReviewDecision(
+        decision=decision,
+        summary=values.get("SUMMARY", ""),
+        findings=values.get("FINDINGS", ""),
+    )
+
+
 class PgolfController:
     def __init__(self, config: Config):
         self.config = config
@@ -435,6 +468,9 @@ class PgolfController:
         self.prep_thread.start()
         try:
             while not self._deadline_reached():
+                if self._needs_bootstrap_baseline():
+                    self._run_bootstrap_baseline()
+                    continue
                 candidate = self._wait_for_candidate()
                 if candidate is None:
                     break
@@ -522,6 +558,87 @@ class PgolfController:
 
     def _deadline_reached(self) -> bool:
         return self.config.deadline is not None and time.time() >= self.config.deadline
+
+    def _needs_bootstrap_baseline(self) -> bool:
+        return not has_completed_result(self.config.results_file)
+
+    def _run_bootstrap_baseline(self) -> None:
+        iteration = self.next_iteration
+        run_number = self.next_run_number
+        run_id = f"{self.config.tag}_{run_number:04d}"
+        run_dir = self.config.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with self.reviewed_base_lock:
+            base_commit = self.reviewed_base_commit
+
+        write_json(
+            run_dir / "baseline_ref.json",
+            {
+                "run_type": "baseline",
+                "base_commit": base_commit,
+                "hypothesis": BASELINE_HYPOTHESIS,
+                "expected_signals": BASELINE_EXPECTED_SIGNALS,
+            },
+        )
+        self.logger.log(
+            f"baseline_start iteration={iteration} run_id={run_id} base_commit={base_commit}"
+        )
+        try:
+            outcome = self._run_baseline_experiment(
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=base_commit,
+            )
+        except ControllerError as exc:
+            self._record_baseline_error(
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=base_commit,
+                stage="experiment",
+                error=str(exc),
+            )
+            ensure_clean_git(self.config.repo_dir)
+            self.next_iteration += 1
+            self.next_run_number += 1
+            return
+        try:
+            decision = self._run_baseline_post_review(
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=base_commit,
+                outcome=outcome,
+            )
+        except ControllerError as exc:
+            self._record_baseline_error(
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=base_commit,
+                stage="post_review",
+                error=str(exc),
+                outcome=outcome,
+            )
+            ensure_clean_git(self.config.repo_dir)
+            self.next_iteration += 1
+            self.next_run_number += 1
+            return
+        self._finalize_baseline(
+            iteration=iteration,
+            run_id=run_id,
+            run_dir=run_dir,
+            experiment_commit=base_commit,
+            outcome=outcome,
+            decision=decision,
+        )
+        ensure_clean_git(self.config.repo_dir)
+        self.logger.log(
+            f"baseline_complete iteration={iteration} run_id={run_id} decision={decision.decision}"
+        )
+        self.next_iteration += 1
+        self.next_run_number += 1
 
     def _prep_worker(self) -> None:
         while not self.stop_event.is_set():
@@ -878,28 +995,52 @@ class PgolfController:
     ) -> RunOutcome:
         if self.config.execution_mode == "local":
             return self._run_local_experiment(
-                candidate=candidate,
                 iteration=iteration,
                 run_id=run_id,
                 run_dir=run_dir,
                 experiment_commit=experiment_commit,
+                extra_env_pairs=candidate.spec.extra_env_pairs,
             )
         return self._run_remote_experiment(
-            candidate=candidate,
             iteration=iteration,
             run_id=run_id,
             run_dir=run_dir,
             experiment_commit=experiment_commit,
+            extra_env_pairs=candidate.spec.extra_env_pairs,
+        )
+
+    def _run_baseline_experiment(
+        self,
+        *,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+    ) -> RunOutcome:
+        if self.config.execution_mode == "local":
+            return self._run_local_experiment(
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=experiment_commit,
+                extra_env_pairs=[],
+            )
+        return self._run_remote_experiment(
+            iteration=iteration,
+            run_id=run_id,
+            run_dir=run_dir,
+            experiment_commit=experiment_commit,
+            extra_env_pairs=[],
         )
 
     def _run_remote_experiment(
         self,
         *,
-        candidate: PreparedCandidate,
         iteration: int,
         run_id: str,
         run_dir: Path,
         experiment_commit: str,
+        extra_env_pairs: list[tuple[str, str]],
     ) -> RunOutcome:
         branch_name = git_output(self.config.repo_dir, "branch", "--show-current")
         self.logger.log(
@@ -911,7 +1052,7 @@ class PgolfController:
             cwd=self.config.repo_dir,
         )
         remote_log = self.config.remote_log_dir / f"{run_id}.log"
-        remote_command = self._build_remote_command(run_id, candidate.spec.extra_env_pairs)
+        remote_command = self._build_remote_command(run_id, extra_env_pairs)
         ssh_cmd = ["ssh", *self._ssh_options(), self.config.remote_host, remote_command]
         self.logger.log(
             f"remote_start iteration={iteration} run_id={run_id} "
@@ -956,11 +1097,11 @@ class PgolfController:
     def _run_local_experiment(
         self,
         *,
-        candidate: PreparedCandidate,
         iteration: int,
         run_id: str,
         run_dir: Path,
         experiment_commit: str,
+        extra_env_pairs: list[tuple[str, str]],
     ) -> RunOutcome:
         local_log = self.config.remote_log_dir / f"{run_id}.log"
         env = os.environ.copy()
@@ -973,7 +1114,7 @@ class PgolfController:
             ("ITERATIONS", str(self.config.iterations)),
             ("MAX_WALLCLOCK_SECONDS", str(self.config.max_wallclock_seconds)),
             *self.config.base_extra_env_pairs,
-            *candidate.spec.extra_env_pairs,
+            *extra_env_pairs,
         ]
         for key, value in env_pairs:
             env[key] = value
@@ -1081,6 +1222,62 @@ class PgolfController:
         )
         return decision
 
+    def _run_baseline_post_review(
+        self,
+        *,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+        outcome: RunOutcome,
+    ) -> BaselineReviewDecision:
+        best_prior_bpb = latest_kept_bpb(self.config.results_file) or "none"
+        output_file = run_dir / "post_review.env"
+        prompt = self._build_baseline_post_review_prompt(
+            iteration=iteration,
+            run_id=run_id,
+            run_dir=run_dir,
+            experiment_commit=experiment_commit,
+            outcome=outcome,
+            best_prior_bpb=best_prior_bpb,
+            output_file=output_file,
+        )
+        prompt_file = run_dir / "post_review_prompt.txt"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        self.logger.log(
+            f"baseline_post_review_start iteration={iteration} "
+            f"reviewer={self.config.post_review_model} run_id={run_id}"
+        )
+        exit_code = self._stream_subprocess(
+            [
+                self.config.codex_binary,
+                "exec",
+                "-m",
+                self.config.post_review_model,
+                "--dangerously-bypass-approvals-and-sandbox",
+                prompt,
+            ],
+            cwd=self.config.repo_dir,
+            prefix=f"post-review[{run_id}] ",
+            raw_log_path=run_dir / "post_review.log",
+        )
+        if exit_code != 0:
+            raise ControllerError(
+                f"baseline post-review failed for run_id={run_id} with exit code {exit_code}"
+            )
+        decision = load_baseline_review_decision(output_file)
+        write_json(
+            run_dir / "post_review.json",
+            {
+                "decision": decision.decision,
+                "summary": decision.summary,
+                "findings": decision.findings,
+                "model": self.config.post_review_model,
+                "run_type": "baseline",
+            },
+        )
+        return decision
+
     def _record_run_error(
         self,
         *,
@@ -1162,6 +1359,79 @@ class PgolfController:
         with self.reviewed_base_lock:
             self.reviewed_base_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
 
+    def _record_baseline_error(
+        self,
+        *,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+        stage: str,
+        error: str,
+        outcome: RunOutcome | None = None,
+    ) -> None:
+        self.logger.log(
+            f"baseline_error run_id={run_id} stage={stage} error={sanitize_tsv(error)}"
+        )
+        remote_log = self.config.remote_log_dir / f"{run_id}.log"
+        if remote_log.exists():
+            copy_file(remote_log, run_dir / "remote.log")
+
+        timestamp = iso_now()
+        note_parts = [
+            BASELINE_NOTES,
+            f"stage={stage}",
+            f"error={error}",
+            f"hypothesis={BASELINE_HYPOTHESIS}",
+            f"expected_signals={BASELINE_EXPECTED_SIGNALS}",
+        ]
+        results_row = (
+            f"{iteration}\t{timestamp}\tbaseline\t{self.config.post_review_model}\t{run_id}\terror\t"
+            f"{outcome.val_bpb if outcome else ''}\t{outcome.val_loss if outcome else ''}\t"
+            f"{outcome.size_bytes if outcome else ''}\t{experiment_commit}\t"
+            f"{BASELINE_IDEA}\t{sanitize_tsv(self.config.base_extra_env_text)}\t"
+            f"{sanitize_tsv(' | '.join(note_parts))}\n"
+        )
+        with self.config.results_file.open("a", encoding="utf-8") as fh:
+            fh.write(results_row)
+        reviews_row = (
+            f"{iteration}\t{timestamp}\t{self.config.post_review_model}\t{run_id}\terror\t"
+            f"{experiment_commit}\t{sanitize_tsv(stage + ' failed')}\t{sanitize_tsv(error)}\n"
+        )
+        with self.config.reviews_file.open("a", encoding="utf-8") as fh:
+            fh.write(reviews_row)
+
+        failure_manifest = {
+            "run_type": "baseline",
+            "run_id": run_id,
+            "iteration": iteration,
+            "experiment_commit": experiment_commit,
+            "decision": "error",
+            "failure_stage": stage,
+            "error": error,
+            "idea": BASELINE_IDEA,
+            "hypothesis": BASELINE_HYPOTHESIS,
+            "expected_signals": BASELINE_EXPECTED_SIGNALS,
+            "notes": BASELINE_NOTES,
+            "extra_env": self.config.base_extra_env_text,
+            "metrics": (
+                {
+                    "val_bpb": outcome.val_bpb,
+                    "val_loss": outcome.val_loss,
+                    "size_bytes": outcome.size_bytes,
+                }
+                if outcome
+                else None
+            ),
+            "remote_log": str(remote_log) if remote_log.exists() else "",
+            "timestamp": timestamp,
+        }
+        write_json(run_dir / "failure.json", failure_manifest)
+        self._append_history({"event": "baseline_failed", **failure_manifest})
+        self._commit_ledger_updates(run_id=run_id, decision="error")
+        with self.reviewed_base_lock:
+            self.reviewed_base_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
+
     def _finalize_decision(
         self,
         *,
@@ -1227,6 +1497,67 @@ class PgolfController:
         write_json(run_dir / "manifest.json", run_manifest)
         self._append_history({"event": "run_finalized", **run_manifest})
         self._update_candidate_status(candidate.manifest_path, decision.decision)
+        self._commit_ledger_updates(run_id=run_id, decision=decision.decision)
+        with self.reviewed_base_lock:
+            self.reviewed_base_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
+
+    def _finalize_baseline(
+        self,
+        *,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+        outcome: RunOutcome,
+        decision: BaselineReviewDecision,
+    ) -> None:
+        timestamp = iso_now()
+        note_parts = [
+            BASELINE_NOTES,
+            f"hypothesis={BASELINE_HYPOTHESIS}",
+            f"expected_signals={BASELINE_EXPECTED_SIGNALS}",
+            f"post_review={decision.summary}",
+        ]
+        results_row = (
+            f"{iteration}\t{timestamp}\tbaseline\t{self.config.post_review_model}\t{run_id}\t"
+            f"{decision.decision}\t{outcome.val_bpb}\t{outcome.val_loss}\t{outcome.size_bytes}\t"
+            f"{experiment_commit}\t{BASELINE_IDEA}\t{sanitize_tsv(self.config.base_extra_env_text)}\t"
+            f"{sanitize_tsv(' | '.join(note_parts))}\n"
+        )
+        with self.config.results_file.open("a", encoding="utf-8") as fh:
+            fh.write(results_row)
+        reviews_row = (
+            f"{iteration}\t{timestamp}\t{self.config.post_review_model}\t{run_id}\t"
+            f"{decision.decision}\t{experiment_commit}\t{sanitize_tsv(decision.summary)}\t"
+            f"{sanitize_tsv(decision.findings)}\n"
+        )
+        with self.config.reviews_file.open("a", encoding="utf-8") as fh:
+            fh.write(reviews_row)
+
+        run_manifest = {
+            "run_type": "baseline",
+            "run_id": run_id,
+            "iteration": iteration,
+            "experiment_commit": experiment_commit,
+            "post_review_model": self.config.post_review_model,
+            "decision": decision.decision,
+            "decision_summary": decision.summary,
+            "decision_findings": decision.findings,
+            "idea": BASELINE_IDEA,
+            "hypothesis": BASELINE_HYPOTHESIS,
+            "expected_signals": BASELINE_EXPECTED_SIGNALS,
+            "notes": BASELINE_NOTES,
+            "extra_env": self.config.base_extra_env_text,
+            "metrics": {
+                "val_bpb": outcome.val_bpb,
+                "val_loss": outcome.val_loss,
+                "size_bytes": outcome.size_bytes,
+            },
+            "remote_log": str(outcome.remote_log),
+            "timestamp": timestamp,
+        }
+        write_json(run_dir / "manifest.json", run_manifest)
+        self._append_history({"event": "baseline_finalized", **run_manifest})
         self._commit_ledger_updates(run_id=run_id, decision=decision.decision)
         with self.reviewed_base_lock:
             self.reviewed_base_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
@@ -1491,6 +1822,57 @@ class PgolfController:
                 ),
                 "- Revert if the result regresses or if the evidence is not trustworthy.",
                 f"- Write your decision to {output_file}.",
+                "- Do not edit the repository yourself.",
+                "- Do not run training.",
+            ]
+        )
+
+    def _build_baseline_post_review_prompt(
+        self,
+        *,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+        outcome: RunOutcome,
+        best_prior_bpb: str,
+        output_file: Path,
+    ) -> str:
+        return "\n".join(
+            [
+                f"This is the bootstrap baseline post-review step for iteration {iteration}.",
+                "",
+                "Review these artifacts:",
+                f"- results: {self.config.results_file}",
+                f"- reviews: {self.config.reviews_file}",
+                f"- run manifest directory: {run_dir}",
+                f"- remote log: {outcome.remote_log}",
+                f"- post-review protocol: {self.config.post_review_protocol_file}",
+                "",
+                "Run metadata:",
+                f"- run_id: {run_id}",
+                f"- experiment_commit: {experiment_commit}",
+                f"- best prior kept val_bpb: {best_prior_bpb}",
+                f"- current val_bpb: {outcome.val_bpb}",
+                f"- current val_loss: {outcome.val_loss}",
+                f"- current size_bytes: {outcome.size_bytes}",
+                "",
+                "Important:",
+                "- No candidate patch was applied in this run.",
+                (
+                    "- This is a bootstrap baseline run meant to establish the initial "
+                    "reference metric and validate the harness."
+                ),
+                (
+                    "- Focus on trustworthiness of the run and whether the result is a "
+                    "usable baseline reference."
+                ),
+                f"- Write your decision to {output_file}.",
+                "- Use DECISION=keep if the baseline is trustworthy and usable.",
+                (
+                    "- Use DECISION=invalid_baseline if the baseline should be discarded "
+                    "and retried."
+                ),
                 "- Do not edit the repository yourself.",
                 "- Do not run training.",
             ]

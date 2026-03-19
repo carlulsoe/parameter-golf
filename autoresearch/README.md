@@ -62,21 +62,23 @@ The controller has three Codex roles:
 
 The runtime loop is:
 
-1. Draft a candidate from the last reviewed base commit.
-2. Pre-review it for correctness and trustworthiness.
-3. Repeat proposer plus pre-review for up to `MAX_PRE_REVIEW_ROUNDS`.
-4. Queue only approved patches.
-5. Apply the next queued patch with `git am --3way`.
-6. Push it to the remote branch and run training.
-7. Post-review the result.
-8. Keep or revert the experiment commit.
-9. Append the final result to `results.tsv` and `reviews.tsv`.
-10. Commit the ledger update so the repo returns to a clean reviewed state.
+1. On first launch with no completed result yet, run an immediate unmodified baseline from the current reviewed base commit.
+2. While that baseline trains, draft a candidate from the same reviewed base commit in the background.
+3. Pre-review it for correctness and trustworthiness.
+4. Repeat proposer plus pre-review for up to `MAX_PRE_REVIEW_ROUNDS`.
+5. Queue only approved patches.
+6. Apply the next queued patch with `git am --3way`.
+7. Push it to the remote branch and run training.
+8. Post-review the result.
+9. Keep or revert the experiment commit.
+10. Append the final result to `results.tsv` and `reviews.tsv`.
+11. Commit the ledger update so the repo returns to a clean reviewed state.
 
 Two details matter:
 
 - The proposer is intentionally based on the last reviewed commit, not the currently running speculative experiment.
 - The queue unit is a reviewed patch, not a raw idea.
+- The bootstrap baseline is a first-class traced run, not an unlogged special case.
 
 **Artifacts And Traceability**
 
@@ -106,8 +108,8 @@ Each candidate directory contains round-by-round trace material such as:
 
 Each run directory contains:
 
-- copied candidate patch
-- candidate reference manifest
+- copied candidate patch for reviewed experiments, or a baseline reference file for the bootstrap run
+- candidate reference manifest when a patch was applied
 - remote training log
 - parsed metrics
 - post-review prompt
@@ -163,6 +165,7 @@ uv run python run_pgolf_experiment.py --hours 8
 - A candidate can be rejected before it ever reaches the GPU.
 - A queued patch can still fail to apply later if the reviewed base has moved too far; those failures are recorded in trace artifacts.
 - `results.tsv` and `reviews.tsv` are still the high-level human-readable ledgers.
+- If there is no completed result yet, the controller will run a baseline first and only then begin dequeuing reviewed patches.
 - Detailed artifacts live outside git-tracked history under `TRACE_ROOT`.
 - The prompt files in this directory are part of the controller contract. If you change them, do it deliberately.
 - Under `systemd --user`, prefer `journalctl --user -u parameter-golf-autoresearch`
