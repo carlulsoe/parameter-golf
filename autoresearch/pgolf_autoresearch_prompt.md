@@ -30,8 +30,10 @@ Protocol:
 8. `EXPECTED_SIGNALS` should say what metrics or log changes would support or falsify the hypothesis.
 9. `EXTRA_ENV` must be a single-line space-separated list of additional `KEY=VALUE` pairs for this run, for example `TRAIN_SEQ_LEN=512 EVAL_SEQ_LEN=1024`.
 10. Make exactly one git commit for your experiment before stopping so the controller can export it as a single patch.
-11. Do not run training yourself. The controller will run the exact experiment remotely on the GPU box if the pre-reviewer approves it.
-12. Stop after one completed proposer iteration.
+11. Do not commit `controller_state/current_candidate.env`. Leave it as an untracked file.
+12. If you accidentally stage `controller_state/current_candidate.env`, unstage it before the final commit.
+13. Do not run training yourself. The controller will run the exact experiment remotely on the GPU box if the pre-reviewer approves it.
+14. Stop after one completed proposer iteration.
 
 Rules:
 - Do not ask for confirmation.

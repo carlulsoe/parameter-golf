@@ -35,6 +35,7 @@ class Config:
     proposer_model: str
     pre_review_model: str
     post_review_model: str
+    execution_mode: str
     tag: str
     deadline: float | None
     max_pre_review_rounds: int
@@ -52,6 +53,9 @@ class Config:
     remote_branch: str
     remote_torchrun: str
     remote_identity: str
+    local_torchrun: str
+    base_extra_env_text: str
+    base_extra_env_pairs: list[tuple[str, str]]
     results_file: Path
     reviews_file: Path
     harness_log: Path
@@ -395,6 +399,7 @@ class PgolfController:
             f"proposer_model={self.config.proposer_model} "
             f"pre_review_model={self.config.pre_review_model} "
             f"post_review_model={self.config.post_review_model} "
+            f"execution_mode={self.config.execution_mode} "
             f"tag={self.config.tag} "
             f"deadline={self.config.deadline if self.config.deadline is not None else 'forever'} "
             f"prep_queue_depth={self.config.prep_queue_depth} "
@@ -423,21 +428,52 @@ class PgolfController:
                 if not self._apply_candidate(candidate, run_id, run_dir):
                     continue
                 experiment_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
-                outcome = self._run_remote_experiment(
-                    candidate=candidate,
-                    iteration=iteration,
-                    run_id=run_id,
-                    run_dir=run_dir,
-                    experiment_commit=experiment_commit,
-                )
-                decision = self._run_post_review(
-                    candidate=candidate,
-                    iteration=iteration,
-                    run_id=run_id,
-                    run_dir=run_dir,
-                    experiment_commit=experiment_commit,
-                    outcome=outcome,
-                )
+                try:
+                    outcome = self._run_experiment(
+                        candidate=candidate,
+                        iteration=iteration,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        experiment_commit=experiment_commit,
+                    )
+                except ControllerError as exc:
+                    self._record_run_error(
+                        candidate=candidate,
+                        iteration=iteration,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        experiment_commit=experiment_commit,
+                        stage="experiment",
+                        error=str(exc),
+                    )
+                    ensure_clean_git(self.config.repo_dir)
+                    self.next_iteration += 1
+                    self.next_run_number += 1
+                    continue
+                try:
+                    decision = self._run_post_review(
+                        candidate=candidate,
+                        iteration=iteration,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        experiment_commit=experiment_commit,
+                        outcome=outcome,
+                    )
+                except ControllerError as exc:
+                    self._record_run_error(
+                        candidate=candidate,
+                        iteration=iteration,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        experiment_commit=experiment_commit,
+                        stage="post_review",
+                        error=str(exc),
+                        outcome=outcome,
+                    )
+                    ensure_clean_git(self.config.repo_dir)
+                    self.next_iteration += 1
+                    self.next_run_number += 1
+                    continue
                 self._finalize_decision(
                     candidate=candidate,
                     iteration=iteration,
@@ -552,17 +588,15 @@ class PgolfController:
                 generated_spec = clone_dir / "controller_state" / "current_candidate.env"
                 if not generated_spec.exists():
                     raise ControllerError("proposer did not write controller_state/current_candidate.env")
-                ensure_clean_git(clone_dir)
                 commit_count = int(git_output(clone_dir, "rev-list", "--count", f"{base_commit}..HEAD"))
                 if commit_count != 1:
                     raise ControllerError(f"expected exactly one candidate commit, found {commit_count}")
-                head_commit = git_output(clone_dir, "rev-parse", "HEAD")
-                changed_files = git_changed_files(clone_dir, base_commit, head_commit)
-                if changed_files != ["train_gpt.py"]:
-                    raise ControllerError(
-                        "candidate commit must only touch train_gpt.py; changed files were "
-                        + ", ".join(changed_files)
-                    )
+                head_commit = self._sanitize_candidate_commit(
+                    clone_dir=clone_dir,
+                    base_commit=base_commit,
+                    spec_path=generated_spec,
+                )
+                ensure_clean_git(clone_dir)
                 patch_text = run_cmd(
                     ["git", "format-patch", "--quiet", "--stdout", f"{base_commit}..HEAD"],
                     cwd=clone_dir,
@@ -710,6 +744,39 @@ class PgolfController:
                 continue
         return None
 
+    def _sanitize_candidate_commit(
+        self,
+        *,
+        clone_dir: Path,
+        base_commit: str,
+        spec_path: Path,
+    ) -> str:
+        head_commit = git_output(clone_dir, "rev-parse", "HEAD")
+        changed_files = git_changed_files(clone_dir, base_commit, head_commit)
+        allowed_files = {"train_gpt.py", "controller_state/current_candidate.env"}
+        unexpected_files = [path for path in changed_files if path not in allowed_files]
+        if unexpected_files:
+            raise ControllerError(
+                "candidate commit must only touch train_gpt.py; changed files were "
+                + ", ".join(changed_files)
+            )
+        if "controller_state/current_candidate.env" not in changed_files:
+            return head_commit
+
+        spec_text = spec_path.read_text(encoding="utf-8")
+        run_cmd(["git", "rm", "--cached", "--quiet", "--", "controller_state/current_candidate.env"], cwd=clone_dir)
+        run_cmd(["git", "commit", "--amend", "--no-edit"], cwd=clone_dir)
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        spec_path.write_text(spec_text, encoding="utf-8")
+        head_commit = git_output(clone_dir, "rev-parse", "HEAD")
+        changed_files = git_changed_files(clone_dir, base_commit, head_commit)
+        if changed_files != ["train_gpt.py"]:
+            raise ControllerError(
+                "candidate commit must only touch train_gpt.py after controller sanitization; changed files were "
+                + ", ".join(changed_files)
+            )
+        return head_commit
+
     def _apply_candidate(self, candidate: PreparedCandidate, run_id: str, run_dir: Path) -> bool:
         self.logger.log(
             f"apply_start candidate_id={candidate.candidate_id} run_id={run_id} base_commit={candidate.base_commit}"
@@ -745,6 +812,31 @@ class PgolfController:
         self._update_candidate_status(candidate.manifest_path, "running")
         self.logger.log(f"apply_ready candidate_id={candidate.candidate_id} run_id={run_id}")
         return True
+
+    def _run_experiment(
+        self,
+        *,
+        candidate: PreparedCandidate,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+    ) -> RunOutcome:
+        if self.config.execution_mode == "local":
+            return self._run_local_experiment(
+                candidate=candidate,
+                iteration=iteration,
+                run_id=run_id,
+                run_dir=run_dir,
+                experiment_commit=experiment_commit,
+            )
+        return self._run_remote_experiment(
+            candidate=candidate,
+            iteration=iteration,
+            run_id=run_id,
+            run_dir=run_dir,
+            experiment_commit=experiment_commit,
+        )
 
     def _run_remote_experiment(
         self,
@@ -792,6 +884,75 @@ class PgolfController:
             val_loss=val_loss_match.group(1),
             size_bytes=size_match.group(1) if size_match else "",
             remote_log=remote_log,
+        )
+        write_json(
+            run_dir / "metrics.json",
+            {
+                "val_bpb": outcome.val_bpb,
+                "val_loss": outcome.val_loss,
+                "size_bytes": outcome.size_bytes,
+            },
+        )
+        return outcome
+
+    def _run_local_experiment(
+        self,
+        *,
+        candidate: PreparedCandidate,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+    ) -> RunOutcome:
+        local_log = self.config.remote_log_dir / f"{run_id}.log"
+        env = os.environ.copy()
+        env_pairs = [
+            ("RUN_ID", run_id),
+            ("DATA_PATH", self.config.data_path),
+            ("TOKENIZER_PATH", self.config.tokenizer_path),
+            ("VOCAB_SIZE", str(self.config.vocab_size)),
+            ("VAL_LOSS_EVERY", str(self.config.val_loss_every)),
+            ("ITERATIONS", str(self.config.iterations)),
+            ("MAX_WALLCLOCK_SECONDS", str(self.config.max_wallclock_seconds)),
+            *self.config.base_extra_env_pairs,
+            *candidate.spec.extra_env_pairs,
+        ]
+        for key, value in env_pairs:
+            env[key] = value
+        cmd = [
+            self.config.local_torchrun,
+            "--standalone",
+            f"--nproc_per_node={self.config.nproc_per_node}",
+            "train_gpt.py",
+        ]
+        self.logger.log(
+            f"local_start iteration={iteration} run_id={run_id} commit={experiment_commit} "
+            f"base_env={sanitize_tsv(self.config.base_extra_env_text)}"
+        )
+        exit_code = self._stream_subprocess(
+            cmd,
+            cwd=self.config.repo_dir,
+            prefix=f"local[{run_id}] ",
+            raw_log_path=local_log,
+            env=env,
+        )
+        if exit_code != 0:
+            raise ControllerError(f"local training failed for run_id={run_id} with exit code {exit_code}")
+        copy_file(local_log, run_dir / "remote.log")
+        metrics_line = grep_last("final_int8_zlib_roundtrip_exact", local_log)
+        size_line = grep_last("Total submission size int8+zlib:", local_log)
+        if not metrics_line:
+            raise ControllerError(f"missing final metric line in {local_log}")
+        val_loss_match = re.search(r"val_loss:([0-9.]+)", metrics_line)
+        val_bpb_match = re.search(r"val_bpb:([0-9.]+)", metrics_line)
+        size_match = re.search(r"Total submission size int8\+zlib: ([0-9]+) bytes", size_line)
+        if not val_loss_match or not val_bpb_match:
+            raise ControllerError(f"unable to parse metrics from {local_log}")
+        outcome = RunOutcome(
+            val_bpb=val_bpb_match.group(1),
+            val_loss=val_loss_match.group(1),
+            size_bytes=size_match.group(1) if size_match else "",
+            remote_log=local_log,
         )
         write_json(
             run_dir / "metrics.json",
@@ -854,6 +1015,87 @@ class PgolfController:
             },
         )
         return decision
+
+    def _record_run_error(
+        self,
+        *,
+        candidate: PreparedCandidate,
+        iteration: int,
+        run_id: str,
+        run_dir: Path,
+        experiment_commit: str,
+        stage: str,
+        error: str,
+        outcome: RunOutcome | None = None,
+    ) -> None:
+        self.logger.log(f"run_error run_id={run_id} stage={stage} error={sanitize_tsv(error)}")
+        active_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
+        if active_commit == experiment_commit:
+            self.logger.log(f"run_error_revert_start run_id={run_id} commit={experiment_commit}")
+            run_cmd(["git", "revert", "--no-edit", experiment_commit], cwd=self.config.repo_dir)
+
+        remote_log = self.config.remote_log_dir / f"{run_id}.log"
+        if remote_log.exists():
+            copy_file(remote_log, run_dir / "remote.log")
+
+        timestamp = iso_now()
+        note_parts = [
+            f"stage={stage}",
+            f"error={error}",
+            f"hypothesis={candidate.spec.hypothesis}",
+            f"expected_signals={candidate.spec.expected_signals}",
+            f"pre_review_round={candidate.approved_round}",
+        ]
+        if candidate.spec.notes:
+            note_parts.insert(0, candidate.spec.notes)
+        results_row = (
+            f"{iteration}\t{timestamp}\t{self.config.proposer_model}\t{self.config.post_review_model}\t{run_id}\terror\t"
+            f"{outcome.val_bpb if outcome else ''}\t{outcome.val_loss if outcome else ''}\t"
+            f"{outcome.size_bytes if outcome else ''}\t{experiment_commit}\t"
+            f"{sanitize_tsv(candidate.spec.idea)}\t{sanitize_tsv(candidate.spec.extra_env_text)}\t"
+            f"{sanitize_tsv(' | '.join(note_parts))}\n"
+        )
+        with self.config.results_file.open("a", encoding="utf-8") as fh:
+            fh.write(results_row)
+        reviews_row = (
+            f"{iteration}\t{timestamp}\t{self.config.post_review_model}\t{run_id}\terror\t{experiment_commit}\t"
+            f"{sanitize_tsv(stage + ' failed')}\t{sanitize_tsv(error)}\n"
+        )
+        with self.config.reviews_file.open("a", encoding="utf-8") as fh:
+            fh.write(reviews_row)
+
+        failure_manifest = {
+            "run_id": run_id,
+            "candidate_id": candidate.candidate_id,
+            "iteration": iteration,
+            "experiment_commit": experiment_commit,
+            "candidate_manifest": str(candidate.manifest_path),
+            "decision": "error",
+            "failure_stage": stage,
+            "error": error,
+            "idea": candidate.spec.idea,
+            "hypothesis": candidate.spec.hypothesis,
+            "expected_signals": candidate.spec.expected_signals,
+            "notes": candidate.spec.notes,
+            "extra_env": candidate.spec.extra_env_text,
+            "metrics": (
+                {
+                    "val_bpb": outcome.val_bpb,
+                    "val_loss": outcome.val_loss,
+                    "size_bytes": outcome.size_bytes,
+                }
+                if outcome
+                else None
+            ),
+            "remote_log": str(remote_log) if remote_log.exists() else "",
+            "timestamp": timestamp,
+        }
+        write_json(run_dir / "failure.json", failure_manifest)
+        self._append_history({"event": "run_failed", **failure_manifest})
+        self._update_candidate_status(candidate.manifest_path, "error")
+        self._commit_ledger_updates(run_id=run_id, decision="error")
+        with self.reviewed_base_lock:
+            self.reviewed_base_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
 
     def _finalize_decision(
         self,
@@ -1017,6 +1259,7 @@ class PgolfController:
             ("VAL_LOSS_EVERY", str(self.config.val_loss_every)),
             ("ITERATIONS", str(self.config.iterations)),
             ("MAX_WALLCLOCK_SECONDS", str(self.config.max_wallclock_seconds)),
+            *self.config.base_extra_env_pairs,
             *extra_env_pairs,
         ]
         env_prefix = shell_assignments(env_pairs)
@@ -1042,7 +1285,7 @@ class PgolfController:
     ) -> str:
         spec_file = clone_dir / "controller_state" / "current_candidate.env"
         protocol_path = clone_dir / "autoresearch" / self.config.proposer_protocol_file.name
-        history_summary = self.config.history_summary
+        history_summary = self.history_summary
         feedback_section = (
             "Pre-review feedback from the previous round:\n"
             f"{prior_feedback}\n"
@@ -1062,7 +1305,9 @@ class PgolfController:
                     f"DATA_PATH={self.config.data_path} TOKENIZER_PATH={self.config.tokenizer_path} "
                     f"VOCAB_SIZE={self.config.vocab_size} VAL_LOSS_EVERY={self.config.val_loss_every} "
                     f"ITERATIONS={self.config.iterations} MAX_WALLCLOCK_SECONDS={self.config.max_wallclock_seconds} "
-                    f"{self.config.remote_torchrun} --standalone --nproc_per_node={self.config.nproc_per_node} train_gpt.py"
+                    f"{self.config.base_extra_env_text + ' ' if self.config.base_extra_env_text else ''}"
+                    f"{self.config.remote_torchrun if self.config.execution_mode == 'remote' else self.config.local_torchrun} "
+                    f"--standalone --nproc_per_node={self.config.nproc_per_node} train_gpt.py"
                 ),
                 "",
                 "Read these repository files before you act:",
@@ -1161,11 +1406,13 @@ class PgolfController:
         cwd: Path,
         prefix: str,
         raw_log_path: Path,
+        env: dict[str, str] | None = None,
     ) -> int:
         raw_log_path.parent.mkdir(parents=True, exist_ok=True)
         process = subprocess.Popen(
             cmd,
             cwd=cwd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1189,6 +1436,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--proposer-model", default=os.environ.get("PROPOSER_MODEL", "gpt-5.4"))
     parser.add_argument("--pre-review-model", default=os.environ.get("PRE_REVIEW_MODEL"))
     parser.add_argument("--post-review-model", default=os.environ.get("POST_REVIEW_MODEL"))
+    parser.add_argument(
+        "--executor",
+        choices=("remote", "local"),
+        default=os.environ.get("EXECUTION_MODE", "remote"),
+    )
     parser.add_argument("--tag", default=os.environ.get("TAG", "pgolf"))
     time_group = parser.add_mutually_exclusive_group()
     time_group.add_argument("--hours", type=float, default=None)
@@ -1221,6 +1473,7 @@ def build_config(args: argparse.Namespace) -> Config:
     proposer_model = args.proposer_model
     pre_review_model = args.pre_review_model or os.environ.get("REVIEW_MODEL", proposer_model)
     post_review_model = args.post_review_model or os.environ.get("REVIEW_MODEL", proposer_model)
+    base_extra_env_text = os.environ.get("BASE_EXTRA_ENV", "")
     default_hours = float(os.environ.get("HOURS", "8"))
     if args.forever:
         deadline = None
@@ -1238,6 +1491,7 @@ def build_config(args: argparse.Namespace) -> Config:
         proposer_model=proposer_model,
         pre_review_model=pre_review_model,
         post_review_model=post_review_model,
+        execution_mode=args.executor,
         tag=args.tag,
         deadline=deadline,
         max_pre_review_rounds=max(1, args.max_pre_review_rounds),
@@ -1257,6 +1511,9 @@ def build_config(args: argparse.Namespace) -> Config:
         remote_branch=os.environ.get("REMOTE_BRANCH", "runpod-autoresearch"),
         remote_torchrun=os.environ.get("REMOTE_TORCHRUN", "torchrun"),
         remote_identity=os.environ.get("REMOTE_IDENTITY", ""),
+        local_torchrun=os.environ.get("LOCAL_TORCHRUN", str(repo_dir / ".venv/bin/torchrun")),
+        base_extra_env_text=base_extra_env_text,
+        base_extra_env_pairs=parse_extra_env(base_extra_env_text),
         results_file=env_path("RESULTS_FILE", "results.tsv"),
         reviews_file=env_path("REVIEWS_FILE", "reviews.tsv"),
         harness_log=env_path("HARNESS_LOG", f"logs/autoresearch_{args.tag}.log"),
@@ -1279,7 +1536,7 @@ def build_config(args: argparse.Namespace) -> Config:
         prep_poll_seconds=max(1.0, float(os.environ.get("PREP_POLL_SECONDS", "5"))),
         codex_binary=os.environ.get("CODEX_BIN", "codex"),
     )
-    if not config.remote_host:
+    if config.execution_mode == "remote" and not config.remote_host:
         raise ControllerError("set REMOTE_HOST=user@host for the GPU box")
     ensure_exists(config.proposer_protocol_file, "proposer protocol file")
     ensure_exists(config.pre_review_protocol_file, "pre-review protocol file")

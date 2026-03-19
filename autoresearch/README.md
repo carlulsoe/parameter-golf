@@ -156,6 +156,7 @@ uv run python run_pgolf_experiment.py --hours 8
 
 - The proposer is restricted to changing `train_gpt.py`. Run config changes belong in `EXTRA_ENV`.
 - The controller expects exactly one candidate commit per proposer round.
+- `controller_state/current_candidate.env` is trace metadata, not part of the experiment patch. Leave it untracked.
 - A candidate can be rejected before it ever reaches the GPU.
 - A queued patch can still fail to apply later if the reviewed base has moved too far; those failures are recorded in trace artifacts.
 - `results.tsv` and `reviews.tsv` are still the high-level human-readable ledgers.
