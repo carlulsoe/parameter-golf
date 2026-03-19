@@ -22,8 +22,6 @@ REPO_EXCLUDES = [
     "remote_logs/",
     "data/datasets/",
     "data/tokenizers/",
-    "final_model.pt",
-    "final_model.int8.ptz",
     ".DS_Store",
 ]
 
@@ -99,7 +97,6 @@ def render_service(args: argparse.Namespace, remote_repo_dir: str, remote_env_fi
     escaped_args = shell_join(shlex.split(args.controller_args.strip() or "--forever"))
     service_repo_dir = remote_service_path(remote_repo_dir)
     service_env_file = remote_service_path(remote_env_file)
-    state_dir = remote_service_path(args.remote_state_dir).rstrip("/")
     return f"""[Unit]
 Description=Parameter Golf Autoresearch Controller
 After=network-online.target
@@ -113,8 +110,6 @@ EnvironmentFile={service_env_file}
 ExecStart=/bin/bash -lc "cd {service_repo_dir}/autoresearch && uv run python run_pgolf_experiment.py {escaped_args}"
 Restart=always
 RestartSec=15
-StandardOutput=append:{state_dir}/controller.stdout.log
-StandardError=append:{state_dir}/controller.stderr.log
 
 [Install]
 WantedBy=default.target
@@ -169,6 +164,7 @@ def remote_prepare_script(args: argparse.Namespace) -> str:
             "export PATH=\"$HOME/.local/bin:$HOME/.npm/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin\"",
             "command -v uv >/dev/null 2>&1 || { echo 'uv install failed'; exit 1; }",
             "command -v codex >/dev/null 2>&1 || { echo 'codex CLI missing on controller host'; exit 1; }",
+            f"git config --global --add safe.directory {repo_dir}",
             f"systemctl --user stop {service_name} >/dev/null 2>&1 || true",
         ]
     )
