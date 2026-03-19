@@ -72,6 +72,13 @@ def remote_shell_path(path: str) -> str:
     return path
 
 
+def remote_shell_expr(path: str) -> str:
+    shell_path = remote_shell_path(path)
+    if shell_path == "$HOME" or shell_path.startswith("$HOME/"):
+        return f'"{shell_path}"'
+    return shlex.quote(shell_path)
+
+
 def remote_service_path(path: str) -> str:
     if path == "~":
         return "%h"
@@ -150,10 +157,10 @@ def upload_file(args: argparse.Namespace, local_path: Path, remote_path: str) ->
 
 
 def remote_prepare_script(args: argparse.Namespace) -> str:
-    repo_dir = shlex.quote(remote_shell_path(args.remote_repo_dir))
-    env_dir = shlex.quote(remote_shell_path(str(Path(args.remote_env_file).parent)))
-    systemd_dir = shlex.quote(remote_shell_path(args.remote_systemd_dir))
-    state_dir = shlex.quote(remote_shell_path(args.remote_state_dir))
+    repo_dir = remote_shell_expr(args.remote_repo_dir)
+    env_dir = remote_shell_expr(str(Path(args.remote_env_file).parent))
+    systemd_dir = remote_shell_expr(args.remote_systemd_dir)
+    state_dir = remote_shell_expr(args.remote_state_dir)
     service_name = shlex.quote(args.service_name)
     require_python = (
         "command -v python3 >/dev/null 2>&1 || "
@@ -192,7 +199,7 @@ def remote_finalize_script(args: argparse.Namespace) -> str:
     service_name = shlex.quote(args.service_name)
     remote_systemd_dir = remote_shell_path(args.remote_systemd_dir).rstrip("/")
     service_file = shlex.quote(f"{remote_systemd_dir}/{args.service_name}.service")
-    remote_repo_dir = shlex.quote(remote_shell_path(args.remote_repo_dir))
+    remote_repo_dir = remote_shell_expr(args.remote_repo_dir)
     export_path = f'export PATH="{SERVICE_PATH.replace("%h", "$HOME")}"'
     require_systemctl = (
         "command -v systemctl >/dev/null 2>&1 || "
