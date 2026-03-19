@@ -1,0 +1,1 @@
+Run checks with `uv run --group dev ruff check .` and `uv run --group dev ty check`.
