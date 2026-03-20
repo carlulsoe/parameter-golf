@@ -305,43 +305,459 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_FP32_SCALE_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_FP32_SCALE_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_MIN_CLIP_NAME_VALUE_OVERRIDES = tuple(
+    entry.strip()
+    for entry in os.environ.get("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES", "").split(",")
+    if entry.strip()
+)
+INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_CLIP_SWEEP_AUDIT_PERCENTILES = tuple(
+    float(entry.strip())
+    for entry in os.environ.get("INT8_CLIP_SWEEP_AUDIT_PERCENTILES", "").split(",")
+    if entry.strip()
+)
+INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
+INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
+INT8_CLIP_SWEEP_AUDIT_LOG_TOPK = int(os.environ.get("INT8_CLIP_SWEEP_AUDIT_LOG_TOPK", 4))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_BASELINE_MIN_CLIP = 1.0
+SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
+INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN = float(
+    os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN", 0.0)
+)
+INT8_KEEP_FLOAT_FP32_AUDIT_MIN_IMPROVED_TENSORS = int(
+    os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_IMPROVED_TENSORS", 1)
+)
+INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
+    os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN", 0.0)
+)
+INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
+    os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
+)
+INT8_CLIP_SWEEP_AUDIT_MIN_TENSOR_GAIN = float(os.environ.get("INT8_CLIP_SWEEP_AUDIT_MIN_TENSOR_GAIN", 0.0))
+INT8_CLIP_SWEEP_AUDIT_MIN_IMPROVED_TENSORS = int(os.environ.get("INT8_CLIP_SWEEP_AUDIT_MIN_IMPROVED_TENSORS", 1))
+INT8_CLIP_SWEEP_AUDIT_MIN_MEAN_GAIN = float(os.environ.get("INT8_CLIP_SWEEP_AUDIT_MIN_MEAN_GAIN", 0.0))
+INT8_CLIP_SWEEP_AUDIT_MIN_MEDIAN_GAIN = float(os.environ.get("INT8_CLIP_SWEEP_AUDIT_MIN_MEDIAN_GAIN", 0.0))
+INT8_CLIP_SWEEP_AUDIT_REQUIRE_MATCHED_TENSORS = int(
+    os.environ.get("INT8_CLIP_SWEEP_AUDIT_REQUIRE_MATCHED_TENSORS", 0)
+)
+
+int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
+for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
+    if ":" not in entry:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use pattern:value")
+    pattern, raw_value = entry.split(":", 1)
+    int8_min_clip_name_value_pairs.append((pattern.strip(), float(raw_value.strip())))
+INT8_MIN_CLIP_NAME_VALUE_PAIRS: tuple[tuple[str, float], ...] = tuple(int8_min_clip_name_value_pairs)
+for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+    if not pattern:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use non-empty pattern:value pairs")
+    if value <= 0.0:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES values must be strictly positive")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
+def keep_float_tensor_with_fp32_patterns(
+    name: str,
+    t: Tensor,
+    passthrough_orig_dtypes: dict[str, str],
+    fp32_name_patterns: tuple[str, ...],
+) -> Tensor:
+    if matches_name_patterns(name, fp32_name_patterns):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    return keep_float_tensor_with_fp32_patterns(name, t, passthrough_orig_dtypes, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)
+
+def keep_float_tensor_for_export(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    return keep_float_tensor_with_fp32_patterns(
+        name,
+        t,
+        passthrough_orig_dtypes,
+        INT8_KEEP_FLOAT_FP32_NAME_PATTERNS + INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS,
+    )
+
+def int8_scale_dtype_for_tensor(name: str, t: Tensor) -> torch.dtype:
+    if t.ndim == 2 and matches_name_patterns(name, INT8_FP32_SCALE_NAME_PATTERNS):
+        return torch.float32
+    return INT8_PER_ROW_SCALE_DTYPE
+
+def int8_min_clip_value_for_tensor(name: str, t: Tensor, default: float = INT8_BASELINE_MIN_CLIP) -> float:
+    if t.ndim != 2:
+        return default
+    for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+        if pattern in name:
+            return value
+    return default
+
+def quantize_float_tensor(
+    name: str,
+    t: Tensor,
+    scale_dtype: torch.dtype = INT8_PER_ROW_SCALE_DTYPE,
+    min_clip_value: float = INT8_BASELINE_MIN_CLIP,
+    clip_q: float = INT8_CLIP_Q,
+) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
         clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            torch.quantile(t32.abs(), clip_q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        scale = (clip_abs / 127.0).clamp_min(min_clip_value / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q, scale.to(dtype=scale_dtype).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    clip_abs = float(torch.quantile(t32.abs().flatten(), clip_q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+def restore_passthrough_tensor(name: str, stored: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    out_t = stored.detach().to("cpu").contiguous()
+    orig_dtype = passthrough_orig_dtypes.get(name)
+    if isinstance(orig_dtype, str):
+        out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+    return out_t
+
+def dequantize_quantized_tensor(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
+    if s.ndim > 0:
+        s32 = s.to(dtype=torch.float32)
+        return (q.float() * s32.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+    return (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+
+def normalized_mae(reference: Tensor, reconstructed: Tensor) -> float:
+    ref32 = reference.float()
+    recon32 = reconstructed.float()
+    denom = max(float(ref32.abs().mean().item()), 1e-12)
+    return float((recon32 - ref32).abs().mean().item() / denom)
+
+def median_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
+    if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
+        return None
+    results: list[dict[str, object]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point() or not matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS):
+            continue
+        fp16_orig_dtypes: dict[str, str] = {}
+        fp16_stored = keep_float_tensor(name, t, fp16_orig_dtypes)
+        fp16_recon = restore_passthrough_tensor(name, fp16_stored, fp16_orig_dtypes)
+        fp32_orig_dtypes: dict[str, str] = {}
+        fp32_stored = keep_float_tensor_with_fp32_patterns(
+            name,
+            t,
+            fp32_orig_dtypes,
+            INT8_KEEP_FLOAT_FP32_NAME_PATTERNS + INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS,
+        )
+        fp32_recon = restore_passthrough_tensor(name, fp32_stored, fp32_orig_dtypes)
+        fp16_error = normalized_mae(t, fp16_recon)
+        fp32_error = normalized_mae(t, fp32_recon)
+        gain = fp16_error - fp32_error
+        results.append(
+            {
+                "name": name,
+                "fp16_error": fp16_error,
+                "fp32_error": fp32_error,
+                "gain": gain,
+                "fp16_payload_bytes": tensor_nbytes(fp16_stored),
+                "fp32_payload_bytes": tensor_nbytes(fp32_stored),
+                "extra_raw_bytes": tensor_nbytes(fp32_stored) - tensor_nbytes(fp16_stored),
+            }
+        )
+    if not results:
+        return {
+            "matched_tensor_count": 0,
+            "selected": "none",
+            "improved_tensor_count": 0,
+            "mean_gain": 0.0,
+            "median_gain": 0.0,
+            "extra_raw_bytes": 0,
+            "candidate_summary": "",
+        }
+    gains = [float(item["gain"]) for item in results]
+    improved_tensor_count = sum(gain >= INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN for gain in gains)
+    mean_gain = float(sum(gains) / len(gains))
+    median_gain = median_float(gains)
+    selected = "fp32"
+    if improved_tensor_count < INT8_KEEP_FLOAT_FP32_AUDIT_MIN_IMPROVED_TENSORS:
+        selected = "none"
+    if mean_gain < INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN:
+        selected = "none"
+    if median_gain < INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN:
+        selected = "none"
+    ranked = sorted(results, key=lambda item: (float(item["gain"]), str(item["name"])), reverse=True)
+    candidate_summary = ",".join(
+        (
+            f"{str(item['name'])}|gain={float(item['gain']):.8f}|fp16={float(item['fp16_error']):.8f}|"
+            f"fp32={float(item['fp32_error']):.8f}|extra_raw={int(item['extra_raw_bytes'])}"
+            for item in ranked[: max(INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK, 0)]
+        )
+    )
+    return {
+        "matched_tensor_count": len(results),
+        "selected": selected,
+        "improved_tensor_count": improved_tensor_count,
+        "mean_gain": mean_gain,
+        "median_gain": median_gain,
+        "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in results),
+        "candidate_summary": candidate_summary,
+    }
+
+def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
+    # Keep selector scoring on the baseline fp16-scale quantized path so export
+    # ablations on still-quantized tensors do not also change the selector.
+    q, s = quantize_float_tensor(
+        name,
+        t,
+        scale_dtype=INT8_PER_ROW_SCALE_DTYPE,
+        min_clip_value=INT8_BASELINE_MIN_CLIP,
+    )
+    quantized_recon = dequantize_quantized_tensor(q, s, dtype=t.dtype)
+    candidate_orig_dtypes: dict[str, str] = {}
+    kept = keep_float_tensor(name, t, candidate_orig_dtypes)
+    kept_recon = restore_passthrough_tensor(name, kept, candidate_orig_dtypes)
+    quantized_error = normalized_mae(t, quantized_recon)
+    keep_error = normalized_mae(t, kept_recon)
+    quantized_payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
+    keep_payload_bytes = tensor_nbytes(kept)
+    return {
+        "name": name,
+        "estimated_gain": quantized_error - keep_error,
+        "quantized_error": quantized_error,
+        "keep_error": keep_error,
+        "quantized_payload_bytes": quantized_payload_bytes,
+        "keep_payload_bytes": keep_payload_bytes,
+        "extra_payload_bytes": keep_payload_bytes - quantized_payload_bytes,
+    }
+
+def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
+    if not INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
+        return None
+    candidates: list[dict[str, object]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point():
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
+            continue
+        if not matches_name_patterns(name, INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS):
+            continue
+        candidates.append(score_keep_float_candidate(name, t))
+    if not candidates:
+        return {
+            "candidate_count": 0,
+            "name": "",
+            "selected_name": "",
+            "estimated_gain": 0.0,
+            "quantized_error": 0.0,
+            "keep_error": 0.0,
+            "quantized_payload_bytes": 0,
+            "keep_payload_bytes": 0,
+            "extra_payload_bytes": 0,
+            "top_candidates_summary": "",
+        }
+    ranked = sorted(
+        candidates,
+        key=lambda item: (float(item["estimated_gain"]), -int(item["keep_payload_bytes"])),
+        reverse=True,
+    )
+    best = ranked[0]
+    best["candidate_count"] = len(candidates)
+    best["selected_name"] = str(best["name"])
+    best["top_candidates_summary"] = ",".join(
+        (
+            f"{str(item['name'])}|gain={float(item['estimated_gain']):.8f}|extra={int(item['extra_payload_bytes'])}"
+            for item in ranked[: max(INT8_AUTO_KEEP_FLOAT_LOG_TOPK, 0)]
+        )
+    )
+    return best
+
+def audit_clip_sweep_family(
+    state_dict: dict[str, Tensor],
+    selected_auto_keep_name: str,
+) -> dict[str, object] | None:
+    if not INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS or not INT8_CLIP_SWEEP_AUDIT_PERCENTILES:
+        return None
+    baseline_percentile = INT8_CLIP_PERCENTILE
+    candidate_percentiles = tuple(
+        percentile
+        for percentile in INT8_CLIP_SWEEP_AUDIT_PERCENTILES
+        if percentile > 0.0 and percentile < 100.0 and abs(percentile - baseline_percentile) > 1e-12
+    )
+    if not candidate_percentiles:
+        return {
+            "matched_tensor_count": 0,
+            "candidate_count": 0,
+            "selected_percentile": "none",
+            "selected_improved_tensor_count": 0,
+            "selected_mean_gain": 0.0,
+            "selected_median_gain": 0.0,
+            "candidate_summary": "",
+            "tensor_summary": "",
+        }
+    matched_tensors: list[tuple[str, Tensor]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point() or t.ndim != 2:
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            continue
+        if matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
+            continue
+        if name == selected_auto_keep_name:
+            continue
+        if not matches_name_patterns(name, INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS):
+            continue
+        matched_tensors.append((name, t))
+    per_candidate: list[dict[str, object]] = []
+    for percentile in candidate_percentiles:
+        candidate_q = percentile / 100.0
+        per_tensor_results: list[dict[str, object]] = []
+        for name, t in matched_tensors:
+            scale_dtype = int8_scale_dtype_for_tensor(name, t)
+            min_clip_value = int8_min_clip_value_for_tensor(name, t)
+            baseline_q, baseline_s = quantize_float_tensor(
+                name,
+                t,
+                scale_dtype=scale_dtype,
+                min_clip_value=min_clip_value,
+                clip_q=INT8_CLIP_Q,
+            )
+            candidate_qt, candidate_s = quantize_float_tensor(
+                name,
+                t,
+                scale_dtype=scale_dtype,
+                min_clip_value=min_clip_value,
+                clip_q=candidate_q,
+            )
+            baseline_error = normalized_mae(t, dequantize_quantized_tensor(baseline_q, baseline_s, dtype=t.dtype))
+            candidate_error = normalized_mae(t, dequantize_quantized_tensor(candidate_qt, candidate_s, dtype=t.dtype))
+            gain = baseline_error - candidate_error
+            per_tensor_results.append(
+                {
+                    "name": name,
+                    "baseline_error": baseline_error,
+                    "candidate_error": candidate_error,
+                    "gain": gain,
+                }
+            )
+        gains = [float(item["gain"]) for item in per_tensor_results]
+        improved_tensor_count = sum(gain >= INT8_CLIP_SWEEP_AUDIT_MIN_TENSOR_GAIN for gain in gains)
+        mean_gain = float(sum(gains) / len(gains)) if gains else 0.0
+        median_gain = median_float(gains)
+        per_candidate.append(
+            {
+                "percentile": percentile,
+                "improved_tensor_count": improved_tensor_count,
+                "mean_gain": mean_gain,
+                "median_gain": median_gain,
+                "per_tensor_results": per_tensor_results,
+            }
+        )
+    ranked = sorted(
+        per_candidate,
+        key=lambda item: (
+            int(item["improved_tensor_count"]),
+            float(item["mean_gain"]),
+            float(item["median_gain"]),
+            float(item["percentile"]),
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    selected_percentile = f"{float(best['percentile']):.5f}"
+    if INT8_CLIP_SWEEP_AUDIT_REQUIRE_MATCHED_TENSORS > 0 and len(matched_tensors) != INT8_CLIP_SWEEP_AUDIT_REQUIRE_MATCHED_TENSORS:
+        selected_percentile = "none"
+    if int(best["improved_tensor_count"]) < INT8_CLIP_SWEEP_AUDIT_MIN_IMPROVED_TENSORS:
+        selected_percentile = "none"
+    if float(best["mean_gain"]) < INT8_CLIP_SWEEP_AUDIT_MIN_MEAN_GAIN:
+        selected_percentile = "none"
+    if float(best["median_gain"]) < INT8_CLIP_SWEEP_AUDIT_MIN_MEDIAN_GAIN:
+        selected_percentile = "none"
+    candidate_summary = ",".join(
+        (
+            f"{float(item['percentile']):.5f}|improved={int(item['improved_tensor_count'])}/{len(matched_tensors)}|"
+            f"mean={float(item['mean_gain']):.8f}|median={float(item['median_gain']):.8f}"
+            for item in ranked[: max(INT8_CLIP_SWEEP_AUDIT_LOG_TOPK, 0)]
+        )
+    )
+    best_item = best
+    tensor_summary = ",".join(
+        (
+            f"{str(item['name'])}|gain={float(item['gain']):.8f}|baseline={float(item['baseline_error']):.8f}|"
+            f"candidate={float(item['candidate_error']):.8f}"
+            for item in sorted(
+                best_item["per_tensor_results"],
+                key=lambda entry: (float(entry["gain"]), str(entry["name"])),
+                reverse=True,
+            )
+        )
+    )
+    return {
+        "matched_tensor_count": len(matched_tensors),
+        "candidate_count": len(candidate_percentiles),
+        "selected_percentile": selected_percentile,
+        "selected_improved_tensor_count": int(best["improved_tensor_count"]),
+        "selected_mean_gain": float(best["mean_gain"]),
+        "selected_median_gain": float(best["median_gain"]),
+        "candidate_summary": candidate_summary,
+        "tensor_summary": tensor_summary,
+    }
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -355,9 +771,85 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    auto_keep = select_auto_keep_float_tensor(state_dict)
+    keep_float_fp32_audit = audit_keep_float_fp32_family(state_dict)
+    selected_auto_keep_name = ""
+    if auto_keep is not None:
+        selected_auto_keep_name = str(auto_keep["selected_name"])
+    clip_sweep_audit = audit_clip_sweep_family(state_dict, selected_auto_keep_name)
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "int8_payload_bytes",
+            "large_keep_tensor_count",
+            "large_keep_payload_bytes",
+            "auto_keep_tensor_count",
+            "auto_keep_payload_bytes",
+            "fp32_scale_tensor_count",
+            "fp32_scale_payload_bytes",
+            "min_clip_override_tensor_count",
+            "extra_fp32_keep_tensor_count",
+            "extra_fp32_keep_extra_bytes",
+        ),
         0,
+    )
+    stats["auto_keep_candidate_count"] = int(auto_keep["candidate_count"]) if auto_keep is not None else 0
+    stats["auto_keep_selected_name"] = selected_auto_keep_name
+    stats["auto_keep_estimated_gain"] = float(auto_keep["estimated_gain"]) if auto_keep is not None else 0.0
+    stats["auto_keep_quantized_error"] = float(auto_keep["quantized_error"]) if auto_keep is not None else 0.0
+    stats["auto_keep_keep_error"] = float(auto_keep["keep_error"]) if auto_keep is not None else 0.0
+    stats["auto_keep_quantized_payload_bytes"] = int(auto_keep["quantized_payload_bytes"]) if auto_keep is not None else 0
+    stats["auto_keep_keep_payload_bytes"] = int(auto_keep["keep_payload_bytes"]) if auto_keep is not None else 0
+    stats["auto_keep_extra_payload_bytes"] = (
+        stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
+    )
+    stats["auto_keep_top_candidates_summary"] = str(auto_keep["top_candidates_summary"]) if auto_keep is not None else ""
+    stats["keep_float_fp32_audit_matched_tensor_count"] = (
+        int(keep_float_fp32_audit["matched_tensor_count"]) if keep_float_fp32_audit is not None else 0
+    )
+    stats["keep_float_fp32_audit_selected"] = str(keep_float_fp32_audit["selected"]) if keep_float_fp32_audit is not None else "none"
+    stats["keep_float_fp32_audit_improved_tensor_count"] = (
+        int(keep_float_fp32_audit["improved_tensor_count"]) if keep_float_fp32_audit is not None else 0
+    )
+    stats["keep_float_fp32_audit_mean_gain"] = (
+        float(keep_float_fp32_audit["mean_gain"]) if keep_float_fp32_audit is not None else 0.0
+    )
+    stats["keep_float_fp32_audit_median_gain"] = (
+        float(keep_float_fp32_audit["median_gain"]) if keep_float_fp32_audit is not None else 0.0
+    )
+    stats["keep_float_fp32_audit_extra_raw_bytes"] = (
+        int(keep_float_fp32_audit["extra_raw_bytes"]) if keep_float_fp32_audit is not None else 0
+    )
+    stats["keep_float_fp32_audit_candidate_summary"] = (
+        str(keep_float_fp32_audit["candidate_summary"]) if keep_float_fp32_audit is not None else ""
+    )
+    stats["clip_sweep_audit_matched_tensor_count"] = (
+        int(clip_sweep_audit["matched_tensor_count"]) if clip_sweep_audit is not None else 0
+    )
+    stats["clip_sweep_audit_candidate_count"] = (
+        int(clip_sweep_audit["candidate_count"]) if clip_sweep_audit is not None else 0
+    )
+    stats["clip_sweep_audit_selected_percentile"] = (
+        str(clip_sweep_audit["selected_percentile"]) if clip_sweep_audit is not None else "none"
+    )
+    stats["clip_sweep_audit_selected_improved_tensor_count"] = (
+        int(clip_sweep_audit["selected_improved_tensor_count"]) if clip_sweep_audit is not None else 0
+    )
+    stats["clip_sweep_audit_selected_mean_gain"] = (
+        float(clip_sweep_audit["selected_mean_gain"]) if clip_sweep_audit is not None else 0.0
+    )
+    stats["clip_sweep_audit_selected_median_gain"] = (
+        float(clip_sweep_audit["selected_median_gain"]) if clip_sweep_audit is not None else 0.0
+    )
+    stats["clip_sweep_audit_candidate_summary"] = (
+        str(clip_sweep_audit["candidate_summary"]) if clip_sweep_audit is not None else ""
+    )
+    stats["clip_sweep_audit_tensor_summary"] = (
+        str(clip_sweep_audit["tensor_summary"]) if clip_sweep_audit is not None else ""
     )
 
     for name, tensor in state_dict.items():
@@ -374,16 +866,35 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+        keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
+        keep_auto = name == selected_auto_keep_name
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
+            baseline_kept_bytes = tensor_nbytes(keep_float_tensor(name, t, {}))
+            kept = keep_float_tensor_for_export(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS):
+                stats["extra_fp32_keep_tensor_count"] += 1
+                stats["extra_fp32_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
+            if keep_large:
+                stats["large_keep_tensor_count"] += 1
+                stats["large_keep_payload_bytes"] += tensor_nbytes(kept)
+            if keep_auto:
+                stats["auto_keep_tensor_count"] += 1
+                stats["auto_keep_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        scale_dtype = int8_scale_dtype_for_tensor(name, t)
+        min_clip_value = int8_min_clip_value_for_tensor(name, t)
+        q, s = quantize_float_tensor(name, t, scale_dtype=scale_dtype, min_clip_value=min_clip_value)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
+            if scale_dtype == torch.float32:
+                stats["fp32_scale_tensor_count"] += 1
+                stats["fp32_scale_payload_bytes"] += tensor_nbytes(s)
+            if min_clip_value != INT8_BASELINE_MIN_CLIP:
+                stats["min_clip_override_tensor_count"] += 1
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -418,11 +929,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
+        out[name] = restore_passthrough_tensor(name, t, passthrough_orig_dtypes)
     return out
 
 
@@ -1115,11 +1622,109 @@ def main() -> None:
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        if INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
+            log0(
+                "Int8 auto-keep selector: "
+                f"candidates:{quant_stats['auto_keep_candidate_count']} "
+                f"selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
+                f"estimated_gain:{quant_stats['auto_keep_estimated_gain']:.8f} "
+                f"quantized_error:{quant_stats['auto_keep_quantized_error']:.8f} "
+                f"keep_error:{quant_stats['auto_keep_keep_error']:.8f}"
+            )
+            if quant_stats["auto_keep_top_candidates_summary"]:
+                log0(f"Int8 auto-keep top candidates: {quant_stats['auto_keep_top_candidates_summary']}")
+            log0(
+                "Int8 auto-keep bytes: "
+                f"large_tensors:{quant_stats['large_keep_tensor_count']} "
+                f"large_payload:{quant_stats['large_keep_payload_bytes']} "
+                f"selected_tensors:{quant_stats['auto_keep_tensor_count']} "
+                f"selected_payload:{quant_stats['auto_keep_payload_bytes']} "
+                f"selected_quantized_payload:{quant_stats['auto_keep_quantized_payload_bytes']} "
+                f"selected_extra_payload:{quant_stats['auto_keep_extra_payload_bytes']}"
+            )
+        if INT8_FP32_SCALE_NAME_PATTERNS:
+            log0(
+                "Int8 scale storage: "
+                f"fp32_tensors:{quant_stats['fp32_scale_tensor_count']} "
+                f"fp32_bytes:{quant_stats['fp32_scale_payload_bytes']}"
+            )
+        if INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+            override_summary = ",".join(
+                f"{pattern}:{value:.5f}" for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS
+            )
+            log0(
+                "Int8 min-clip override: "
+                f"tensors:{quant_stats['min_clip_override_tensor_count']} "
+                f"baseline:{INT8_BASELINE_MIN_CLIP:.5f} "
+                f"overrides:{override_summary}"
+            )
+        if INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS:
+            override_summary = ",".join(INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS)
+            log0(
+                "Kept float storage: "
+                f"extra_fp32_tensors:{quant_stats['extra_fp32_keep_tensor_count']} "
+                f"extra_fp32_extra_bytes:{quant_stats['extra_fp32_keep_extra_bytes']} "
+                f"patterns:{override_summary}"
+            )
+        if INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
+            audit_summary = ",".join(INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS)
+            log0(
+                "Int8 kept-float fp32 audit: "
+                f"tensors:{quant_stats['keep_float_fp32_audit_matched_tensor_count']} "
+                f"selected:{quant_stats['keep_float_fp32_audit_selected']} "
+                f"patterns:{audit_summary} "
+                f"extra_raw_bytes:{quant_stats['keep_float_fp32_audit_extra_raw_bytes']}"
+            )
+            log0(
+                "Int8 kept-float fp32 thresholds: "
+                f"min_tensor_gain:{INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN:.8f} "
+                f"min_improved_tensors:{INT8_KEEP_FLOAT_FP32_AUDIT_MIN_IMPROVED_TENSORS} "
+                f"min_mean_gain:{INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN:.8f} "
+                f"min_median_gain:{INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN:.8f} "
+                f"selected_improved:{quant_stats['keep_float_fp32_audit_improved_tensor_count']} "
+                f"selected_mean_gain:{quant_stats['keep_float_fp32_audit_mean_gain']:.8f} "
+                f"selected_median_gain:{quant_stats['keep_float_fp32_audit_median_gain']:.8f}"
+            )
+            if quant_stats["keep_float_fp32_audit_candidate_summary"]:
+                log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
+        if INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS:
+            audit_summary = ",".join(INT8_CLIP_SWEEP_AUDIT_NAME_PATTERNS)
+            log0(
+                "Int8 clip sweep audit: "
+                f"baseline:{INT8_CLIP_PERCENTILE:.5f} "
+                f"tensors:{quant_stats['clip_sweep_audit_matched_tensor_count']} "
+                f"candidates:{quant_stats['clip_sweep_audit_candidate_count']} "
+                f"selected:{quant_stats['clip_sweep_audit_selected_percentile']} "
+                f"patterns:{audit_summary}"
+            )
+            log0(
+                "Int8 clip sweep thresholds: "
+                f"require_tensors:{INT8_CLIP_SWEEP_AUDIT_REQUIRE_MATCHED_TENSORS} "
+                f"min_tensor_gain:{INT8_CLIP_SWEEP_AUDIT_MIN_TENSOR_GAIN:.8f} "
+                f"min_improved_tensors:{INT8_CLIP_SWEEP_AUDIT_MIN_IMPROVED_TENSORS} "
+                f"min_mean_gain:{INT8_CLIP_SWEEP_AUDIT_MIN_MEAN_GAIN:.8f} "
+                f"min_median_gain:{INT8_CLIP_SWEEP_AUDIT_MIN_MEDIAN_GAIN:.8f} "
+                f"selected_improved:{quant_stats['clip_sweep_audit_selected_improved_tensor_count']} "
+                f"selected_mean_gain:{quant_stats['clip_sweep_audit_selected_mean_gain']:.8f} "
+                f"selected_median_gain:{quant_stats['clip_sweep_audit_selected_median_gain']:.8f}"
+            )
+            if quant_stats["clip_sweep_audit_candidate_summary"]:
+                log0(f"Int8 clip sweep candidates: {quant_stats['clip_sweep_audit_candidate_summary']}")
+            if quant_stats["clip_sweep_audit_tensor_summary"]:
+                log0(f"Int8 clip sweep tensors: {quant_stats['clip_sweep_audit_tensor_summary']}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        total_submission_bytes = quant_file_bytes + code_bytes
+        size_headroom = SUBMISSION_SIZE_CAP_BYTES - total_submission_bytes
+        log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
+        log0(
+            "Submission size headroom: "
+            f"cap:{SUBMISSION_SIZE_CAP_BYTES} "
+            f"used:{total_submission_bytes} "
+            f"remaining:{size_headroom}"
+        )
 
     if distributed:
         dist.barrier()
