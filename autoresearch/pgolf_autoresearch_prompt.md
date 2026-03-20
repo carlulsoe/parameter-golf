@@ -13,6 +13,7 @@ Context to read before acting:
 Goal:
 - Improve final `final_int8_zlib_roundtrip_exact val_bpb` on the FineWeb validation set.
 - Lower `val_bpb` is better.
+- Prioritize ideas that are plausibly transferable from stronger 8xH100 record runs into this 1xA40 proxy, rather than narrow one-off export bookkeeping tweaks.
 
 Protocol:
 1. Inspect `git status`, recent commits, `results.tsv`, and recent logs.
@@ -40,6 +41,17 @@ Rules:
 - Do not delete or redownload the dataset.
 - Do not change the tokenizer or dataset export path unless that is the explicit experiment.
 - Prefer bounded changes that can be evaluated in one run.
+- Prefer ideas from these categories:
+  - evaluation correctness or richer-context evaluation that keeps comparisons trustworthy, for example sliding-window evaluation or partial-window accounting fixes
+  - training schedule and optimizer changes that plausibly reduce quantization damage, for example lower learning rates, longer warmdown, momentum or weight-decay tuning, or batch/update tradeoffs
+  - architecture and export co-design that is still realistic on this proxy, for example modest depth or width changes, selective fp16 on especially sensitive tensors, or mixed-precision layer plans that improve the final compressed artifact
+  - training-side changes that make the final int8/zlib metric better for causal reasons, not just post-hoc reporting changes
+- Deprioritize these categories unless recent evidence in the repo strongly supports them:
+  - narrow export-only audits, allowlist reshuffles, or selector/bookkeeping tweaks with no strong causal story for transferability
+  - patches whose main effect is to exploit an evaluation artifact rather than improve a trustworthy final comparison
+  - large bundles of loosely related ideas that make attribution hard
+- Use the upstream 8xH100 records as idea sources, not as a target for exact hyperparameter copying. Adapt them to what can plausibly teach us something in a 1xA40 10-minute run.
+- In `HYPOTHESIS`, explain both why the idea should help this proxy and why the mechanism might transfer to the full challenge regime.
 - Keep the code change self-contained and cherry-pick friendly. The controller may apply it onto a slightly newer reviewed state after other runs finish.
 - Keep the repo runnable after the iteration.
 - Do not update `results.tsv` or `reviews.tsv` yourself.
