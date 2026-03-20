@@ -320,6 +320,11 @@ INT8_FP32_SCALE_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_FP32_SCALE_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_FP32_SCALE_AUDIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_FP32_SCALE_AUDIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_MIN_CLIP_NAME_VALUE_OVERRIDES = tuple(
     entry.strip()
     for entry in os.environ.get("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES", "").split(",")
@@ -337,6 +342,7 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
 )
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
+INT8_FP32_SCALE_AUDIT_LOG_TOPK = int(os.environ.get("INT8_FP32_SCALE_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -356,6 +362,21 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
 )
+INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS = int(
+    os.environ.get("INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS", 0)
+)
+INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN = float(
+    os.environ.get("INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN", 0.0)
+)
+INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS = int(
+    os.environ.get("INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS", 1)
+)
+INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN = float(
+    os.environ.get("INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN", 0.0)
+)
+INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN = float(
+    os.environ.get("INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN", 0.0)
+)
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
 for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
@@ -369,6 +390,17 @@ for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
         raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use non-empty pattern:value pairs")
     if value <= 0.0:
         raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES values must be strictly positive")
+for value, name in (
+    (INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN, "INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN"),
+    (INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN, "INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN"),
+    (INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN, "INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN"),
+):
+    if value < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+if INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS < 0:
+    raise ValueError("INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS must be non-negative")
+if INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS < 1:
+    raise ValueError("INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS must be at least 1")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -539,6 +571,83 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "candidate_summary": candidate_summary,
     }
 
+def audit_fp32_scale_family(
+    state_dict: dict[str, Tensor],
+    selected_auto_keep_name: str,
+) -> dict[str, object] | None:
+    if not INT8_FP32_SCALE_AUDIT_NAME_PATTERNS:
+        return None
+    results: list[dict[str, object]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point() or t.ndim != 2:
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            continue
+        if name == selected_auto_keep_name or matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
+            continue
+        if not matches_name_patterns(name, INT8_FP32_SCALE_AUDIT_NAME_PATTERNS):
+            continue
+        if int8_scale_dtype_for_tensor(name, t) == torch.float32:
+            continue
+        min_clip_value = int8_min_clip_value_for_tensor(name, t)
+        q16, s16 = quantize_float_tensor(name, t, scale_dtype=INT8_PER_ROW_SCALE_DTYPE, min_clip_value=min_clip_value)
+        q32, s32 = quantize_float_tensor(name, t, scale_dtype=torch.float32, min_clip_value=min_clip_value)
+        fp16_recon = dequantize_quantized_tensor(q16, s16, dtype=t.dtype)
+        fp32_recon = dequantize_quantized_tensor(q32, s32, dtype=t.dtype)
+        fp16_error = normalized_mae(t, fp16_recon)
+        fp32_error = normalized_mae(t, fp32_recon)
+        gain = fp16_error - fp32_error
+        results.append(
+            {
+                "name": name,
+                "fp16_error": fp16_error,
+                "fp32_error": fp32_error,
+                "gain": gain,
+                "extra_scale_bytes": tensor_nbytes(s32) - tensor_nbytes(s16),
+            }
+        )
+    if not results:
+        return {
+            "matched_tensor_count": 0,
+            "selected": "none",
+            "improved_tensor_count": 0,
+            "mean_gain": 0.0,
+            "median_gain": 0.0,
+            "extra_scale_bytes": 0,
+            "candidate_summary": "",
+        }
+    gains = [float(item["gain"]) for item in results]
+    improved_tensor_count = sum(gain >= INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN for gain in gains)
+    mean_gain = float(sum(gains) / len(gains))
+    median_gain = median_float(gains)
+    selected = "fp32"
+    if INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS > 0 and len(results) != INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS:
+        selected = "none"
+    if improved_tensor_count < INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS:
+        selected = "none"
+    if mean_gain < INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN:
+        selected = "none"
+    if median_gain < INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN:
+        selected = "none"
+    ranked = sorted(results, key=lambda item: (float(item["gain"]), str(item["name"])), reverse=True)
+    candidate_summary = ",".join(
+        (
+            f"{str(item['name'])}|gain={float(item['gain']):.8f}|fp16={float(item['fp16_error']):.8f}|"
+            f"fp32={float(item['fp32_error']):.8f}|extra_scale={int(item['extra_scale_bytes'])}"
+            for item in ranked[: max(INT8_FP32_SCALE_AUDIT_LOG_TOPK, 0)]
+        )
+    )
+    return {
+        "matched_tensor_count": len(results),
+        "selected": selected,
+        "improved_tensor_count": improved_tensor_count,
+        "mean_gain": mean_gain,
+        "median_gain": median_gain,
+        "extra_scale_bytes": sum(int(item["extra_scale_bytes"]) for item in results),
+        "candidate_summary": candidate_summary,
+    }
+
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
     # ablations on still-quantized tensors do not also change the selector.
@@ -625,6 +734,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     selected_auto_keep_name = ""
     if auto_keep is not None:
         selected_auto_keep_name = str(auto_keep["selected_name"])
+    fp32_scale_audit = audit_fp32_scale_family(state_dict, selected_auto_keep_name)
     stats = dict.fromkeys(
         (
             "param_count",
@@ -674,6 +784,25 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     )
     stats["keep_float_fp32_audit_candidate_summary"] = (
         str(keep_float_fp32_audit["candidate_summary"]) if keep_float_fp32_audit is not None else ""
+    )
+    stats["fp32_scale_audit_matched_tensor_count"] = (
+        int(fp32_scale_audit["matched_tensor_count"]) if fp32_scale_audit is not None else 0
+    )
+    stats["fp32_scale_audit_selected"] = str(fp32_scale_audit["selected"]) if fp32_scale_audit is not None else "none"
+    stats["fp32_scale_audit_improved_tensor_count"] = (
+        int(fp32_scale_audit["improved_tensor_count"]) if fp32_scale_audit is not None else 0
+    )
+    stats["fp32_scale_audit_mean_gain"] = (
+        float(fp32_scale_audit["mean_gain"]) if fp32_scale_audit is not None else 0.0
+    )
+    stats["fp32_scale_audit_median_gain"] = (
+        float(fp32_scale_audit["median_gain"]) if fp32_scale_audit is not None else 0.0
+    )
+    stats["fp32_scale_audit_extra_scale_bytes"] = (
+        int(fp32_scale_audit["extra_scale_bytes"]) if fp32_scale_audit is not None else 0
+    )
+    stats["fp32_scale_audit_candidate_summary"] = (
+        str(fp32_scale_audit["candidate_summary"]) if fp32_scale_audit is not None else ""
     )
 
     for name, tensor in state_dict.items():
@@ -1511,6 +1640,28 @@ def main() -> None:
             )
             if quant_stats["keep_float_fp32_audit_candidate_summary"]:
                 log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
+        if INT8_FP32_SCALE_AUDIT_NAME_PATTERNS:
+            audit_summary = ",".join(INT8_FP32_SCALE_AUDIT_NAME_PATTERNS)
+            log0(
+                "Int8 fp32-scale audit: "
+                f"tensors:{quant_stats['fp32_scale_audit_matched_tensor_count']} "
+                f"selected:{quant_stats['fp32_scale_audit_selected']} "
+                f"patterns:{audit_summary} "
+                f"extra_scale_bytes:{quant_stats['fp32_scale_audit_extra_scale_bytes']}"
+            )
+            log0(
+                "Int8 fp32-scale thresholds: "
+                f"require_tensors:{INT8_FP32_SCALE_AUDIT_REQUIRE_MATCHED_TENSORS} "
+                f"min_tensor_gain:{INT8_FP32_SCALE_AUDIT_MIN_TENSOR_GAIN:.8f} "
+                f"min_improved_tensors:{INT8_FP32_SCALE_AUDIT_MIN_IMPROVED_TENSORS} "
+                f"min_mean_gain:{INT8_FP32_SCALE_AUDIT_MIN_MEAN_GAIN:.8f} "
+                f"min_median_gain:{INT8_FP32_SCALE_AUDIT_MIN_MEDIAN_GAIN:.8f} "
+                f"selected_improved:{quant_stats['fp32_scale_audit_improved_tensor_count']} "
+                f"selected_mean_gain:{quant_stats['fp32_scale_audit_mean_gain']:.8f} "
+                f"selected_median_gain:{quant_stats['fp32_scale_audit_median_gain']:.8f}"
+            )
+            if quant_stats["fp32_scale_audit_candidate_summary"]:
+                log0(f"Int8 fp32-scale candidates: {quant_stats['fp32_scale_audit_candidate_summary']}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
