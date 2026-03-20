@@ -305,11 +305,6 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
-    if pattern
-)
 INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get("INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS", "").split(",")
@@ -340,9 +335,7 @@ def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in name for pattern in patterns)
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS) or matches_name_patterns(
-        name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS
-    ):
+    if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -488,8 +481,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "auto_keep_payload_bytes",
             "fp32_scale_tensor_count",
             "fp32_scale_payload_bytes",
-            "fp32_keep_override_tensor_count",
-            "fp32_keep_override_payload_bytes",
         ),
         0,
     )
@@ -525,9 +516,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS):
-                stats["fp32_keep_override_tensor_count"] += 1
-                stats["fp32_keep_override_payload_bytes"] += tensor_nbytes(kept)
             if keep_large:
                 stats["large_keep_tensor_count"] += 1
                 stats["large_keep_payload_bytes"] += tensor_nbytes(kept)
@@ -1296,12 +1284,6 @@ def main() -> None:
                 "Int8 scale storage: "
                 f"fp32_tensors:{quant_stats['fp32_scale_tensor_count']} "
                 f"fp32_bytes:{quant_stats['fp32_scale_payload_bytes']}"
-            )
-        if INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS:
-            log0(
-                "Kept float fp32 overrides: "
-                f"tensors:{quant_stats['fp32_keep_override_tensor_count']} "
-                f"bytes:{quant_stats['fp32_keep_override_payload_bytes']}"
             )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
