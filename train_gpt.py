@@ -335,6 +335,11 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -607,6 +612,100 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
         )
     )
     return best
+
+def audit_exact_extra_keep_float(
+    state_dict: dict[str, Tensor],
+    quant_obj: dict[str, object],
+    baseline_submission_bytes: int,
+    code_bytes: int,
+) -> dict[str, object] | None:
+    if not INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS:
+        return None
+    quantized = dict(quant_obj["quantized"])
+    scales = dict(quant_obj["scales"])
+    dtypes = dict(quant_obj["dtypes"])
+    passthrough = dict(quant_obj["passthrough"])
+    passthrough_orig_dtypes = dict(quant_obj.get("passthrough_orig_dtypes", {}))
+    qmeta = dict(quant_obj.get("qmeta", {}))
+    matched: list[dict[str, object]] = []
+
+    for name, tensor in state_dict.items():
+        if not matches_name_patterns(name, INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS):
+            continue
+        if name not in quantized:
+            continue
+        t = tensor.detach().to("cpu").contiguous()
+        if not t.is_floating_point():
+            continue
+        kept_orig_dtypes: dict[str, str] = {}
+        kept = keep_float_tensor(name, t, kept_orig_dtypes)
+        quantized_payload_bytes = tensor_nbytes(quantized[name]) + tensor_nbytes(scales[name])
+        keep_payload_bytes = tensor_nbytes(kept)
+        matched.append(
+            {
+                "name": name,
+                "quantized_payload_bytes": quantized_payload_bytes,
+                "keep_payload_bytes": keep_payload_bytes,
+                "extra_raw_bytes": keep_payload_bytes - quantized_payload_bytes,
+            }
+        )
+        passthrough[name] = kept
+        passthrough_orig_dtypes.update(kept_orig_dtypes)
+        del quantized[name]
+        del scales[name]
+        del dtypes[name]
+        qmeta.pop(name, None)
+
+    if not matched:
+        return {
+            "matched_tensor_count": 0,
+            "matched_names": "",
+            "quantized_payload_bytes": 0,
+            "keep_payload_bytes": 0,
+            "extra_raw_bytes": 0,
+            "candidate_summary": "",
+            "baseline_submission_bytes": baseline_submission_bytes,
+            "promoted_submission_bytes": baseline_submission_bytes,
+            "extra_submission_bytes": 0,
+            "remaining_after_bytes": SUBMISSION_SIZE_CAP_BYTES - baseline_submission_bytes,
+        }
+
+    promoted_obj: dict[str, object] = {
+        "__quant_format__": str(quant_obj["__quant_format__"]),
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        promoted_obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        promoted_obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+
+    promoted_buf = io.BytesIO()
+    torch.save(promoted_obj, promoted_buf)
+    promoted_blob = zlib.compress(promoted_buf.getvalue(), level=9)
+    promoted_submission_bytes = len(promoted_blob) + code_bytes
+    matched_names = ",".join(str(item["name"]) for item in matched)
+    candidate_summary = ",".join(
+        (
+            f"{str(item['name'])}|quantized={int(item['quantized_payload_bytes'])}|"
+            f"keep={int(item['keep_payload_bytes'])}|extra_raw={int(item['extra_raw_bytes'])}"
+        )
+        for item in matched
+    )
+    return {
+        "matched_tensor_count": len(matched),
+        "matched_names": matched_names,
+        "quantized_payload_bytes": sum(int(item["quantized_payload_bytes"]) for item in matched),
+        "keep_payload_bytes": sum(int(item["keep_payload_bytes"]) for item in matched),
+        "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in matched),
+        "candidate_summary": candidate_summary,
+        "baseline_submission_bytes": baseline_submission_bytes,
+        "promoted_submission_bytes": promoted_submission_bytes,
+        "extra_submission_bytes": promoted_submission_bytes - baseline_submission_bytes,
+        "remaining_after_bytes": SUBMISSION_SIZE_CAP_BYTES - promoted_submission_bytes,
+    }
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -1516,6 +1615,12 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         total_submission_bytes = quant_file_bytes + code_bytes
+        extra_keep_audit = audit_exact_extra_keep_float(
+            base_model.state_dict(),
+            quant_obj,
+            baseline_submission_bytes=total_submission_bytes,
+            code_bytes=code_bytes,
+        )
         size_headroom = SUBMISSION_SIZE_CAP_BYTES - total_submission_bytes
         log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
         log0(
@@ -1524,6 +1629,28 @@ def main() -> None:
             f"used:{total_submission_bytes} "
             f"remaining:{size_headroom}"
         )
+        if INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS:
+            audit_patterns = ",".join(INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS)
+            if extra_keep_audit is None:
+                raise RuntimeError("INT8_KEEP_FLOAT_EXTRA_AUDIT_NAME_PATTERNS requested but audit did not run")
+            log0(
+                "Int8 extra keep-float audit: "
+                f"tensors:{extra_keep_audit['matched_tensor_count']} "
+                f"patterns:{audit_patterns} "
+                f"matched:{extra_keep_audit['matched_names'] or 'none'} "
+                f"quantized_payload:{extra_keep_audit['quantized_payload_bytes']} "
+                f"keep_payload:{extra_keep_audit['keep_payload_bytes']} "
+                f"extra_raw_bytes:{extra_keep_audit['extra_raw_bytes']}"
+            )
+            log0(
+                "Int8 extra keep-float audit bytes: "
+                f"baseline_submission:{extra_keep_audit['baseline_submission_bytes']} "
+                f"promoted_submission:{extra_keep_audit['promoted_submission_bytes']} "
+                f"extra_submission:{extra_keep_audit['extra_submission_bytes']} "
+                f"remaining_after:{extra_keep_audit['remaining_after_bytes']}"
+            )
+            if extra_keep_audit["candidate_summary"]:
+                log0(f"Int8 extra keep-float audit candidates: {extra_keep_audit['candidate_summary']}")
 
     if distributed:
         dist.barrier()
