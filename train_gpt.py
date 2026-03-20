@@ -320,34 +320,13 @@ INT8_FP32_SCALE_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_FP32_SCALE_NAME_PATTERNS", "").split(",")
     if pattern
 )
-INT8_MIN_CLIP_AUDIT_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get("INT8_MIN_CLIP_AUDIT_NAME_PATTERNS", "").split(",")
-    if pattern
-)
-INT8_MIN_CLIP_AUDIT_VALUES = tuple(
-    float(value.strip())
-    for value in os.environ.get("INT8_MIN_CLIP_AUDIT_VALUES", "").split(",")
-    if value.strip()
-)
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
-INT8_MIN_CLIP_AUDIT_LOG_TOPK = int(os.environ.get("INT8_MIN_CLIP_AUDIT_LOG_TOPK", 4))
-INT8_MIN_CLIP_AUDIT_MIN_ROW_GAIN = float(os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_ROW_GAIN", 0.0001))
-INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_ROWS = int(os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_ROWS", 128))
-INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS = int(os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS", 4))
-INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN = float(
-    os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN", 0.00002)
-)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT8_BASELINE_MIN_CLIP = 1.0
 SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
-
-if any(value <= 0.0 for value in INT8_MIN_CLIP_AUDIT_VALUES):
-    raise ValueError("INT8_MIN_CLIP_AUDIT_VALUES must be strictly positive")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -368,33 +347,20 @@ def int8_scale_dtype_for_tensor(name: str, t: Tensor) -> torch.dtype:
         return torch.float32
     return INT8_PER_ROW_SCALE_DTYPE
 
-def _quantize_int8_per_row(
-    t32: Tensor,
-    scale_dtype: torch.dtype,
-    min_clip_value: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    clip_abs = (
-        torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-        if t32.numel()
-        else torch.empty((t32.shape[0],), dtype=torch.float32)
-    )
-    clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-    scale = (clip_abs / 127.0).clamp_min(min_clip_value / 127.0)
-    q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-    return q, scale.to(dtype=scale_dtype).contiguous(), clip_abs
-
-def quantize_float_tensor(
-    name: str,
-    t: Tensor,
-    scale_dtype: torch.dtype = INT8_PER_ROW_SCALE_DTYPE,
-    min_clip_value: float = INT8_BASELINE_MIN_CLIP,
-) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(name: str, t: Tensor, scale_dtype: torch.dtype = INT8_PER_ROW_SCALE_DTYPE) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
-        q, scale, _ = _quantize_int8_per_row(t32, scale_dtype=scale_dtype, min_clip_value=min_clip_value)
-        return q, scale
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=scale_dtype).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
@@ -420,12 +386,6 @@ def normalized_mae(reference: Tensor, reconstructed: Tensor) -> float:
     recon32 = reconstructed.float()
     denom = max(float(ref32.abs().mean().item()), 1e-12)
     return float((recon32 - ref32).abs().mean().item() / denom)
-
-def rowwise_normalized_mae(reference: Tensor, reconstructed: Tensor) -> Tensor:
-    ref32 = reference.float()
-    recon32 = reconstructed.float()
-    denom = ref32.abs().mean(dim=1).clamp_min(1e-12)
-    return (recon32 - ref32).abs().mean(dim=1) / denom
 
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
@@ -491,133 +451,6 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
     )
     return best
 
-def audit_min_clip_candidates(
-    audit_tensors: list[tuple[str, Tensor]],
-) -> dict[str, object]:
-    stats: dict[str, object] = {
-        "match_tensors": 0,
-        "match_rows": 0,
-        "baseline_floor_rows": 0,
-        "baseline_floor_frac": 0.0,
-        "candidate_count": len(INT8_MIN_CLIP_AUDIT_VALUES),
-        "selected_min_clip": "none",
-        "selected_improved_rows": 0,
-        "selected_improved_tensors": 0,
-        "selected_mean_tensor_gain": 0.0,
-        "selected_mean_row_gain": 0.0,
-        "candidate_summary": "",
-    }
-    if not INT8_MIN_CLIP_AUDIT_NAME_PATTERNS or not INT8_MIN_CLIP_AUDIT_VALUES or not audit_tensors:
-        return stats
-
-    candidate_rows = []
-    baseline_floor_rows = 0
-    total_rows = 0
-    for name, tensor in audit_tensors:
-        t = tensor.float()
-        baseline_q, baseline_s, clip_abs = _quantize_int8_per_row(
-            t,
-            scale_dtype=torch.float32,
-            min_clip_value=INT8_BASELINE_MIN_CLIP,
-        )
-        baseline_recon = dequantize_quantized_tensor(baseline_q, baseline_s, dtype=tensor.dtype)
-        baseline_row_error = rowwise_normalized_mae(tensor, baseline_recon)
-        floor_mask = clip_abs < INT8_BASELINE_MIN_CLIP
-        affected_rows = int(floor_mask.sum().item())
-        baseline_floor_rows += affected_rows
-        total_rows += int(t.shape[0])
-
-        row_summaries = []
-        for min_clip_value in INT8_MIN_CLIP_AUDIT_VALUES:
-            alt_q, alt_s, _ = _quantize_int8_per_row(t, scale_dtype=torch.float32, min_clip_value=min_clip_value)
-            alt_recon = dequantize_quantized_tensor(alt_q, alt_s, dtype=tensor.dtype)
-            alt_row_error = rowwise_normalized_mae(tensor, alt_recon)
-            row_gain = baseline_row_error - alt_row_error
-            affected_row_gain = row_gain[floor_mask]
-            improved_rows = int((affected_row_gain >= INT8_MIN_CLIP_AUDIT_MIN_ROW_GAIN).sum().item())
-            mean_row_gain = float(affected_row_gain.mean().item()) if affected_rows > 0 else 0.0
-            tensor_gain = normalized_mae(tensor, baseline_recon) - normalized_mae(tensor, alt_recon)
-            row_summaries.append(
-                {
-                    "min_clip_value": min_clip_value,
-                    "improved_rows": improved_rows,
-                    "affected_rows": affected_rows,
-                    "mean_row_gain": mean_row_gain,
-                    "tensor_gain": tensor_gain,
-                }
-            )
-        candidate_rows.append((name, row_summaries))
-
-    stats["match_tensors"] = len(audit_tensors)
-    stats["match_rows"] = total_rows
-    stats["baseline_floor_rows"] = baseline_floor_rows
-    stats["baseline_floor_frac"] = (baseline_floor_rows / total_rows) if total_rows > 0 else 0.0
-
-    candidate_aggregates = []
-    for idx, min_clip_value in enumerate(INT8_MIN_CLIP_AUDIT_VALUES):
-        improved_rows = 0
-        affected_rows = 0
-        improved_tensors = 0
-        tensor_gains = []
-        row_gain_mass = 0.0
-        for _, row_summaries in candidate_rows:
-            row_summary = row_summaries[idx]
-            improved_rows += int(row_summary["improved_rows"])
-            affected_rows += int(row_summary["affected_rows"])
-            tensor_gain = float(row_summary["tensor_gain"])
-            tensor_gains.append(tensor_gain)
-            row_gain_mass += float(row_summary["mean_row_gain"]) * int(row_summary["affected_rows"])
-            if tensor_gain >= INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN:
-                improved_tensors += 1
-        mean_tensor_gain = float(sum(tensor_gains) / max(len(tensor_gains), 1))
-        mean_row_gain = row_gain_mass / max(affected_rows, 1)
-        candidate_aggregates.append(
-            {
-                "min_clip_value": min_clip_value,
-                "improved_rows": improved_rows,
-                "affected_rows": affected_rows,
-                "improved_tensors": improved_tensors,
-                "mean_tensor_gain": mean_tensor_gain,
-                "mean_row_gain": mean_row_gain,
-            }
-        )
-
-    ranked = sorted(
-        candidate_aggregates,
-        key=lambda item: (
-            int(item["improved_tensors"]) >= INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS
-            and int(item["improved_rows"]) >= INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_ROWS
-            and float(item["mean_tensor_gain"]) >= INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN,
-            float(item["mean_tensor_gain"]),
-            float(item["mean_row_gain"]),
-            -float(item["min_clip_value"]),
-        ),
-        reverse=True,
-    )
-    stats["candidate_summary"] = ",".join(
-        (
-            f"{float(item['min_clip_value']):.5f}|rows={int(item['improved_rows'])}/{int(item['affected_rows'])}"
-            f"|tensors={int(item['improved_tensors'])}/{len(audit_tensors)}"
-            f"|mean_tensor_gain={float(item['mean_tensor_gain']):.8f}"
-            f"|mean_row_gain={float(item['mean_row_gain']):.8f}"
-        )
-        for item in ranked[: max(INT8_MIN_CLIP_AUDIT_LOG_TOPK, 0)]
-    )
-    if ranked:
-        best = ranked[0]
-        clears_gate = (
-            int(best["improved_tensors"]) >= INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS
-            and int(best["improved_rows"]) >= INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_ROWS
-            and float(best["mean_tensor_gain"]) >= INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN
-        )
-        if clears_gate:
-            stats["selected_min_clip"] = f"{float(best['min_clip_value']):.5f}"
-            stats["selected_improved_rows"] = int(best["improved_rows"])
-            stats["selected_improved_tensors"] = int(best["improved_tensors"])
-            stats["selected_mean_tensor_gain"] = float(best["mean_tensor_gain"])
-            stats["selected_mean_row_gain"] = float(best["mean_row_gain"])
-    return stats
-
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -634,7 +467,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     selected_auto_keep_name = ""
     if auto_keep is not None:
         selected_auto_keep_name = str(auto_keep["selected_name"])
-    min_clip_audit_tensors: list[tuple[str, Tensor]] = []
     stats = dict.fromkeys(
         (
             "param_count",
@@ -663,17 +495,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
     )
     stats["auto_keep_top_candidates_summary"] = str(auto_keep["top_candidates_summary"]) if auto_keep is not None else ""
-    stats["min_clip_audit_match_tensors"] = 0
-    stats["min_clip_audit_match_rows"] = 0
-    stats["min_clip_audit_baseline_floor_rows"] = 0
-    stats["min_clip_audit_baseline_floor_frac"] = 0.0
-    stats["min_clip_audit_candidate_count"] = len(INT8_MIN_CLIP_AUDIT_VALUES)
-    stats["min_clip_audit_selected_min_clip"] = "none"
-    stats["min_clip_audit_selected_improved_rows"] = 0
-    stats["min_clip_audit_selected_improved_tensors"] = 0
-    stats["min_clip_audit_selected_mean_tensor_gain"] = 0.0
-    stats["min_clip_audit_selected_mean_row_gain"] = 0.0
-    stats["min_clip_audit_candidate_summary"] = ""
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -705,8 +526,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
         scale_dtype = int8_scale_dtype_for_tensor(name, t)
-        if t.ndim == 2 and matches_name_patterns(name, INT8_MIN_CLIP_AUDIT_NAME_PATTERNS):
-            min_clip_audit_tensors.append((name, t))
         q, s = quantize_float_tensor(name, t, scale_dtype=scale_dtype)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -717,20 +536,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    min_clip_audit_stats = audit_min_clip_candidates(min_clip_audit_tensors)
-    stats["min_clip_audit_match_tensors"] = int(min_clip_audit_stats["match_tensors"])
-    stats["min_clip_audit_match_rows"] = int(min_clip_audit_stats["match_rows"])
-    stats["min_clip_audit_baseline_floor_rows"] = int(min_clip_audit_stats["baseline_floor_rows"])
-    stats["min_clip_audit_baseline_floor_frac"] = float(min_clip_audit_stats["baseline_floor_frac"])
-    stats["min_clip_audit_selected_min_clip"] = str(min_clip_audit_stats["selected_min_clip"])
-    stats["min_clip_audit_selected_improved_rows"] = int(min_clip_audit_stats["selected_improved_rows"])
-    stats["min_clip_audit_selected_improved_tensors"] = int(min_clip_audit_stats["selected_improved_tensors"])
-    stats["min_clip_audit_selected_mean_tensor_gain"] = float(
-        min_clip_audit_stats["selected_mean_tensor_gain"]
-    )
-    stats["min_clip_audit_selected_mean_row_gain"] = float(min_clip_audit_stats["selected_mean_row_gain"])
-    stats["min_clip_audit_candidate_summary"] = str(min_clip_audit_stats["candidate_summary"])
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -1480,30 +1285,6 @@ def main() -> None:
                 f"fp32_tensors:{quant_stats['fp32_scale_tensor_count']} "
                 f"fp32_bytes:{quant_stats['fp32_scale_payload_bytes']}"
             )
-        if INT8_MIN_CLIP_AUDIT_NAME_PATTERNS and INT8_MIN_CLIP_AUDIT_VALUES:
-            log0(
-                "Int8 min-clip audit: "
-                f"tensors:{quant_stats['min_clip_audit_match_tensors']} "
-                f"rows:{quant_stats['min_clip_audit_match_rows']} "
-                f"baseline_min_clip:{INT8_BASELINE_MIN_CLIP:.5f} "
-                f"baseline_floor_rows:{quant_stats['min_clip_audit_baseline_floor_rows']} "
-                f"baseline_floor_frac:{quant_stats['min_clip_audit_baseline_floor_frac']:.8f} "
-                f"candidates:{quant_stats['min_clip_audit_candidate_count']} "
-                f"selected:{quant_stats['min_clip_audit_selected_min_clip']}"
-            )
-            log0(
-                "Int8 min-clip thresholds: "
-                f"min_row_gain:{INT8_MIN_CLIP_AUDIT_MIN_ROW_GAIN:.8f} "
-                f"min_improved_rows:{INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_ROWS} "
-                f"min_improved_tensors:{INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS} "
-                f"min_mean_tensor_gain:{INT8_MIN_CLIP_AUDIT_MIN_MEAN_TENSOR_GAIN:.8f} "
-                f"selected_rows:{quant_stats['min_clip_audit_selected_improved_rows']} "
-                f"selected_tensors:{quant_stats['min_clip_audit_selected_improved_tensors']} "
-                f"selected_mean_tensor_gain:{quant_stats['min_clip_audit_selected_mean_tensor_gain']:.8f} "
-                f"selected_mean_row_gain:{quant_stats['min_clip_audit_selected_mean_row_gain']:.8f}"
-            )
-            if quant_stats["min_clip_audit_candidate_summary"]:
-                log0(f"Int8 min-clip candidates: {quant_stats['min_clip_audit_candidate_summary']}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
