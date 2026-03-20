@@ -335,6 +335,7 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_AUTO_KEEP_FLOAT_SELECTED_FP32 = bool(int(os.environ.get("INT8_AUTO_KEEP_FLOAT_SELECTED_FP32", "0")))
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -392,7 +393,14 @@ def keep_float_tensor_with_fp32_patterns(
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     return keep_float_tensor_with_fp32_patterns(name, t, passthrough_orig_dtypes, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)
 
-def keep_float_tensor_for_export(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+def keep_float_tensor_for_export(
+    name: str,
+    t: Tensor,
+    passthrough_orig_dtypes: dict[str, str],
+    force_fp32: bool = False,
+) -> Tensor:
+    if force_fp32:
+        return t.float().contiguous()
     return keep_float_tensor_with_fp32_patterns(
         name,
         t,
@@ -642,6 +650,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "min_clip_override_tensor_count",
             "extra_fp32_keep_tensor_count",
             "extra_fp32_keep_extra_bytes",
+            "selected_fp32_keep_tensor_count",
+            "selected_fp32_keep_extra_bytes",
         ),
         0,
     )
@@ -694,12 +704,21 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         keep_auto = name == selected_auto_keep_name
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
             baseline_kept_bytes = tensor_nbytes(keep_float_tensor(name, t, {}))
-            kept = keep_float_tensor_for_export(name, t, passthrough_orig_dtypes)
+            selected_force_fp32 = keep_auto and INT8_AUTO_KEEP_FLOAT_SELECTED_FP32
+            kept = keep_float_tensor_for_export(
+                name,
+                t,
+                passthrough_orig_dtypes,
+                force_fp32=selected_force_fp32,
+            )
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS):
                 stats["extra_fp32_keep_tensor_count"] += 1
                 stats["extra_fp32_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
+            if selected_force_fp32:
+                stats["selected_fp32_keep_tensor_count"] += 1
+                stats["selected_fp32_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
             if keep_large:
                 stats["large_keep_tensor_count"] += 1
                 stats["large_keep_payload_bytes"] += tensor_nbytes(kept)
@@ -1489,6 +1508,13 @@ def main() -> None:
                 f"extra_fp32_tensors:{quant_stats['extra_fp32_keep_tensor_count']} "
                 f"extra_fp32_extra_bytes:{quant_stats['extra_fp32_keep_extra_bytes']} "
                 f"patterns:{override_summary}"
+            )
+        if INT8_AUTO_KEEP_FLOAT_SELECTED_FP32:
+            log0(
+                "Int8 auto-keep selected fp32: "
+                f"selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
+                f"selected_fp32_tensors:{quant_stats['selected_fp32_keep_tensor_count']} "
+                f"selected_fp32_extra_bytes:{quant_stats['selected_fp32_keep_extra_bytes']}"
             )
         if INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
             audit_summary = ",".join(INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS)
