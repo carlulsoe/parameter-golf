@@ -324,9 +324,46 @@ INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOP
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
+ALLOWED_INT8_KEEP_FLOAT_OVERRIDE_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
+
+def parse_name_dtype_overrides(
+    env_name: str,
+    raw_value: str,
+    allowed_dtypes: dict[str, torch.dtype],
+) -> tuple[tuple[str, str, torch.dtype], ...]:
+    overrides: list[tuple[str, str, torch.dtype]] = []
+    if not raw_value:
+        return ()
+    for entry in raw_value.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        pattern, sep, dtype_name = item.partition(":")
+        if not sep or not pattern or not dtype_name:
+            raise ValueError(
+                f"{env_name} entries must look like pattern:dtype, got {entry!r}"
+            )
+        dtype_key = dtype_name.strip()
+        dtype = allowed_dtypes.get(dtype_key)
+        if dtype is None:
+            allowed = ",".join(sorted(allowed_dtypes))
+            raise ValueError(
+                f"{env_name} dtype {dtype_key!r} is unsupported; allowed values: {allowed}"
+            )
+        overrides.append((pattern.strip(), dtype_key, dtype))
+    return tuple(overrides)
+
+INT8_KEEP_FLOAT_DTYPE_OVERRIDES = parse_name_dtype_overrides(
+    "INT8_KEEP_FLOAT_DTYPE_OVERRIDES",
+    os.environ.get("INT8_KEEP_FLOAT_DTYPE_OVERRIDES", ""),
+    ALLOWED_INT8_KEEP_FLOAT_OVERRIDE_DTYPES,
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -334,12 +371,23 @@ def tensor_nbytes(t: Tensor) -> int:
 def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in name for pattern in patterns)
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+def keep_float_storage_override(name: str) -> tuple[str, torch.dtype] | None:
+    for pattern, dtype_name, dtype in INT8_KEEP_FLOAT_DTYPE_OVERRIDES:
+        if pattern in name:
+            return dtype_name, dtype
+    return None
+
+def keep_float_tensor(
+    name: str,
+    t: Tensor,
+    passthrough_orig_dtypes: dict[str, str],
+    store_dtype: torch.dtype = INT8_KEEP_FLOAT_STORE_DTYPE,
+) -> Tensor:
     if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+        return t.to(dtype=store_dtype).contiguous()
     return t
 
 def int8_scale_dtype_for_tensor(name: str, t: Tensor) -> torch.dtype:
@@ -393,7 +441,7 @@ def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     q, s = quantize_float_tensor(name, t, scale_dtype=INT8_PER_ROW_SCALE_DTYPE)
     quantized_recon = dequantize_quantized_tensor(q, s, dtype=t.dtype)
     candidate_orig_dtypes: dict[str, str] = {}
-    kept = keep_float_tensor(name, t, candidate_orig_dtypes)
+    kept = keep_float_tensor(name, t, candidate_orig_dtypes, store_dtype=INT8_KEEP_FLOAT_STORE_DTYPE)
     kept_recon = restore_passthrough_tensor(name, kept, candidate_orig_dtypes)
     quantized_error = normalized_mae(t, quantized_recon)
     keep_error = normalized_mae(t, kept_recon)
@@ -479,6 +527,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "large_keep_payload_bytes",
             "auto_keep_tensor_count",
             "auto_keep_payload_bytes",
+            "keep_float_override_tensor_count",
+            "keep_float_override_payload_bytes",
             "fp32_scale_tensor_count",
             "fp32_scale_payload_bytes",
         ),
@@ -495,6 +545,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
     )
     stats["auto_keep_top_candidates_summary"] = str(auto_keep["top_candidates_summary"]) if auto_keep is not None else ""
+    stats["auto_keep_selector_scoring_dtype"] = str(INT8_KEEP_FLOAT_STORE_DTYPE).removeprefix("torch.")
+    stats["auto_keep_selected_storage_dtype"] = ""
+    stats["keep_float_override_summary"] = ""
+    keep_float_override_counts: dict[str, int] = {}
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -513,15 +567,25 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
         keep_auto = name == selected_auto_keep_name
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            store_dtype = INT8_KEEP_FLOAT_STORE_DTYPE
+            override = keep_float_storage_override(name)
+            if not matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS) and override is not None:
+                override_dtype_name, override_dtype = override
+                store_dtype = override_dtype
+                stats["keep_float_override_tensor_count"] += 1
+                keep_float_override_counts[override_dtype_name] = keep_float_override_counts.get(override_dtype_name, 0) + 1
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes, store_dtype=store_dtype)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            if override is not None and not matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+                stats["keep_float_override_payload_bytes"] += tensor_nbytes(kept)
             if keep_large:
                 stats["large_keep_tensor_count"] += 1
                 stats["large_keep_payload_bytes"] += tensor_nbytes(kept)
             if keep_auto:
                 stats["auto_keep_tensor_count"] += 1
                 stats["auto_keep_payload_bytes"] += tensor_nbytes(kept)
+                stats["auto_keep_selected_storage_dtype"] = str(kept.dtype).removeprefix("torch.")
             continue
 
         stats["num_float_tensors"] += 1
@@ -536,6 +600,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    if keep_float_override_counts:
+        stats["keep_float_override_summary"] = ",".join(
+            f"{dtype_name}:{count}" for dtype_name, count in sorted(keep_float_override_counts.items())
+        )
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -1264,6 +1333,8 @@ def main() -> None:
                 "Int8 auto-keep selector: "
                 f"candidates:{quant_stats['auto_keep_candidate_count']} "
                 f"selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
+                f"selector_scoring_dtype:{quant_stats['auto_keep_selector_scoring_dtype']} "
+                f"selected_storage_dtype:{quant_stats['auto_keep_selected_storage_dtype'] or 'none'} "
                 f"estimated_gain:{quant_stats['auto_keep_estimated_gain']:.8f} "
                 f"quantized_error:{quant_stats['auto_keep_quantized_error']:.8f} "
                 f"keep_error:{quant_stats['auto_keep_keep_error']:.8f}"
@@ -1278,6 +1349,13 @@ def main() -> None:
                 f"selected_payload:{quant_stats['auto_keep_payload_bytes']} "
                 f"selected_quantized_payload:{quant_stats['auto_keep_quantized_payload_bytes']} "
                 f"selected_extra_payload:{quant_stats['auto_keep_extra_payload_bytes']}"
+            )
+        if INT8_KEEP_FLOAT_DTYPE_OVERRIDES:
+            log0(
+                "Kept float storage: "
+                f"override_tensors:{quant_stats['keep_float_override_tensor_count']} "
+                f"override_bytes:{quant_stats['keep_float_override_payload_bytes']} "
+                f"override_summary:{quant_stats['keep_float_override_summary'] or 'none'}"
             )
         if INT8_FP32_SCALE_NAME_PATTERNS:
             log0(
