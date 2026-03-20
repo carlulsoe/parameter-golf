@@ -320,13 +320,32 @@ INT8_FP32_SCALE_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_FP32_SCALE_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_MIN_CLIP_NAME_VALUE_OVERRIDES = tuple(
+    entry.strip()
+    for entry in os.environ.get("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES", "").split(",")
+    if entry.strip()
+)
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_BASELINE_MIN_CLIP = 1.0
 SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
+
+int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
+for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
+    if ":" not in entry:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use pattern:value")
+    pattern, raw_value = entry.split(":", 1)
+    int8_min_clip_name_value_pairs.append((pattern.strip(), float(raw_value.strip())))
+INT8_MIN_CLIP_NAME_VALUE_PAIRS: tuple[tuple[str, float], ...] = tuple(int8_min_clip_name_value_pairs)
+for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+    if not pattern:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use non-empty pattern:value pairs")
+    if value <= 0.0:
+        raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES values must be strictly positive")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -347,7 +366,20 @@ def int8_scale_dtype_for_tensor(name: str, t: Tensor) -> torch.dtype:
         return torch.float32
     return INT8_PER_ROW_SCALE_DTYPE
 
-def quantize_float_tensor(name: str, t: Tensor, scale_dtype: torch.dtype = INT8_PER_ROW_SCALE_DTYPE) -> tuple[Tensor, Tensor]:
+def int8_min_clip_value_for_tensor(name: str, t: Tensor, default: float = INT8_BASELINE_MIN_CLIP) -> float:
+    if t.ndim != 2:
+        return default
+    for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+        if pattern in name:
+            return value
+    return default
+
+def quantize_float_tensor(
+    name: str,
+    t: Tensor,
+    scale_dtype: torch.dtype = INT8_PER_ROW_SCALE_DTYPE,
+    min_clip_value: float = INT8_BASELINE_MIN_CLIP,
+) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -358,7 +390,7 @@ def quantize_float_tensor(name: str, t: Tensor, scale_dtype: torch.dtype = INT8_
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        scale = (clip_abs / 127.0).clamp_min(min_clip_value / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=scale_dtype).contiguous()
 
@@ -390,7 +422,12 @@ def normalized_mae(reference: Tensor, reconstructed: Tensor) -> float:
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
     # ablations on still-quantized tensors do not also change the selector.
-    q, s = quantize_float_tensor(name, t, scale_dtype=INT8_PER_ROW_SCALE_DTYPE)
+    q, s = quantize_float_tensor(
+        name,
+        t,
+        scale_dtype=INT8_PER_ROW_SCALE_DTYPE,
+        min_clip_value=INT8_BASELINE_MIN_CLIP,
+    )
     quantized_recon = dequantize_quantized_tensor(q, s, dtype=t.dtype)
     candidate_orig_dtypes: dict[str, str] = {}
     kept = keep_float_tensor(name, t, candidate_orig_dtypes)
@@ -481,6 +518,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "auto_keep_payload_bytes",
             "fp32_scale_tensor_count",
             "fp32_scale_payload_bytes",
+            "min_clip_override_tensor_count",
         ),
         0,
     )
@@ -526,12 +564,15 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
         scale_dtype = int8_scale_dtype_for_tensor(name, t)
-        q, s = quantize_float_tensor(name, t, scale_dtype=scale_dtype)
+        min_clip_value = int8_min_clip_value_for_tensor(name, t)
+        q, s = quantize_float_tensor(name, t, scale_dtype=scale_dtype, min_clip_value=min_clip_value)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
             if scale_dtype == torch.float32:
                 stats["fp32_scale_tensor_count"] += 1
                 stats["fp32_scale_payload_bytes"] += tensor_nbytes(s)
+            if min_clip_value != INT8_BASELINE_MIN_CLIP:
+                stats["min_clip_override_tensor_count"] += 1
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -1284,6 +1325,16 @@ def main() -> None:
                 "Int8 scale storage: "
                 f"fp32_tensors:{quant_stats['fp32_scale_tensor_count']} "
                 f"fp32_bytes:{quant_stats['fp32_scale_payload_bytes']}"
+            )
+        if INT8_MIN_CLIP_NAME_VALUE_PAIRS:
+            override_summary = ",".join(
+                f"{pattern}:{value:.5f}" for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS
+            )
+            log0(
+                "Int8 min-clip override: "
+                f"tensors:{quant_stats['min_clip_override_tensor_count']} "
+                f"baseline:{INT8_BASELINE_MIN_CLIP:.5f} "
+                f"overrides:{override_summary}"
             )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
