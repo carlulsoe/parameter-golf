@@ -335,6 +335,11 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_BASELINE_EXTRA_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_BASELINE_EXTRA_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -637,6 +642,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "large_keep_payload_bytes",
             "auto_keep_tensor_count",
             "auto_keep_payload_bytes",
+            "baseline_extra_keep_tensor_count",
+            "baseline_extra_keep_payload_bytes",
+            "baseline_extra_keep_extra_bytes",
             "fp32_scale_tensor_count",
             "fp32_scale_payload_bytes",
             "min_clip_override_tensor_count",
@@ -692,11 +700,26 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
         keep_auto = name == selected_auto_keep_name
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
+        keep_baseline_extra = matches_name_patterns(name, INT8_KEEP_FLOAT_BASELINE_EXTRA_NAME_PATTERNS)
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto or keep_baseline_extra:
             baseline_kept_bytes = tensor_nbytes(keep_float_tensor(name, t, {}))
             kept = keep_float_tensor_for_export(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            if keep_baseline_extra:
+                quantized_scale_dtype = int8_scale_dtype_for_tensor(name, t)
+                quantized_min_clip = int8_min_clip_value_for_tensor(name, t)
+                q_keep_extra, s_keep_extra = quantize_float_tensor(
+                    name,
+                    t,
+                    scale_dtype=quantized_scale_dtype,
+                    min_clip_value=quantized_min_clip,
+                )
+                stats["baseline_extra_keep_tensor_count"] += 1
+                stats["baseline_extra_keep_payload_bytes"] += tensor_nbytes(kept)
+                stats["baseline_extra_keep_extra_bytes"] += (
+                    tensor_nbytes(kept) - tensor_nbytes(q_keep_extra) - tensor_nbytes(s_keep_extra)
+                )
             if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS):
                 stats["extra_fp32_keep_tensor_count"] += 1
                 stats["extra_fp32_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
@@ -1488,6 +1511,15 @@ def main() -> None:
                 "Kept float storage: "
                 f"extra_fp32_tensors:{quant_stats['extra_fp32_keep_tensor_count']} "
                 f"extra_fp32_extra_bytes:{quant_stats['extra_fp32_keep_extra_bytes']} "
+                f"patterns:{override_summary}"
+            )
+        if INT8_KEEP_FLOAT_BASELINE_EXTRA_NAME_PATTERNS:
+            override_summary = ",".join(INT8_KEEP_FLOAT_BASELINE_EXTRA_NAME_PATTERNS)
+            log0(
+                "Kept float baseline storage: "
+                f"extra_tensors:{quant_stats['baseline_extra_keep_tensor_count']} "
+                f"extra_payload:{quant_stats['baseline_extra_keep_payload_bytes']} "
+                f"extra_bytes_vs_quantized:{quant_stats['baseline_extra_keep_extra_bytes']} "
                 f"patterns:{override_summary}"
             )
         if INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
