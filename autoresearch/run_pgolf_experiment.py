@@ -79,6 +79,7 @@ class Config:
     prep_clones_dir: Path
     remote_log_dir: Path
     prep_queue_depth: int
+    prep_worker_count: int
     prep_poll_seconds: float
     infrastructure_retry_schedule: tuple[float, ...]
     codex_binary: str
@@ -536,7 +537,9 @@ class PgolfController:
         self.next_iteration = detect_next_iteration(config.results_file)
         self.next_run_number = detect_next_run_number(config.results_file, config.tag)
         self.next_candidate_number = detect_next_candidate_number(config.candidates_dir)
+        self.next_candidate_number_lock = threading.Lock()
         self.reviewed_base_lock = threading.Lock()
+        self.history_summary_lock = threading.Lock()
         self.reviewed_base_commit = git_output(config.repo_dir, "rev-parse", "HEAD")
         self.stop_event = threading.Event()
         self.ready_queue: queue.Queue[PreparedCandidate] = queue.Queue(
@@ -544,11 +547,15 @@ class PgolfController:
         )
         self.retry_candidate: PreparedCandidate | None = None
         self.infrastructure_retry_attempts: dict[str, int] = {}
-        self.prep_thread = threading.Thread(
-            target=self._prep_worker,
-            name="pgolf-prep",
-            daemon=True,
-        )
+        self.prep_threads = [
+            threading.Thread(
+                target=self._prep_worker,
+                args=(worker_index,),
+                name=f"pgolf-prep-{worker_index}",
+                daemon=True,
+            )
+            for worker_index in range(1, config.prep_worker_count + 1)
+        ]
         self.history_ledger = self.config.history_dir / "ledger.jsonl"
         self.history_summary = self.config.history_dir / "summary.md"
         for path in (
@@ -563,8 +570,9 @@ class PgolfController:
 
     def close(self) -> None:
         self.stop_event.set()
-        if self.prep_thread.is_alive():
-            self.prep_thread.join()
+        for prep_thread in self.prep_threads:
+            if prep_thread.is_alive():
+                prep_thread.join()
         self.logger.close()
 
     def run(self) -> None:
@@ -577,9 +585,11 @@ class PgolfController:
             f"tag={self.config.tag} "
             f"deadline={self.config.deadline if self.config.deadline is not None else 'forever'} "
             f"prep_queue_depth={self.config.prep_queue_depth} "
+            f"prep_worker_count={self.config.prep_worker_count} "
             f"max_pre_review_rounds={self.config.max_pre_review_rounds}"
         )
-        self.prep_thread.start()
+        for prep_thread in self.prep_threads:
+            prep_thread.start()
         try:
             while not self._deadline_reached():
                 if self._needs_bootstrap_baseline():
@@ -694,7 +704,8 @@ class PgolfController:
                 self.next_run_number += 1
         finally:
             self.stop_event.set()
-            self.prep_thread.join()
+            for prep_thread in self.prep_threads:
+                prep_thread.join()
             self._cleanup_unused_candidates()
             self.logger.log("controller_finished")
 
@@ -807,39 +818,47 @@ class PgolfController:
         self.next_iteration += 1
         self.next_run_number += 1
 
-    def _prep_worker(self) -> None:
+    def _prep_worker(self, worker_index: int) -> None:
         while not self.stop_event.is_set():
             if self._deadline_reached():
                 return
             if self.ready_queue.full():
                 time.sleep(self.config.prep_poll_seconds)
                 continue
-            candidate = self._prepare_candidate()
+            candidate = self._prepare_candidate(worker_index=worker_index)
             if candidate is None:
                 time.sleep(self.config.prep_poll_seconds)
                 continue
-            self._update_candidate_status(candidate.manifest_path, "queued")
-            try:
-                self.ready_queue.put(candidate, timeout=self.config.prep_poll_seconds)
-                self._append_history(
-                    {
-                        "event": "candidate_queued",
-                        "candidate_id": candidate.candidate_id,
-                        "manifest_path": str(candidate.manifest_path),
-                        "timestamp": iso_now(),
-                    }
-                )
-            except queue.Full:
-                self._update_candidate_status(candidate.manifest_path, "approved")
-            except Exception as exc:
-                self.logger.log(
-                    f"prep_worker_error error={sanitize_tsv(str(exc))}"
-                )
-                time.sleep(self.config.prep_poll_seconds)
+            while not self.stop_event.is_set():
+                if self._deadline_reached():
+                    return
+                try:
+                    self.ready_queue.put(candidate, timeout=self.config.prep_poll_seconds)
+                    self._update_candidate_status(candidate.manifest_path, "queued")
+                    self._append_history(
+                        {
+                            "event": "candidate_queued",
+                            "candidate_id": candidate.candidate_id,
+                            "manifest_path": str(candidate.manifest_path),
+                            "prep_worker": worker_index,
+                            "timestamp": iso_now(),
+                        }
+                    )
+                    break
+                except queue.Full:
+                    continue
+                except Exception as exc:
+                    self.logger.log(
+                        "prep_worker_error "
+                        f"worker={worker_index} error={sanitize_tsv(str(exc))}"
+                    )
+                    time.sleep(self.config.prep_poll_seconds)
+                    break
 
-    def _prepare_candidate(self) -> PreparedCandidate | None:
-        candidate_id = f"candidate_{self.next_candidate_number:04d}"
-        self.next_candidate_number += 1
+    def _prepare_candidate(self, *, worker_index: int) -> PreparedCandidate | None:
+        with self.next_candidate_number_lock:
+            candidate_id = f"candidate_{self.next_candidate_number:04d}"
+            self.next_candidate_number += 1
         candidate_dir = self.config.candidates_dir / candidate_id
         candidate_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = candidate_dir / "manifest.json"
@@ -850,12 +869,16 @@ class PgolfController:
             "base_commit": base_commit,
             "created_at": iso_now(),
             "status": "drafting",
+            "prep_worker": worker_index,
             "proposer_model": self.config.proposer_model,
             "pre_review_model": self.config.pre_review_model,
             "rounds": [],
         }
         self._write_candidate_manifest(manifest_path, manifest)
-        self.logger.log(f"candidate_start candidate_id={candidate_id} base_commit={base_commit}")
+        self.logger.log(
+            f"candidate_start candidate_id={candidate_id} "
+            f"worker={worker_index} base_commit={base_commit}"
+        )
 
         prior_feedback = ""
         for round_number in range(1, self.config.max_pre_review_rounds + 1):
@@ -891,7 +914,7 @@ class PgolfController:
                 proposer_prompt_file.write_text(proposer_prompt, encoding="utf-8")
                 self.logger.log(
                     f"proposer_start candidate_id={candidate_id} round={round_number} "
-                    f"base_commit={base_commit}"
+                    f"worker={worker_index} base_commit={base_commit}"
                 )
                 exit_code = self._stream_subprocess(
                     [
@@ -945,7 +968,8 @@ class PgolfController:
                 )
                 pre_review_prompt_file.write_text(pre_review_prompt, encoding="utf-8")
                 self.logger.log(
-                    f"pre_review_start candidate_id={candidate_id} round={round_number}"
+                    f"pre_review_start candidate_id={candidate_id} round={round_number} "
+                    f"worker={worker_index}"
                 )
                 review_exit = self._stream_subprocess(
                     [
@@ -1015,7 +1039,8 @@ class PgolfController:
                     self._write_candidate_manifest(manifest_path, manifest)
                     self.logger.log(
                         f"candidate_approved candidate_id={candidate_id} "
-                        f"round={round_number} idea={sanitize_tsv(spec.idea)}"
+                        f"round={round_number} worker={worker_index} "
+                        f"idea={sanitize_tsv(spec.idea)}"
                     )
                     return PreparedCandidate(
                         candidate_id=candidate_id,
@@ -1029,7 +1054,7 @@ class PgolfController:
                 prior_feedback = decision.feedback
                 self.logger.log(
                     f"candidate_revise candidate_id={candidate_id} round={round_number} "
-                    f"feedback={sanitize_tsv(decision.feedback)}"
+                    f"worker={worker_index} feedback={sanitize_tsv(decision.feedback)}"
                 )
             except Exception as exc:
                 manifest["status"] = "failed"
@@ -1046,7 +1071,8 @@ class PgolfController:
                     }
                 )
                 self.logger.log(
-                    f"candidate_failed candidate_id={candidate_id} error={sanitize_tsv(str(exc))}"
+                    f"candidate_failed candidate_id={candidate_id} worker={worker_index} "
+                    f"error={sanitize_tsv(str(exc))}"
                 )
                 return None
             finally:
@@ -1065,7 +1091,8 @@ class PgolfController:
             }
         )
         self.logger.log(
-            f"candidate_rejected candidate_id={candidate_id} reason=max_pre_review_rounds"
+            f"candidate_rejected candidate_id={candidate_id} worker={worker_index} "
+            "reason=max_pre_review_rounds"
         )
         return None
 
@@ -1964,57 +1991,58 @@ class PgolfController:
         append_jsonl(self.history_ledger, payload)
 
     def _refresh_history_summary(self) -> None:
-        result_lines = read_lines(self.config.results_file)
-        lines = [
-            "# Autoresearch Summary",
-            "",
-            f"Generated: {iso_now()}",
-            "",
-            "## Best kept results",
-        ]
-        kept_rows = []
-        for line in result_lines[1:]:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 13 or parts[5] != "keep":
-                continue
-            kept_rows.append(parts)
-        kept_rows.sort(key=lambda row: float(row[6]))
-        if kept_rows:
-            for row in kept_rows[:5]:
-                lines.append(
-                    f"- {row[4]} val_bpb={row[6]} idea={row[10]} env={row[11]} notes={row[12]}"
-                )
-        else:
-            lines.append("- none yet")
-        lines.extend(["", "## Recent results"])
-        recent_rows = result_lines[max(1, len(result_lines) - 10) :]
-        if not recent_rows:
-            lines.append("- none yet")
-        else:
-            for row_line in recent_rows:
-                row = row_line.rstrip("\n").split("\t")
-                if len(row) < 13:
+        with self.history_summary_lock:
+            result_lines = read_lines(self.config.results_file)
+            lines = [
+                "# Autoresearch Summary",
+                "",
+                f"Generated: {iso_now()}",
+                "",
+                "## Best kept results",
+            ]
+            kept_rows = []
+            for line in result_lines[1:]:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 13 or parts[5] != "keep":
                     continue
-                lines.append(
-                    f"- {row[4]} decision={row[5]} val_bpb={row[6]} idea={row[10]} notes={row[12]}"
-                )
-        lines.extend(["", "## Recent history events"])
-        history_lines = read_lines(self.history_ledger)[-15:]
-        if history_lines:
-            for raw in history_lines:
-                event = json.loads(raw)
-                event_name = event.get("event", "unknown")
-                timestamp = event.get("timestamp", "?")
-                candidate_id = event.get("candidate_id", "")
-                run_id = event.get("run_id", "")
-                idea = event.get("idea", "")
-                lines.append(
-                    f"- {timestamp} event={event_name} candidate={candidate_id} "
-                    f"run={run_id} idea={idea}"
-                )
-        else:
-            lines.append("- none yet")
-        self.history_summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                kept_rows.append(parts)
+            kept_rows.sort(key=lambda row: float(row[6]))
+            if kept_rows:
+                for row in kept_rows[:5]:
+                    lines.append(
+                        f"- {row[4]} val_bpb={row[6]} idea={row[10]} env={row[11]} notes={row[12]}"
+                    )
+            else:
+                lines.append("- none yet")
+            lines.extend(["", "## Recent results"])
+            recent_rows = result_lines[max(1, len(result_lines) - 10) :]
+            if not recent_rows:
+                lines.append("- none yet")
+            else:
+                for row_line in recent_rows:
+                    row = row_line.rstrip("\n").split("\t")
+                    if len(row) < 13:
+                        continue
+                    lines.append(
+                        f"- {row[4]} decision={row[5]} val_bpb={row[6]} idea={row[10]} notes={row[12]}"
+                    )
+            lines.extend(["", "## Recent history events"])
+            history_lines = read_lines(self.history_ledger)[-15:]
+            if history_lines:
+                for raw in history_lines:
+                    event = json.loads(raw)
+                    event_name = event.get("event", "unknown")
+                    timestamp = event.get("timestamp", "?")
+                    candidate_id = event.get("candidate_id", "")
+                    run_id = event.get("run_id", "")
+                    idea = event.get("idea", "")
+                    lines.append(
+                        f"- {timestamp} event={event_name} candidate={candidate_id} "
+                        f"run={run_id} idea={idea}"
+                    )
+            else:
+                lines.append("- none yet")
+            self.history_summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _ssh_options(self) -> list[str]:
         options = ["-p", str(self.config.remote_port)]
@@ -2327,7 +2355,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--prep-queue-depth",
         type=int,
-        default=int(os.environ.get("PREP_QUEUE_DEPTH", "1")),
+        default=int(os.environ.get("PREP_QUEUE_DEPTH", "4")),
+    )
+    parser.add_argument(
+        "--prep-workers",
+        type=int,
+        default=int(os.environ.get("PREP_WORKERS", "2")),
     )
     return parser.parse_args(argv)
 
@@ -2420,6 +2453,7 @@ def build_config(args: argparse.Namespace) -> Config:
         prep_clones_dir=prep_clones_dir,
         remote_log_dir=env_path("REMOTE_LOG_DIR", "remote_logs"),
         prep_queue_depth=max(1, args.prep_queue_depth),
+        prep_worker_count=max(1, args.prep_workers),
         prep_poll_seconds=max(1.0, float(os.environ.get("PREP_POLL_SECONDS", "5"))),
         infrastructure_retry_schedule=tuple(
             max(1.0, float(part.strip()))
