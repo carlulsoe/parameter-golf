@@ -115,6 +115,8 @@ WorkingDirectory={service_repo_dir}
 Environment=PATH={SERVICE_PATH}
 EnvironmentFile={service_env_file}
 ExecStart={exec_start}
+KillMode=mixed
+TimeoutStopSec=30min
 Restart=always
 RestartSec=15
 

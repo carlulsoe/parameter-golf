@@ -95,6 +95,7 @@ Important paths:
 
 - `history/ledger.jsonl`: append-only structured event log.
 - `history/summary.md`: compact summary of recent runs and decisions for future proposer rounds.
+- `ready_queue.json`: durable ordered ready-queue snapshot used for restart recovery.
 - `candidates/candidate_XXXX/`: one directory per proposed candidate.
 - `runs/<run-id>/`: one directory per executed run.
 
@@ -149,6 +150,13 @@ Run until you stop it after the current in-flight work finishes:
 cd autoresearch
 uv run python run_pgolf_experiment.py --forever
 ```
+
+When the controller receives `SIGTERM` or `SIGINT`, it now enters a drain mode instead of discarding the queue immediately:
+
+- no new prep units start
+- no new experiment is dequeued
+- already-running prep, training, and post-review work is allowed to finish
+- the durable `ready_queue.json` file and candidate manifests are used to recover the queue on the next start
 
 For short experiments, a practical starting point is `PREP_WORKERS=2` and `PREP_QUEUE_DEPTH=4`. Increase the worker count if proposer plus pre-review latency is still longer than your train wallclock.
 

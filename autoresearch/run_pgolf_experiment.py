@@ -8,8 +8,10 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -78,6 +80,7 @@ class Config:
     runs_dir: Path
     prep_clones_dir: Path
     remote_log_dir: Path
+    queue_file: Path
     prep_queue_depth: int
     prep_worker_count: int
     prep_poll_seconds: float
@@ -238,7 +241,25 @@ def ensure_file_with_header(path: Path, header: str) -> None:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            fh.write(rendered)
+            fh.flush()
+            os.fsync(fh.fileno())
+            tmp_path = Path(fh.name)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
@@ -540,8 +561,10 @@ class PgolfController:
         self.next_candidate_number_lock = threading.Lock()
         self.reviewed_base_lock = threading.Lock()
         self.history_summary_lock = threading.Lock()
+        self.queue_lock = threading.Lock()
         self.reviewed_base_commit = git_output(config.repo_dir, "rev-parse", "HEAD")
         self.stop_event = threading.Event()
+        self.drain_event = threading.Event()
         self.ready_queue: queue.Queue[PreparedCandidate] = queue.Queue(
             maxsize=config.prep_queue_depth
         )
@@ -565,14 +588,14 @@ class PgolfController:
             self.config.runs_dir,
             self.config.prep_clones_dir,
             self.config.remote_log_dir,
+            self.config.queue_file.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        if not self.config.queue_file.exists():
+            write_json(self.config.queue_file, {"version": 1, "items": []})
 
     def close(self) -> None:
         self.stop_event.set()
-        for prep_thread in self.prep_threads:
-            if prep_thread.is_alive():
-                prep_thread.join()
         self.logger.close()
 
     def run(self) -> None:
@@ -588,11 +611,16 @@ class PgolfController:
             f"prep_worker_count={self.config.prep_worker_count} "
             f"max_pre_review_rounds={self.config.max_pre_review_rounds}"
         )
+        self._restore_ready_queue()
         for prep_thread in self.prep_threads:
             prep_thread.start()
         try:
-            while not self._deadline_reached():
+            while True:
+                if self._should_stop_scheduling():
+                    break
                 if self._needs_bootstrap_baseline():
+                    if self._should_stop_scheduling():
+                        break
                     self._run_bootstrap_baseline()
                     continue
                 candidate = self._wait_for_candidate()
@@ -613,6 +641,8 @@ class PgolfController:
                     },
                 )
                 if not self._apply_candidate(candidate, run_id, run_dir):
+                    if self._should_stop_scheduling():
+                        break
                     continue
                 experiment_commit = git_output(self.config.repo_dir, "rev-parse", "HEAD")
                 try:
@@ -638,7 +668,7 @@ class PgolfController:
                     self.next_iteration += 1
                     self.next_run_number += 1
                     self.retry_candidate = candidate
-                    if self.stop_event.wait(retry_after):
+                    if self.drain_event.wait(retry_after):
                         break
                     continue
                 except (ControllerError, subprocess.CalledProcessError) as exc:
@@ -659,6 +689,8 @@ class PgolfController:
                     ensure_clean_git(self.config.repo_dir)
                     self.next_iteration += 1
                     self.next_run_number += 1
+                    if self._should_stop_scheduling():
+                        break
                     continue
                 self._clear_infrastructure_retry_state(candidate.candidate_id)
                 try:
@@ -688,6 +720,8 @@ class PgolfController:
                     ensure_clean_git(self.config.repo_dir)
                     self.next_iteration += 1
                     self.next_run_number += 1
+                    if self._should_stop_scheduling():
+                        break
                     continue
                 self._finalize_decision(
                     candidate=candidate,
@@ -703,10 +737,11 @@ class PgolfController:
                 self.next_iteration += 1
                 self.next_run_number += 1
         finally:
-            self.stop_event.set()
+            self.drain_event.set()
             for prep_thread in self.prep_threads:
                 prep_thread.join()
-            self._cleanup_unused_candidates()
+            self._persist_ready_queue()
+            self.stop_event.set()
             self.logger.log("controller_finished")
 
     def _deadline_reached(self) -> bool:
@@ -716,6 +751,8 @@ class PgolfController:
         return not has_completed_result(self.config.results_file)
 
     def _run_bootstrap_baseline(self) -> None:
+        if self._should_stop_scheduling():
+            return
         iteration = self.next_iteration
         run_number = self.next_run_number
         run_id = f"{self.config.tag}_{run_number:04d}"
@@ -756,7 +793,7 @@ class PgolfController:
             ensure_clean_git(self.config.repo_dir)
             self.next_iteration += 1
             self.next_run_number += 1
-            self.stop_event.wait(retry_after)
+            self.drain_event.wait(retry_after)
             return
         except (ControllerError, subprocess.CalledProcessError) as exc:
             self._clear_infrastructure_retry_state('baseline')
@@ -820,9 +857,9 @@ class PgolfController:
 
     def _prep_worker(self, worker_index: int) -> None:
         while not self.stop_event.is_set():
-            if self._deadline_reached():
+            if self._should_stop_scheduling():
                 return
-            if self.ready_queue.full():
+            if self._ready_queue_full():
                 time.sleep(self.config.prep_poll_seconds)
                 continue
             candidate = self._prepare_candidate(worker_index=worker_index)
@@ -830,30 +867,15 @@ class PgolfController:
                 time.sleep(self.config.prep_poll_seconds)
                 continue
             while not self.stop_event.is_set():
-                if self._deadline_reached():
-                    return
-                try:
-                    self.ready_queue.put(candidate, timeout=self.config.prep_poll_seconds)
-                    self._update_candidate_status(candidate.manifest_path, "queued")
-                    self._append_history(
-                        {
-                            "event": "candidate_queued",
-                            "candidate_id": candidate.candidate_id,
-                            "manifest_path": str(candidate.manifest_path),
-                            "prep_worker": worker_index,
-                            "timestamp": iso_now(),
-                        }
-                    )
+                if self._enqueue_ready_candidate(candidate, prep_worker=worker_index):
                     break
-                except queue.Full:
-                    continue
-                except Exception as exc:
+                if self._should_stop_scheduling():
                     self.logger.log(
-                        "prep_worker_error "
-                        f"worker={worker_index} error={sanitize_tsv(str(exc))}"
+                        f"candidate_left_approved candidate_id={candidate.candidate_id} "
+                        f"worker={worker_index} reason=queue_full_during_drain"
                     )
-                    time.sleep(self.config.prep_poll_seconds)
-                    break
+                    return
+                time.sleep(self.config.prep_poll_seconds)
 
     def _prepare_candidate(self, *, worker_index: int) -> PreparedCandidate | None:
         with self.next_candidate_number_lock:
@@ -1098,22 +1120,270 @@ class PgolfController:
 
     def _wait_for_candidate(self) -> PreparedCandidate | None:
         while not self.stop_event.is_set():
+            if self._should_stop_scheduling():
+                return None
             if self.retry_candidate is not None:
                 candidate = self.retry_candidate
                 self.retry_candidate = None
                 self._update_candidate_status(candidate.manifest_path, "dequeued")
                 self.logger.log(f"candidate_retry candidate_id={candidate.candidate_id}")
                 return candidate
-            if self._deadline_reached() and self.ready_queue.empty():
-                return None
-            try:
-                candidate = self.ready_queue.get(timeout=self.config.prep_poll_seconds)
-                self._update_candidate_status(candidate.manifest_path, "dequeued")
+            candidate = self._dequeue_ready_candidate()
+            if candidate is not None:
                 self.logger.log(f"candidate_dequeued candidate_id={candidate.candidate_id}")
                 return candidate
-            except queue.Empty:
-                continue
+            if self._should_stop_scheduling():
+                return None
+            time.sleep(self.config.prep_poll_seconds)
         return None
+
+    def _should_stop_scheduling(self) -> bool:
+        return self.drain_event.is_set() or self._deadline_reached()
+
+    def request_drain(self, reason: str) -> None:
+        if self.drain_event.is_set():
+            return
+        self.drain_event.set()
+        self.logger.log(f"controller_drain_requested reason={sanitize_tsv(reason)}")
+
+    def _ready_queue_full(self) -> bool:
+        with self.queue_lock:
+            return self.ready_queue.qsize() >= self.config.prep_queue_depth
+
+    def _persist_ready_queue_locked(self) -> None:
+        items = [
+            {
+                "candidate_id": candidate.candidate_id,
+                "manifest_path": str(candidate.manifest_path),
+            }
+            for candidate in list(self.ready_queue.queue)
+        ]
+        write_json(self.config.queue_file, {"version": 1, "items": items})
+
+    def _persist_ready_queue(self) -> None:
+        with self.queue_lock:
+            self._persist_ready_queue_locked()
+
+    def _return_candidate_to_ready_queue(self, candidate: PreparedCandidate, reason: str) -> None:
+        with self.queue_lock:
+            self.ready_queue.queue.appendleft(candidate)
+            self._update_candidate_status(candidate.manifest_path, "queued")
+            self._persist_ready_queue_locked()
+        self.logger.log(
+            "candidate_requeued "
+            f"candidate_id={candidate.candidate_id} reason={sanitize_tsv(reason)}"
+        )
+
+    def _enqueue_ready_candidate(
+        self,
+        candidate: PreparedCandidate,
+        *,
+        prep_worker: int | None = None,
+        emit_history: bool = True,
+    ) -> bool:
+        with self.queue_lock:
+            if self.ready_queue.qsize() >= self.config.prep_queue_depth:
+                return False
+            self.ready_queue.put_nowait(candidate)
+            self._update_candidate_status(candidate.manifest_path, "queued")
+            self._persist_ready_queue_locked()
+        if emit_history:
+            payload: dict[str, Any] = {
+                "event": "candidate_queued",
+                "candidate_id": candidate.candidate_id,
+                "manifest_path": str(candidate.manifest_path),
+                "timestamp": iso_now(),
+            }
+            if prep_worker is not None:
+                payload["prep_worker"] = prep_worker
+            self._append_history(payload)
+        return True
+
+    def _dequeue_ready_candidate(self) -> PreparedCandidate | None:
+        with self.queue_lock:
+            if self.ready_queue.empty():
+                return None
+            candidate = self.ready_queue.get_nowait()
+            self._update_candidate_status(candidate.manifest_path, "dequeued")
+            self._persist_ready_queue_locked()
+            return candidate
+
+    def _load_ready_queue_entries(self) -> list[dict[str, str]]:
+        try:
+            payload = read_json_object(self.config.queue_file)
+            items = payload.get("items", [])
+            if not isinstance(items, list):
+                raise ControllerError(f"invalid queue file items in {self.config.queue_file}")
+            entries: list[dict[str, str]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ControllerError(
+                        f"invalid queue item in {self.config.queue_file}: {item!r}"
+                    )
+                candidate_id = item.get("candidate_id")
+                manifest_path = item.get("manifest_path")
+                if not isinstance(candidate_id, str) or not isinstance(manifest_path, str):
+                    raise ControllerError(
+                        f"invalid queue item in {self.config.queue_file}: {item!r}"
+                    )
+                entries.append({"candidate_id": candidate_id, "manifest_path": manifest_path})
+            return entries
+        except ControllerError as exc:
+            self.logger.log(
+                "ready_queue_restore_reset "
+                f"path={self.config.queue_file} error={sanitize_tsv(str(exc))}"
+            )
+            return []
+
+    def _load_prepared_candidate_from_manifest(
+        self,
+        manifest_path: Path,
+    ) -> PreparedCandidate | None:
+        try:
+            payload = read_json_object(manifest_path)
+        except ControllerError as exc:
+            self.logger.log(
+                f"candidate_restore_skip manifest={manifest_path} error={sanitize_tsv(str(exc))}"
+            )
+            return None
+        candidate_id = payload.get("candidate_id", manifest_path.parent.name)
+        base_commit = payload.get("base_commit")
+        approved_patch = payload.get("approved_patch")
+        approved_spec = payload.get("approved_spec")
+        approved_round = payload.get("approved_round")
+        if not isinstance(candidate_id, str) or not isinstance(base_commit, str):
+            self.logger.log(
+                f"candidate_restore_skip manifest={manifest_path} reason=missing_identity"
+            )
+            return None
+        if not isinstance(approved_patch, str) or not isinstance(approved_spec, str):
+            self.logger.log(
+                "candidate_restore_skip "
+                f"candidate_id={candidate_id} reason=missing_approved_artifacts"
+            )
+            return None
+        if not isinstance(approved_round, int | str):
+            self.logger.log(
+                f"candidate_restore_skip candidate_id={candidate_id} reason=invalid_approved_round"
+            )
+            return None
+        try:
+            approved_round_int = int(approved_round)
+        except ValueError:
+            self.logger.log(
+                f"candidate_restore_skip candidate_id={candidate_id} reason=invalid_approved_round"
+            )
+            return None
+        patch_file = resolve_artifact_path(Path(approved_patch))
+        spec_file = resolve_artifact_path(Path(approved_spec))
+        if not patch_file.exists() or not spec_file.exists():
+            self.logger.log(
+                f"candidate_restore_skip candidate_id={candidate_id} reason=missing_approved_files"
+            )
+            return None
+        try:
+            spec = load_candidate_spec(spec_file)
+        except ControllerError as exc:
+            self.logger.log(
+                f"candidate_restore_skip candidate_id={candidate_id} error={sanitize_tsv(str(exc))}"
+            )
+            return None
+        return PreparedCandidate(
+            candidate_id=candidate_id,
+            base_commit=base_commit,
+            patch_file=patch_file,
+            spec=spec,
+            approved_round=approved_round_int,
+            manifest_path=manifest_path,
+            candidate_dir=manifest_path.parent,
+        )
+
+    def _restore_ready_queue(self) -> None:
+        queue_entries = self._load_ready_queue_entries()
+        queued_candidates: list[PreparedCandidate] = []
+        backlog_candidates: list[tuple[str, str, PreparedCandidate]] = []
+        seen_manifests: set[Path] = set()
+
+        def maybe_add_queued(candidate: PreparedCandidate) -> None:
+            if candidate.manifest_path in seen_manifests:
+                return
+            seen_manifests.add(candidate.manifest_path)
+            queued_candidates.append(candidate)
+
+        for entry in queue_entries:
+            manifest_path = Path(entry["manifest_path"])
+            candidate = self._load_prepared_candidate_from_manifest(manifest_path)
+            if candidate is None:
+                continue
+            maybe_add_queued(candidate)
+            self._update_candidate_status(candidate.manifest_path, "queued")
+
+        manifest_paths = sorted(self.config.candidates_dir.glob("candidate_*/manifest.json"))
+        for manifest_path in manifest_paths:
+            if manifest_path in seen_manifests:
+                continue
+            payload = read_json_object(manifest_path)
+            status = payload.get("status")
+            if not isinstance(status, str):
+                continue
+            candidate = self._load_prepared_candidate_from_manifest(manifest_path)
+            if candidate is None:
+                continue
+            if status == "queued":
+                maybe_add_queued(candidate)
+                self._update_candidate_status(candidate.manifest_path, "queued")
+                continue
+            if status in {"dequeued", "running"}:
+                self._update_candidate_status(candidate.manifest_path, "approved")
+                self.logger.log(
+                    f"candidate_recovered_to_approved candidate_id={candidate.candidate_id} "
+                    f"previous_status={status}"
+                )
+                status = "approved"
+            if status == "approved":
+                sort_timestamp = str(
+                    payload.get("approved_at")
+                    or payload.get("updated_at")
+                    or payload.get("created_at")
+                    or ""
+                )
+                sort_key = (sort_timestamp, candidate.candidate_id)
+                backlog_candidates.append((sort_key[0], sort_key[1], candidate))
+
+        backlog_candidates.sort(key=lambda item: (item[0], item[1]))
+
+        final_queue: list[PreparedCandidate] = []
+        overflow_candidates: list[PreparedCandidate] = []
+        for candidate in queued_candidates:
+            if len(final_queue) < self.config.prep_queue_depth:
+                final_queue.append(candidate)
+            else:
+                overflow_candidates.append(candidate)
+        for candidate in overflow_candidates:
+            self._update_candidate_status(candidate.manifest_path, "approved")
+            self.logger.log(
+                f"candidate_queue_overflow candidate_id={candidate.candidate_id} action=approved"
+            )
+        for _, _, candidate in backlog_candidates:
+            if len(final_queue) >= self.config.prep_queue_depth:
+                break
+            final_queue.append(candidate)
+            self._update_candidate_status(candidate.manifest_path, "queued")
+            self.logger.log(
+                f"candidate_requeued_on_startup candidate_id={candidate.candidate_id}"
+            )
+
+        with self.queue_lock:
+            self.ready_queue = queue.Queue(maxsize=self.config.prep_queue_depth)
+            for candidate in final_queue:
+                self.ready_queue.put_nowait(candidate)
+            self._persist_ready_queue_locked()
+
+        self.logger.log(
+            "ready_queue_restored "
+            f"queued={len(final_queue)} backlog={len(backlog_candidates)} "
+            f"from_file={len(queue_entries)}"
+        )
 
     def _sanitize_candidate_commit(
         self,
@@ -1161,6 +1431,9 @@ class PgolfController:
         return head_commit
 
     def _apply_candidate(self, candidate: PreparedCandidate, run_id: str, run_dir: Path) -> bool:
+        if self._should_stop_scheduling():
+            self._return_candidate_to_ready_queue(candidate, reason="drain_before_apply")
+            return False
         self.logger.log(
             f"apply_start candidate_id={candidate.candidate_id} run_id={run_id} "
             f"base_commit={candidate.base_commit}"
@@ -1970,14 +2243,6 @@ class PgolfController:
     def _clear_infrastructure_retry_state(self, key: str) -> None:
         self.infrastructure_retry_attempts.pop(key, None)
 
-    def _cleanup_unused_candidates(self) -> None:
-        while True:
-            try:
-                candidate = self.ready_queue.get_nowait()
-            except queue.Empty:
-                return
-            self._update_candidate_status(candidate.manifest_path, "approved")
-
     def _update_candidate_status(self, manifest_path: Path, status: str) -> None:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload["status"] = status
@@ -2024,7 +2289,8 @@ class PgolfController:
                     if len(row) < 13:
                         continue
                     lines.append(
-                        f"- {row[4]} decision={row[5]} val_bpb={row[6]} idea={row[10]} notes={row[12]}"
+                        f"- {row[4]} decision={row[5]} val_bpb={row[6]} "
+                        f"idea={row[10]} notes={row[12]}"
                     )
             lines.extend(["", "## Recent history events"])
             history_lines = read_lines(self.history_ledger)[-15:]
@@ -2453,6 +2719,7 @@ def build_config(args: argparse.Namespace) -> Config:
         runs_dir=runs_dir,
         prep_clones_dir=prep_clones_dir,
         remote_log_dir=env_path("REMOTE_LOG_DIR", "remote_logs"),
+        queue_file=trace_root / "ready_queue.json",
         prep_queue_depth=max(1, args.prep_queue_depth),
         prep_worker_count=max(1, args.prep_workers),
         prep_poll_seconds=max(1.0, float(os.environ.get("PREP_POLL_SECONDS", "5"))),
@@ -2474,10 +2741,23 @@ def build_config(args: argparse.Namespace) -> Config:
     return config
 
 
+def install_signal_handlers(controller: PgolfController) -> None:
+    def _handle_signal(signum: int, _frame: object | None) -> None:
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"SIG{signum}"
+        controller.request_drain(f"signal:{signame}")
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, _handle_signal)
+
+
 def main(argv: list[str]) -> int:
     try:
         config = build_config(parse_args(argv))
         controller = PgolfController(config)
+        install_signal_handlers(controller)
         try:
             controller.run()
         finally:
