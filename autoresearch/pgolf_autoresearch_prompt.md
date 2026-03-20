@@ -13,7 +13,7 @@ Context to read before acting:
 Goal:
 - Improve final `final_int8_zlib_roundtrip_exact val_bpb` on the FineWeb validation set.
 - Lower `val_bpb` is better.
-- Prioritize ideas that are plausibly transferable from stronger 8xH100 record runs into this 1xA40 proxy, rather than narrow one-off export bookkeeping tweaks.
+- Prioritize ideas that can improve this 1xA40 proxy in a trustworthy way, with extra weight on mechanisms that are plausibly transferable from stronger 8xH100 record runs. Deprioritize narrow one-off export bookkeeping tweaks unless repo evidence strongly supports them.
 
 Protocol:
 1. Inspect `git status`, recent commits, `results.tsv`, and recent logs.

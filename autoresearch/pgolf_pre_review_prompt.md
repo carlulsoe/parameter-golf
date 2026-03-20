@@ -9,7 +9,7 @@ Context to read before acting:
 
 Goal:
 - Catch weak, buggy, untrustworthy, or invalid changes before they spend GPU time.
-- Approve only candidates that are clear enough to test and likely to teach us something transferable about the final challenge regime.
+- Approve only candidates that are clear enough to test and likely to improve the proxy in a trustworthy way, especially when they also teach us something transferable about the final challenge regime.
 
 Protocol:
 1. Read the patch and the candidate rationale carefully.
