@@ -315,13 +315,11 @@ INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
     if pattern
 )
-INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -385,16 +383,13 @@ def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     kept_recon = restore_passthrough_tensor(name, kept, candidate_orig_dtypes)
     quantized_error = normalized_mae(t, quantized_recon)
     keep_error = normalized_mae(t, kept_recon)
-    quantized_payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
-    keep_payload_bytes = tensor_nbytes(kept)
     return {
         "name": name,
         "estimated_gain": quantized_error - keep_error,
         "quantized_error": quantized_error,
         "keep_error": keep_error,
-        "quantized_payload_bytes": quantized_payload_bytes,
-        "keep_payload_bytes": keep_payload_bytes,
-        "extra_payload_bytes": keep_payload_bytes - quantized_payload_bytes,
+        "quantized_payload_bytes": tensor_nbytes(q) + tensor_nbytes(s),
+        "keep_payload_bytes": tensor_nbytes(kept),
     }
 
 def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
@@ -420,23 +415,10 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
             "keep_error": 0.0,
             "quantized_payload_bytes": 0,
             "keep_payload_bytes": 0,
-            "extra_payload_bytes": 0,
-            "top_candidates_summary": "",
         }
-    ranked = sorted(
-        candidates,
-        key=lambda item: (float(item["estimated_gain"]), -int(item["keep_payload_bytes"])),
-        reverse=True,
-    )
-    best = ranked[0]
+    best = max(candidates, key=lambda item: (float(item["estimated_gain"]), -int(item["keep_payload_bytes"])))
     best["candidate_count"] = len(candidates)
     best["selected_name"] = str(best["name"])
-    best["top_candidates_summary"] = ",".join(
-        (
-            f"{str(item['name'])}|gain={float(item['estimated_gain']):.8f}|extra={int(item['extra_payload_bytes'])}"
-            for item in ranked[: max(INT8_AUTO_KEEP_FLOAT_LOG_TOPK, 0)]
-        )
-    )
     return best
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -480,7 +462,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     stats["auto_keep_extra_payload_bytes"] = (
         stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
     )
-    stats["auto_keep_top_candidates_summary"] = str(auto_keep["top_candidates_summary"]) if auto_keep is not None else ""
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -1250,8 +1231,6 @@ def main() -> None:
                 f"quantized_error:{quant_stats['auto_keep_quantized_error']:.8f} "
                 f"keep_error:{quant_stats['auto_keep_keep_error']:.8f}"
             )
-            if quant_stats["auto_keep_top_candidates_summary"]:
-                log0(f"Int8 auto-keep top candidates: {quant_stats['auto_keep_top_candidates_summary']}")
             log0(
                 "Int8 auto-keep bytes: "
                 f"large_tensors:{quant_stats['large_keep_tensor_count']} "
@@ -1265,15 +1244,7 @@ def main() -> None:
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        total_submission_bytes = quant_file_bytes + code_bytes
-        size_headroom = SUBMISSION_SIZE_CAP_BYTES - total_submission_bytes
-        log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
-        log0(
-            "Submission size headroom: "
-            f"cap:{SUBMISSION_SIZE_CAP_BYTES} "
-            f"used:{total_submission_bytes} "
-            f"remaining:{size_headroom}"
-        )
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
