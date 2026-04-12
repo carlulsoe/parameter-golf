@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import copy
 import glob
+import hashlib
 import inspect
 import io
+import json
 import math
 import os
 import random
@@ -60,6 +62,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    shard_order_audit = bool(int(os.environ.get("SHARD_ORDER_AUDIT", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -781,18 +784,32 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, enable_audit: bool = False):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.enable_audit = enable_audit
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self._ordered_shards = [file.name for file in self.files]
+        ordered_payload = "\n".join(str(file.resolve()) for file in self.files).encode("utf-8")
+        self._ordered_shards_sha256 = hashlib.sha256(ordered_payload).hexdigest()
+        self._entered_shards_sha256 = hashlib.sha256()
+        self._consumed_spans_sha256 = hashlib.sha256()
+        self._entered_counts = [0 for _ in self.files]
+        self._consumed_tokens = [0 for _ in self.files]
+        self._record_file_entry(self.file_idx)
+
+    def _record_file_entry(self, file_idx: int) -> None:
+        self._entered_counts[file_idx] += 1
+        self._entered_shards_sha256.update(f"{file_idx}:{self.files[file_idx].name}\n".encode("utf-8"))
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
+        self._record_file_entry(self.file_idx)
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -803,20 +820,57 @@ class TokenStream:
                 self._advance_file()
                 continue
             k = min(remaining, avail)
+            start_pos = self.pos
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
             remaining -= k
+            if self.enable_audit:
+                self._consumed_tokens[self.file_idx] += int(k)
+                self._consumed_spans_sha256.update(
+                    f"{self.file_idx}:{start_pos}:{int(k)}\n".encode("utf-8")
+                )
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+    def order_audit_json(self, phase: str) -> str:
+        payload = {
+            "phase": phase,
+            "ordered_shard_count": len(self.files),
+            "ordered_shards": self._ordered_shards,
+            "ordered_shards_sha256": self._ordered_shards_sha256,
+        }
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+    def coverage_audit_json(self, phase: str) -> str:
+        coverage = [
+            {
+                "entries": int(entries),
+                "name": self.files[i].name,
+                "tokens": int(tokens),
+            }
+            for i, (entries, tokens) in enumerate(zip(self._entered_counts, self._consumed_tokens, strict=True))
+            if entries > 0 or tokens > 0
+        ]
+        payload = {
+            "phase": phase,
+            "consumed_spans_sha256": self._consumed_spans_sha256.hexdigest(),
+            "entered_shards_sha256": self._entered_shards_sha256.hexdigest(),
+            "ordered_shard_count": len(self.files),
+            "ordered_shards_sha256": self._ordered_shards_sha256,
+            "shards_touched": sum(1 for tokens in self._consumed_tokens if tokens > 0),
+            "tokens_consumed_total": int(sum(self._consumed_tokens)),
+            "coverage": coverage,
+        }
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, enable_audit: bool = False):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, enable_audit=enable_audit)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -827,6 +881,12 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def order_audit_json(self, phase: str) -> str:
+        return self.stream.order_audit_json(phase)
+
+    def coverage_audit_json(self, phase: str) -> str:
+        return self.stream.coverage_audit_json(phase)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1274,7 +1334,16 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        enable_audit=args.shard_order_audit,
+    )
+    if args.shard_order_audit:
+        initial_phase = "warmup" if args.warmup_steps > 0 else "measured"
+        log0(f"train_shard_order:{train_loader.order_audit_json(initial_phase)}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1319,7 +1388,17 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.shard_order_audit:
+            log0(f"train_shard_audit:{train_loader.coverage_audit_json('warmup')}")
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            enable_audit=args.shard_order_audit,
+        )
+        if args.shard_order_audit:
+            log0(f"train_shard_order:{train_loader.order_audit_json('measured')}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1498,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.shard_order_audit:
+        log0(f"train_shard_audit:{train_loader.coverage_audit_json('measured')}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
