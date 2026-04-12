@@ -828,37 +828,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-def muon_momentum_for_step(args: Hyperparameters, step: int) -> float:
-    frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-
-def muon_warmup_audit_fields(args: Hyperparameters, updates_applied: int) -> dict[str, str]:
-    if updates_applied <= 0:
-        return {
-            "updates_applied": "0",
-            "measured_stop_step": "0",
-            "last_applied_step": "none",
-            "last_muon_momentum": "none",
-            "warmup_fraction_completed": "none",
-            "audit_reference": "no_updates_applied",
-        }
-    last_applied_step = updates_applied - 1
-    warmup_fraction_completed = (
-        min(last_applied_step / args.muon_momentum_warmup_steps, 1.0)
-        if args.muon_momentum_warmup_steps > 0
-        else 1.0
-    )
-    return {
-        "updates_applied": str(updates_applied),
-        "measured_stop_step": str(updates_applied),
-        "last_applied_step": str(last_applied_step),
-        "last_muon_momentum": f"{muon_momentum_for_step(args, last_applied_step):.5f}",
-        "warmup_fraction_completed": f"{warmup_fraction_completed:.5f}",
-        "audit_reference": "last_applied_step",
-    }
-
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1299,11 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"muon_schedule:warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"optimizer_step_semantics:pre_update"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1415,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_step(args, step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1453,16 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    muon_audit = muon_warmup_audit_fields(args, step)
-    log0(
-        "muon_warmup_audit:"
-        f"updates_applied:{muon_audit['updates_applied']} "
-        f"measured_stop_step:{muon_audit['measured_stop_step']} "
-        f"last_applied_step:{muon_audit['last_applied_step']} "
-        f"last_muon_momentum:{muon_audit['last_muon_momentum']} "
-        f"warmup_fraction_completed:{muon_audit['warmup_fraction_completed']} "
-        f"audit_reference:{muon_audit['audit_reference']}"
     )
 
     # -----------------------------
