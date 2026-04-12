@@ -83,6 +83,11 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmdown_start_step = int(os.environ.get("MUON_MOMENTUM_WARMDOWN_START_STEP", 0))
+    muon_momentum_warmdown_steps = int(os.environ.get("MUON_MOMENTUM_WARMDOWN_STEPS", 0))
+    muon_momentum_warmdown_target = float(
+        os.environ.get("MUON_MOMENTUM_WARMDOWN_TARGET", os.environ.get("MUON_MOMENTUM", "0.95"))
+    )
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1171,6 +1176,27 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.muon_momentum_warmup_steps < 0:
+        raise ValueError(f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}")
+    if args.muon_momentum_warmdown_start_step < 0:
+        raise ValueError(
+            "MUON_MOMENTUM_WARMDOWN_START_STEP must be non-negative, "
+            f"got {args.muon_momentum_warmdown_start_step}"
+        )
+    if args.muon_momentum_warmdown_steps < 0:
+        raise ValueError(
+            f"MUON_MOMENTUM_WARMDOWN_STEPS must be non-negative, got {args.muon_momentum_warmdown_steps}"
+        )
+    if not 0.0 <= args.muon_momentum_warmup_start < 1.0:
+        raise ValueError(
+            f"MUON_MOMENTUM_WARMUP_START must be in [0, 1), got {args.muon_momentum_warmup_start}"
+        )
+    if not 0.0 <= args.muon_momentum < 1.0:
+        raise ValueError(f"MUON_MOMENTUM must be in [0, 1), got {args.muon_momentum}")
+    if not 0.0 <= args.muon_momentum_warmdown_target < 1.0:
+        raise ValueError(
+            f"MUON_MOMENTUM_WARMDOWN_TARGET must be in [0, 1), got {args.muon_momentum_warmdown_target}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1294,18 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        "muon_schedule: "
+        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"base:{args.muon_momentum:.5f} "
+        f"warmdown_start_step:{args.muon_momentum_warmdown_start_step} "
+        f"warmdown_steps:{args.muon_momentum_warmdown_steps} "
+        f"warmdown_target:{args.muon_momentum_warmdown_target:.5f} "
+        "optimizer_step_semantics:pre_update "
+        "checkpoint_log_semantics:realized_last_update "
+        f"warmdown_source:{'step_schedule' if args.muon_momentum_warmdown_steps > 0 else 'disabled'}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1292,6 +1330,21 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def muon_momentum_for_update_step(update_step: int) -> float:
+        warmup_frac = (
+            min(update_step / args.muon_momentum_warmup_steps, 1.0)
+            if args.muon_momentum_warmup_steps > 0
+            else 1.0
+        )
+        momentum = (1.0 - warmup_frac) * args.muon_momentum_warmup_start + warmup_frac * args.muon_momentum
+        if args.muon_momentum_warmdown_steps > 0 and update_step >= args.muon_momentum_warmdown_start_step:
+            warmdown_frac = min(
+                (update_step - args.muon_momentum_warmdown_start_step) / args.muon_momentum_warmdown_steps,
+                1.0,
+            )
+            momentum = (1.0 - warmdown_frac) * momentum + warmdown_frac * args.muon_momentum_warmdown_target
+        return momentum
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1331,6 +1384,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    last_lr_scale = 1.0
+    last_muon_momentum = float("nan")
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1352,7 +1407,8 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"lr_scale:{last_lr_scale:.5f} muon_momentum:{last_muon_momentum:.5f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1367,6 +1423,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        muon_momentum = muon_momentum_for_update_step(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1379,8 +1436,6 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1394,6 +1449,8 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        last_lr_scale = scale
+        last_muon_momentum = muon_momentum
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1403,7 +1460,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"lr_scale:{last_lr_scale:.5f} muon_momentum:{last_muon_momentum:.5f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
