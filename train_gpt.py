@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -539,26 +538,6 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in results),
         "candidate_summary": candidate_summary,
     }
-
-
-def init_ema_state_dict(module: nn.Module) -> dict[str, Tensor]:
-    ema_state: dict[str, Tensor] = {}
-    for name, param in module.named_parameters():
-        ema_state[name] = param.detach().float().clone()
-    return ema_state
-
-
-@torch.no_grad()
-def update_ema_state_dict(ema_state: dict[str, Tensor], module: nn.Module, decay: float) -> None:
-    one_minus_decay = 1.0 - decay
-    for name, param in module.named_parameters():
-        ema_state[name].mul_(decay).add_(param.detach().float(), alpha=one_minus_decay)
-
-
-@torch.no_grad()
-def copy_ema_into_model(module: nn.Module, ema_state: dict[str, Tensor]) -> None:
-    for name, param in module.named_parameters():
-        param.copy_(ema_state[name].to(device=param.device, dtype=param.dtype))
 
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
@@ -1111,8 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1291,7 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"ema_decay:{args.ema_decay:.6f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1349,8 +1325,6 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    ema_state = init_ema_state_dict(base_model) if args.ema_decay > 0.0 else None
-    ema_updates = 0
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1418,9 +1392,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if ema_state is not None:
-            update_ema_state_dict(ema_state, base_model, args.ema_decay)
-            ema_updates += 1
         zero_grad_all()
 
         step += 1
@@ -1454,10 +1425,6 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-
-    if ema_state is not None:
-        copy_ema_into_model(base_model, ema_state)
-        log0(f"ema_export:applied decay:{args.ema_decay:.6f} updates:{ema_updates}")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
