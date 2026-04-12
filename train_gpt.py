@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    embed_beta2 = float(os.environ.get("EMBED_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1091,13 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    for beta_name, beta_value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("EMBED_BETA2", args.embed_beta2)):
-        if not 0.0 <= beta_value < 1.0:
-            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
-    if not args.tie_embeddings and args.embed_beta2 != args.beta2:
-        raise ValueError(
-            "EMBED_BETA2 must equal BETA2 when TIE_EMBEDDINGS=0; only the tied tok_emb optimizer can override beta2"
-        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1230,10 +1222,9 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_beta2 = args.embed_beta2 if args.tie_embeddings else args.beta2
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1270,14 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"optimizer_betas:beta1:{args.beta1} adam_beta2:{args.beta2} embed_beta2:{token_beta2}"
-    )
-    log0(
-        "optimizer_beta2_scope: "
-        f"{'only_tied_tok_emb_uses_embed_beta2;head_and_scalar_use_beta2;muon_unchanged' if args.tie_embeddings and token_beta2 != args.beta2 else 'all_groups_use_baseline_beta2;muon_unchanged'} "
-        f"head_beta2:{args.beta2} scalar_beta2:{args.beta2} muon_momentum:{args.muon_momentum}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
