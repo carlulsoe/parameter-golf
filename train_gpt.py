@@ -60,8 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    shard_order_audit = bool(int(os.environ.get("SHARD_ORDER_AUDIT", "0")))
-    shard_order_audit_seed = int(os.environ.get("SHARD_ORDER_AUDIT_SEED", 1337))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -764,119 +762,20 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
     # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
-    return torch.from_numpy(load_data_shard_tokens_np(file, num_tokens))
-
-
-def load_data_shard_tokens_np(file: Path, num_tokens: int) -> np.ndarray:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
     expected_size = header_bytes + num_tokens * token_bytes
     if file.stat().st_size != expected_size:
         raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
-    return tokens_np.astype(np.uint16, copy=False)
-
-
-def get_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
-def simulate_shard_usage(
-    shard_tokens: list[int], total_tokens: int, mode: str, seed: int
-) -> list[int]:
-    if total_tokens <= 0:
-        return [0] * len(shard_tokens)
-    num_shards = len(shard_tokens)
-    if num_shards == 0:
-        return []
-    baseline_order = list(range(num_shards))
-    fixed_permute_order = baseline_order[:]
-    random.Random(seed).shuffle(fixed_permute_order)
-    usage = [0] * num_shards
-    remaining = total_tokens
-    wrap_idx = 0
-    while remaining > 0:
-        if mode == "sorted_repeat":
-            order = baseline_order
-        elif mode == "reverse_repeat":
-            order = list(reversed(baseline_order))
-        elif mode == "fixed_permute_repeat":
-            order = fixed_permute_order
-        elif mode == "rotate_per_wrap":
-            offset = wrap_idx % num_shards
-            order = baseline_order[offset:] + baseline_order[:offset]
-        elif mode == "permute_per_wrap":
-            order = baseline_order[:]
-            random.Random(seed + wrap_idx).shuffle(order)
-        else:
-            raise ValueError(f"Unknown shard audit mode: {mode}")
-        for shard_idx in order:
-            if remaining <= 0:
-                break
-            take = min(remaining, shard_tokens[shard_idx])
-            usage[shard_idx] += take
-            remaining -= take
-        wrap_idx += 1
-    return usage
-
-
-def format_shard_usage_summary(usage: list[int]) -> str:
-    touched = [f"{idx}:{tokens}" for idx, tokens in enumerate(usage) if tokens > 0]
-    return ",".join(touched) if touched else "none"
-
-
-def format_prefix_share_summary(usage: list[int]) -> str:
-    total = sum(usage)
-    if total <= 0:
-        return "none"
-    prefix_marks = {1, 2, 4, 8, 16, 32, len(usage)}
-    prefix_total = 0
-    parts: list[str] = []
-    for idx, tokens in enumerate(usage, start=1):
-        prefix_total += tokens
-        if idx in prefix_marks:
-            parts.append(f"k{idx}:{prefix_total / total:.6f}")
-    return ",".join(parts)
-
-
-def log_shard_order_audit(log0, files: list[Path], shard_tokens: list[int], live_usage: list[int], seed: int) -> None:
-    total_consumed = sum(live_usage)
-    total_shards = len(files)
-    total_dataset_tokens = sum(shard_tokens)
-    touched = sum(tokens > 0 for tokens in live_usage)
-    completed_wraps = total_consumed // max(total_dataset_tokens, 1)
-    live_prefix = format_prefix_share_summary(live_usage)
-    log0(
-        "Shard order audit live: "
-        f"seed:{seed} consumed_tokens:{total_consumed} "
-        f"touched_shards:{touched}/{total_shards} "
-        f"coverage:{touched / max(total_shards, 1):.6f} "
-        f"completed_wraps:{completed_wraps} "
-        f"prefix_shares:{live_prefix}"
-    )
-    log0(f"Shard order audit live usage: {format_shard_usage_summary(live_usage)}")
-    for mode in ("sorted_repeat", "reverse_repeat", "fixed_permute_repeat", "rotate_per_wrap", "permute_per_wrap"):
-        usage = simulate_shard_usage(shard_tokens, total_consumed, mode, seed)
-        touched_mode = sum(tokens > 0 for tokens in usage)
-        matches_live = int(mode == "sorted_repeat" and usage == live_usage)
-        log0(
-            "Shard order audit counterfactual: "
-            f"mode:{mode} "
-            f"matches_live:{matches_live} "
-            f"touched_shards:{touched_mode}/{total_shards} "
-            f"coverage:{touched_mode / max(total_shards, 1):.6f} "
-            f"prefix_shares:{format_prefix_share_summary(usage)}"
-        )
+    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
 class TokenStream:
@@ -886,9 +785,6 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.shard_tokens = [get_data_shard_num_tokens(file) for file in self.files]
-        self.usage_by_file = [0] * len(self.files)
-        self.total_tokens_consumed = 0
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
@@ -909,8 +805,6 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.usage_by_file[self.file_idx] += k
-            self.total_tokens_consumed += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
@@ -1375,12 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.shard_order_audit:
-        log0(
-            "shard_order_audit: "
-            f"enabled:1 seed:{args.shard_order_audit_seed} "
-            "modes:sorted_repeat,reverse_repeat,fixed_permute_repeat,rotate_per_wrap,permute_per_wrap"
-        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1531,14 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.shard_order_audit:
-        log_shard_order_audit(
-            log0,
-            train_loader.stream.files,
-            train_loader.stream.shard_tokens,
-            train_loader.stream.usage_by_file,
-            args.shard_order_audit_seed,
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
