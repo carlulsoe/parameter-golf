@@ -58,6 +58,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    eval_max_context = int(os.environ.get("EVAL_MAX_CONTEXT", os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024))))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -280,6 +281,87 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_matched_target_context_sidecar(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    if args.eval_max_context <= args.eval_seq_len:
+        raise ValueError(
+            f"EVAL_MAX_CONTEXT must exceed EVAL_SEQ_LEN for the matched-target sidecar, "
+            f"got EVAL_MAX_CONTEXT={args.eval_max_context} EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.eval_max_context:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one EVAL_MAX_CONTEXT sequence per rank for the matched-target sidecar; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_MAX_CONTEXT={args.eval_max_context}"
+        )
+    local_batch_seqs = local_batch_tokens // args.eval_max_context
+    total_seqs = (val_tokens.numel() - 1) // args.eval_max_context
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    target_offset = args.eval_max_context - args.eval_seq_len
+    sidecar_mask = torch.zeros((args.eval_max_context,), device=device, dtype=torch.bool)
+    sidecar_mask[target_offset:] = True
+
+    short_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    long_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.eval_max_context
+            raw_end = batch_seq_end * args.eval_max_context + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            long_x = local[:-1].reshape(-1, args.eval_max_context)
+            long_y = local[1:].reshape(-1, args.eval_max_context)
+            short_x = long_x[:, target_offset:]
+            short_y = long_y[:, target_offset:]
+            batch_sidecar_mask = sidecar_mask.expand(long_y.size(0), -1)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                short_loss = model(short_x, short_y).detach()
+                long_loss = model(long_x, long_y, batch_sidecar_mask).detach()
+            batch_token_count = float(short_y.numel())
+            short_loss_sum += short_loss.to(torch.float64) * batch_token_count
+            long_loss_sum += long_loss.to(torch.float64) * batch_token_count
+            token_count += batch_token_count
+            prev_ids = short_x.reshape(-1)
+            tgt_ids = short_y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(short_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(long_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    short_val_loss = short_loss_sum / token_count
+    long_val_loss = long_loss_sum / token_count
+    tokens_per_byte = token_count.item() / byte_count.item()
+    model.train()
+    return (
+        float(short_val_loss.item()),
+        float((short_val_loss.item() / math.log(2.0)) * tokens_per_byte),
+    ), (
+        float(long_val_loss.item()),
+        float((long_val_loss.item() / math.log(2.0)) * tokens_per_byte),
+    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1053,7 +1135,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, loss_mask: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1077,7 +1159,17 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        losses = F.cross_entropy(logits.float(), targets, reduction="none")
+        if loss_mask is None:
+            return losses.mean()
+        loss_mask = loss_mask.reshape(-1).to(device=losses.device, dtype=losses.dtype)
+        if loss_mask.numel() != losses.numel():
+            raise ValueError(
+                f"loss_mask shape must match targets, got loss_mask.numel()={loss_mask.numel()} "
+                f"targets.numel()={losses.numel()}"
+            )
+        denom = loss_mask.sum()
+        return (losses * loss_mask).sum() / denom
 
 
 # -----------------------------
@@ -1171,13 +1263,27 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.eval_max_context <= 0:
+        raise ValueError(f"EVAL_MAX_CONTEXT must be positive, got {args.eval_max_context}")
+    if args.eval_max_context < args.eval_seq_len:
+        raise ValueError(
+            f"EVAL_MAX_CONTEXT must be >= EVAL_SEQ_LEN, got EVAL_MAX_CONTEXT={args.eval_max_context} "
+            f"EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
+    sidecar_val_tokens = load_validation_tokens(args.val_files, args.eval_max_context) if args.eval_max_context > args.eval_seq_len else None
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if sidecar_val_tokens is not None:
+        log0(
+            f"eval_context_sidecar:enabled diagnostic_only:1 "
+            f"eval_seq_len:{args.eval_seq_len} eval_max_context:{args.eval_max_context} "
+            f"tail_tokens:{args.eval_seq_len} tokens:{sidecar_val_tokens.numel() - 1}"
+        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1264,7 +1370,7 @@ def main() -> None:
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"eval_seq_len:{args.eval_seq_len} "
+        f"eval_seq_len:{args.eval_seq_len} eval_max_context:{args.eval_max_context} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
@@ -1551,6 +1657,39 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if sidecar_val_tokens is not None:
+        torch.cuda.synchronize()
+        t_sidecar = time.perf_counter()
+        (sidecar_1024_loss, sidecar_1024_bpb), (sidecar_max_loss, sidecar_max_bpb) = eval_matched_target_context_sidecar(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            sidecar_val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip_sidecar_matched_targets_ctx{args.eval_seq_len} "
+            f"val_loss:{sidecar_1024_loss:.4f} val_bpb:{sidecar_1024_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_sidecar):.0f}ms"
+        )
+        log0(
+            f"final_int8_zlib_roundtrip_sidecar_matched_targets_ctx{args.eval_seq_len}_exact "
+            f"val_loss:{sidecar_1024_loss:.8f} val_bpb:{sidecar_1024_bpb:.8f}"
+        )
+        log0(
+            f"final_int8_zlib_roundtrip_sidecar_matched_targets_ctx{args.eval_max_context} "
+            f"val_loss:{sidecar_max_loss:.4f} val_bpb:{sidecar_max_bpb:.4f}"
+        )
+        log0(
+            f"final_int8_zlib_roundtrip_sidecar_matched_targets_ctx{args.eval_max_context}_exact "
+            f"val_loss:{sidecar_max_loss:.8f} val_bpb:{sidecar_max_bpb:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
