@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1263,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(f"ema_decay:{args.ema_decay}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1322,15 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-
-    if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError(f"EMA_DECAY must satisfy 0 <= EMA_DECAY < 1, got {args.ema_decay}")
-    ema_state = (
-        {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
-        if args.ema_decay > 0.0
-        else None
-    )
-    ema_updates = 0
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1403,11 +1392,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if ema_state is not None:
-            ema_updates += 1
-            one_minus_decay = 1.0 - args.ema_decay
-            for name, tensor in base_model.state_dict().items():
-                ema_state[name].lerp_(tensor.detach(), one_minus_decay)
         zero_grad_all()
 
         step += 1
@@ -1441,13 +1425,6 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-
-    if ema_state is not None:
-        log0(
-            f"EMA final checkpoint: enabled:1 decay:{args.ema_decay:.6f} "
-            f"updates:{ema_updates} tensors:{len(ema_state)}"
-        )
-        base_model.load_state_dict(ema_state, strict=True)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
