@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1209,6 +1212,11 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    scalar_param_names = [
+        name
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1221,6 +1229,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        scalar_param_names.append("skip_weights")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,10 +1245,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+    scalar_group = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    scalar_optimizer_cls = torch.optim.AdamW if args.scalar_weight_decay > 0.0 else torch.optim.Adam
+    optimizer_scalar = scalar_optimizer_cls(
+        scalar_group,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.scalar_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1261,6 +1273,19 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_betas:beta1:{args.beta1} adam_beta2:{args.beta2} adam_eps:{args.adam_eps}"
+    )
+    log0(
+        f"scalar_optimizer:{optimizer_scalar.__class__.__name__} "
+        f"scalar_weight_decay:{optimizer_scalar.param_groups[0]['weight_decay']} "
+        f"scalar_scope:block_named_params(ndim<2_or_control_name_match)+skip_weights "
+        f"scalar_param_tensors:{len(scalar_params)} scalar_param_numel:{sum(p.numel() for p in scalar_params)}"
+    )
+    log0(
+        f"scalar_control_patterns:{','.join(CONTROL_TENSOR_NAME_PATTERNS)} "
+        f"scalar_param_names:{','.join(scalar_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
