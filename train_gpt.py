@@ -78,9 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_lr_warmdown_start_step = int(os.environ.get("MATRIX_LR_WARMDOWN_START_STEP", 0))
-    matrix_lr_warmdown_steps = int(os.environ.get("MATRIX_LR_WARMDOWN_STEPS", 0))
-    matrix_lr_warmdown_target = float(os.environ.get("MATRIX_LR_WARMDOWN_TARGET", 1.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -283,26 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def matrix_lr_warmdown_mult(args: Hyperparameters, update_step: int | None) -> float:
-    if args.matrix_lr_warmdown_steps <= 0 or update_step is None:
-        return 1.0
-    if update_step < args.matrix_lr_warmdown_start_step:
-        return 1.0
-    progress = min(update_step - args.matrix_lr_warmdown_start_step + 1, args.matrix_lr_warmdown_steps)
-    alpha = progress / args.matrix_lr_warmdown_steps
-    return 1.0 + (args.matrix_lr_warmdown_target - 1.0) * alpha
-
-
-def format_matrix_lr_audit(last_applied_update: int | None, last_matrix_lr_mult: float | None, last_matrix_lr: float | None) -> str:
-    if last_applied_update is None or last_matrix_lr_mult is None or last_matrix_lr is None:
-        return "matrix_lr_update:none matrix_lr_mult:none matrix_lr:none"
-    return (
-        f"matrix_lr_update:{last_applied_update} "
-        f"matrix_lr_mult:{last_matrix_lr_mult:.6f} "
-        f"matrix_lr:{last_matrix_lr:.6f}"
-    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1194,16 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.matrix_lr_warmdown_start_step < 0:
-        raise ValueError(
-            f"MATRIX_LR_WARMDOWN_START_STEP must be non-negative, got {args.matrix_lr_warmdown_start_step}"
-        )
-    if args.matrix_lr_warmdown_steps < 0:
-        raise ValueError(f"MATRIX_LR_WARMDOWN_STEPS must be non-negative, got {args.matrix_lr_warmdown_steps}")
-    if not 0.0 <= args.matrix_lr_warmdown_target <= 1.0:
-        raise ValueError(
-            f"MATRIX_LR_WARMDOWN_TARGET must be in [0, 1], got {args.matrix_lr_warmdown_target}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1301,18 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    if args.matrix_lr_warmdown_steps > 0:
-        log0(
-            "matrix_lr_schedule: "
-            f"warmdown_start_step:{args.matrix_lr_warmdown_start_step} "
-            f"warmdown_steps:{args.matrix_lr_warmdown_steps} "
-            f"warmdown_target:{args.matrix_lr_warmdown_target:.5f} "
-            "scope:optimizer_muon_only "
-            "optimizer_step_semantics:pre_update "
-            f"first_affected_update:{args.matrix_lr_warmdown_start_step} "
-            f"first_affected_checkpoint_step:{args.matrix_lr_warmdown_start_step + 1} "
-            "checkpoint_log_semantics:last_applied_update"
-        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1372,9 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_matrix_lr_update: int | None = None
-    last_matrix_lr_mult: float | None = None
-    last_matrix_lr: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1400,8 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"{format_matrix_lr_audit(last_matrix_lr_update, last_matrix_lr_mult, last_matrix_lr)}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1416,7 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        matrix_scale = matrix_lr_warmdown_mult(args, step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1436,17 +1386,13 @@ def main() -> None:
 
         for opt in optimizers:
             for group in opt.param_groups:
-                group_scale = matrix_scale if opt is optimizer_muon else 1.0
-                group["lr"] = group["base_lr"] * scale * group_scale
+                group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
-        last_matrix_lr_update = step
-        last_matrix_lr_mult = matrix_scale
-        last_matrix_lr = args.matrix_lr * scale * matrix_scale
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1457,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"{format_matrix_lr_audit(last_matrix_lr_update, last_matrix_lr_mult, last_matrix_lr)}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
