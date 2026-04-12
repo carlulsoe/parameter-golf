@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    control_eps = float(os.environ.get("CONTROL_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1089,6 +1090,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be strictly positive, got {args.adam_eps}")
+    if args.control_eps <= 0.0:
+        raise ValueError(f"CONTROL_EPS must be strictly positive, got {args.control_eps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1214,13 +1219,21 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    control_named_params = [
+        (name, p) for name, p in block_named_params if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    other_scalar_named_params = [
+        (name, p)
+        for name, p in block_named_params
+        if p.ndim < 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    control_params = [p for _, p in control_named_params]
+    other_scalar_params = [p for _, p in other_scalar_named_params]
+    control_param_names = [f"blocks.{name}" for name, _ in control_named_params]
+    other_scalar_param_names = [f"blocks.{name}" for name, _ in other_scalar_named_params]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        control_params.append(base_model.skip_weights)
+        control_param_names.append("skip_weights")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,13 +1249,21 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+    optimizer_control = torch.optim.Adam(
+        [{"params": control_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.control_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_control]
+    if other_scalar_params:
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": other_scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_scalar)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1283,22 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_betas:beta1:{args.beta1} beta2:{args.beta2} "
+        f"adam_eps:{args.adam_eps:.0e} control_eps:{args.control_eps:.0e}"
+    )
+    log0(
+        "scalar_optimizer_split: "
+        f"control_tensors:{len(control_param_names)} "
+        f"control_numel:{sum(int(p.numel()) for p in control_params)} "
+        f"other_scalar_tensors:{len(other_scalar_param_names)} "
+        f"other_scalar_numel:{sum(int(p.numel()) for p in other_scalar_params)} "
+        "control_scope:control_name_match_plus_skip_weights "
+        "other_scalar_scope:block_named_params(ndim<2_and_not_control)"
+    )
+    log0(f"scalar_control_patterns:{','.join(CONTROL_TENSOR_NAME_PATTERNS)}")
+    log0(f"control_param_names:{','.join(control_param_names)}")
+    log0(f"other_scalar_param_names:{','.join(other_scalar_param_names)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
