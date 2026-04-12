@@ -87,9 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    embed_lr_warmdown_start_step = int(os.environ.get("EMBED_LR_WARMDOWN_START_STEP", 0))
-    embed_lr_warmdown_steps = int(os.environ.get("EMBED_LR_WARMDOWN_STEPS", 0))
-    embed_lr_warmdown_target = float(os.environ.get("EMBED_LR_WARMDOWN_TARGET", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1092,18 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.embed_lr_warmdown_start_step < 0:
-        raise ValueError(
-            f"EMBED_LR_WARMDOWN_START_STEP must be non-negative, got {args.embed_lr_warmdown_start_step}"
-        )
-    if args.embed_lr_warmdown_steps < 0:
-        raise ValueError(f"EMBED_LR_WARMDOWN_STEPS must be non-negative, got {args.embed_lr_warmdown_steps}")
-    if not 0.0 < args.embed_lr_warmdown_target <= 1.0:
-        raise ValueError(
-            f"EMBED_LR_WARMDOWN_TARGET must be in (0, 1], got {args.embed_lr_warmdown_target}"
-        )
-    if args.embed_lr_warmdown_steps > 0 and not args.tie_embeddings:
-        raise ValueError("EMBED_LR_WARMDOWN_* requires TIE_EMBEDDINGS=1 so the scope is the shared embedding/output matrix")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1277,15 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if args.embed_lr_warmdown_steps > 0:
-        log0(
-            "embed_lr_schedule:"
-            f"warmdown_start_step:{args.embed_lr_warmdown_start_step} "
-            f"warmdown_steps:{args.embed_lr_warmdown_steps} "
-            f"warmdown_target:{args.embed_lr_warmdown_target:.5f} "
-            "scope:tied_tok_emb_and_output "
-            "checkpoint_log_semantics:realized_last_update"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1316,12 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def embed_lr_warmdown_mul(step: int) -> float:
-        if args.embed_lr_warmdown_steps <= 0 or step < args.embed_lr_warmdown_start_step:
-            return 1.0
-        progress = min((step - args.embed_lr_warmdown_start_step + 1) / max(args.embed_lr_warmdown_steps, 1), 1.0)
-        return 1.0 + (args.embed_lr_warmdown_target - 1.0) * progress
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1357,8 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_applied_embed_lr_mult = 1.0
-    last_applied_embed_lr = token_lr
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1384,8 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"embed_lr_mult:{last_applied_embed_lr_mult:.6f} embed_lr:{last_applied_embed_lr:.6f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1417,14 +1384,9 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
-        embed_step_lr_mult = scale * embed_lr_warmdown_mul(step)
-        for group in optimizer_tok.param_groups:
-            group["lr"] = group["base_lr"] * embed_step_lr_mult
-        for opt in optimizers[1:]:
+        for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        last_applied_embed_lr_mult = embed_step_lr_mult
-        last_applied_embed_lr = optimizer_tok.param_groups[0]["lr"]
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1441,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"embed_lr_mult:{last_applied_embed_lr_mult:.6f} embed_lr:{last_applied_embed_lr:.6f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
