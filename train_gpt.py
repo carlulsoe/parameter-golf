@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    control_lr_scale = float(os.environ.get("CONTROL_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1207,20 +1208,42 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # - named residual-control tensors can use CONTROL_LR_SCALE * SCALAR_LR via Adam
+    # - remaining vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    control_named_params = [
+        (name, p)
+        for name, p in block_named_params
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    control_params = [p for _, p in control_named_params]
+    scalar_params = [p for _, p in scalar_named_params]
+    control_param_names = [name for name, _ in control_named_params]
+    scalar_param_names = [name for name, _ in scalar_named_params]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        control_params.append(base_model.skip_weights)
+        control_param_names.append("skip_weights")
+    if args.control_lr_scale <= 0.0:
+        raise ValueError(f"CONTROL_LR_SCALE must be positive, got {args.control_lr_scale}")
+    if args.control_lr_scale != 1.0 and not control_params:
+        raise ValueError("CONTROL_LR_SCALE != 1.0 requires at least one matched control parameter")
+    if args.control_lr_scale != 1.0 and not scalar_params:
+        raise ValueError(
+            "CONTROL_LR_SCALE != 1.0 requires non-control scalar parameters to remain on baseline SCALAR_LR"
+        )
+    control_lr = args.scalar_lr * args.control_lr_scale
+    if args.control_lr_scale != 1.0 and control_lr == args.scalar_lr:
+        raise ValueError("CONTROL_LR_SCALE changed but produced no effective control LR split")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1242,7 +1265,17 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
+    optimizer_control = None
+    if control_params:
+        optimizer_control = torch.optim.Adam(
+            [{"params": control_params, "lr": control_lr, "base_lr": control_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_control)
+    optimizers.append(optimizer_scalar)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1260,7 +1293,20 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"control_lr:{control_lr} control_lr_scale:{args.control_lr_scale}"
+    )
+    log0(
+        "scalar_optimizer_split:"
+        f" control_tensors:{len(control_param_names)} control_numel:{sum(p.numel() for p in control_params)} "
+        f"other_scalar_tensors:{len(scalar_param_names)} other_scalar_numel:{sum(p.numel() for p in scalar_params)} "
+        f"control_scope:control_name_match_plus_skip_weights other_scalar_scope:block_named_params(ndim<2_and_not_control)"
+    )
+    log0(
+        "scalar_optimizer_names:"
+        f" control_patterns:{','.join(CONTROL_TENSOR_NAME_PATTERNS)} "
+        f"control_params:{','.join(control_param_names)} "
+        f"other_scalar_params:{','.join(scalar_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
