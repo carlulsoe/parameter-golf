@@ -335,10 +335,8 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
     if pattern
 )
-INT8_CURRENT_PATH_HEADROOM_AUDIT = bool(int(os.environ.get("INT8_CURRENT_PATH_HEADROOM_AUDIT", "0")))
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
-INT8_CURRENT_PATH_HEADROOM_AUDIT_LOG_TOPK = int(os.environ.get("INT8_CURRENT_PATH_HEADROOM_AUDIT_LOG_TOPK", 5))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -357,15 +355,6 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 )
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
-)
-INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_GAIN = float(
-    os.environ.get("INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_GAIN", 0.0)
-)
-INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_MARGIN = float(
-    os.environ.get("INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_MARGIN", 0.0)
-)
-INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_FEASIBLE_ALTERNATIVES = int(
-    os.environ.get("INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_FEASIBLE_ALTERNATIVES", 1)
 )
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
@@ -618,205 +607,6 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
         )
     )
     return best
-
-def compressed_torch_object_size_bytes(obj: object) -> int:
-    buf = io.BytesIO()
-    torch.save(obj, buf)
-    return len(zlib.compress(buf.getvalue(), level=9))
-
-def audit_current_path_headroom_options(
-    state_dict: dict[str, Tensor],
-    quant_obj: dict[str, object],
-    current_quantized_bytes: int,
-    code_bytes: int,
-) -> dict[str, object] | None:
-    if not INT8_CURRENT_PATH_HEADROOM_AUDIT:
-        return None
-    auto_keep = select_auto_keep_float_tensor(state_dict)
-    selected_auto_keep_name = str(auto_keep["selected_name"]) if auto_keep is not None else ""
-    if not selected_auto_keep_name:
-        return {
-            "candidate_count": 0,
-            "feasible_count": 0,
-            "selected": "none",
-            "selected_rank": 0,
-            "selected_gain": 0.0,
-            "selected_margin": 0.0,
-            "selected_exact_submission_bytes": code_bytes + current_quantized_bytes,
-            "selected_current_extra_payload_bytes": 0,
-            "selected_selector_extra_payload_bytes": 0,
-            "selected_current_base_payload_bytes": 0,
-            "selected_current_whatif_payload_bytes": 0,
-            "top_feasible_summary": "",
-            "selected_bytes_summary": "",
-        }
-    base_passthrough = dict(quant_obj["passthrough"])
-    base_quantized = dict(quant_obj["quantized"])
-    base_scales = dict(quant_obj["scales"])
-    base_dtypes = dict(quant_obj["dtypes"])
-    base_qmeta = dict(quant_obj.get("qmeta", {}))
-    base_passthrough_orig_dtypes = dict(quant_obj.get("passthrough_orig_dtypes", {}))
-    results: list[dict[str, object]] = []
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        if not t.is_floating_point():
-            continue
-        keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
-        in_auto_family = matches_name_patterns(name, INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS)
-        if name != selected_auto_keep_name and (
-            t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or not in_auto_family
-        ):
-            continue
-        selector_candidate = score_keep_float_candidate(name, t)
-        selector_extra_payload_bytes = int(selector_candidate["extra_payload_bytes"])
-        current_base_payload_bytes = 0
-        current_whatif_payload_bytes = 0
-        whatif_quantized = dict(base_quantized)
-        whatif_scales = dict(base_scales)
-        whatif_dtypes = dict(base_dtypes)
-        whatif_qmeta = dict(base_qmeta)
-        whatif_passthrough = dict(base_passthrough)
-        whatif_passthrough_orig_dtypes = dict(base_passthrough_orig_dtypes)
-        candidate_kind = "one_more_keep_float"
-        if name == selected_auto_keep_name:
-            candidate_kind = "selected_fp32_promotion"
-            base_orig_dtypes: dict[str, str] = {}
-            current_stored = keep_float_tensor_for_export(name, t, base_orig_dtypes)
-            current_recon = restore_passthrough_tensor(name, current_stored, base_orig_dtypes)
-            promoted_orig_dtypes: dict[str, str] = {}
-            promoted_stored = keep_float_tensor_with_fp32_patterns(
-                name,
-                t,
-                promoted_orig_dtypes,
-                INT8_KEEP_FLOAT_FP32_NAME_PATTERNS + INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS + (name,),
-            )
-            promoted_recon = restore_passthrough_tensor(name, promoted_stored, promoted_orig_dtypes)
-            current_base_payload_bytes = tensor_nbytes(current_stored)
-            current_whatif_payload_bytes = tensor_nbytes(promoted_stored)
-            gain = normalized_mae(t, current_recon) - normalized_mae(t, promoted_recon)
-            whatif_passthrough[name] = promoted_stored
-            if name in promoted_orig_dtypes:
-                whatif_passthrough_orig_dtypes[name] = promoted_orig_dtypes[name]
-            else:
-                whatif_passthrough_orig_dtypes.pop(name, None)
-        else:
-            scale_dtype = int8_scale_dtype_for_tensor(name, t)
-            min_clip_value = int8_min_clip_value_for_tensor(name, t)
-            q, s = quantize_float_tensor(name, t, scale_dtype=scale_dtype, min_clip_value=min_clip_value)
-            quantized_recon = dequantize_quantized_tensor(q, s, dtype=t.dtype)
-            kept_orig_dtypes: dict[str, str] = {}
-            kept = keep_float_tensor_for_export(name, t, kept_orig_dtypes)
-            kept_recon = restore_passthrough_tensor(name, kept, kept_orig_dtypes)
-            current_base_payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
-            current_whatif_payload_bytes = tensor_nbytes(kept)
-            gain = normalized_mae(t, quantized_recon) - normalized_mae(t, kept_recon)
-            whatif_quantized.pop(name, None)
-            whatif_scales.pop(name, None)
-            whatif_dtypes.pop(name, None)
-            whatif_qmeta.pop(name, None)
-            whatif_passthrough[name] = kept
-            if name in kept_orig_dtypes:
-                whatif_passthrough_orig_dtypes[name] = kept_orig_dtypes[name]
-            else:
-                whatif_passthrough_orig_dtypes.pop(name, None)
-        current_extra_payload_bytes = current_whatif_payload_bytes - current_base_payload_bytes
-        whatif_obj: dict[str, object] = {
-            "__quant_format__": quant_obj["__quant_format__"],
-            "quantized": whatif_quantized,
-            "scales": whatif_scales,
-            "dtypes": whatif_dtypes,
-            "passthrough": whatif_passthrough,
-        }
-        if whatif_qmeta:
-            whatif_obj["qmeta"] = whatif_qmeta
-        if whatif_passthrough_orig_dtypes:
-            whatif_obj["passthrough_orig_dtypes"] = whatif_passthrough_orig_dtypes
-        exact_quantized_bytes = compressed_torch_object_size_bytes(whatif_obj)
-        exact_submission_bytes = code_bytes + exact_quantized_bytes
-        feasible = exact_submission_bytes <= SUBMISSION_SIZE_CAP_BYTES
-        results.append(
-            {
-                "name": name,
-                "kind": candidate_kind,
-                "gain": gain,
-                "selector_extra_payload_bytes": selector_extra_payload_bytes,
-                "current_base_payload_bytes": current_base_payload_bytes,
-                "current_whatif_payload_bytes": current_whatif_payload_bytes,
-                "current_extra_payload_bytes": current_extra_payload_bytes,
-                "exact_submission_bytes": exact_submission_bytes,
-                "exact_quantized_bytes": exact_quantized_bytes,
-                "feasible": feasible,
-            }
-        )
-    if not results:
-        return None
-    ranked = sorted(
-        results,
-        key=lambda item: (bool(item["feasible"]), float(item["gain"]), -int(item["exact_submission_bytes"]), str(item["name"])),
-        reverse=True,
-    )
-    feasible_ranked = [item for item in ranked if bool(item["feasible"])]
-    selected_item = next(item for item in ranked if str(item["name"]) == selected_auto_keep_name)
-    selected_rank = 0
-    for idx, item in enumerate(feasible_ranked, start=1):
-        if str(item["name"]) == selected_auto_keep_name:
-            selected_rank = idx
-            break
-    best_other_feasible_gain = max(
-        (
-            float(item["gain"])
-            for item in feasible_ranked
-            if str(item["name"]) != selected_auto_keep_name
-        ),
-        default=0.0,
-    )
-    feasible_alternative_count = sum(
-        1 for item in feasible_ranked if str(item["name"]) != selected_auto_keep_name
-    )
-    selected_margin = float(selected_item["gain"]) - best_other_feasible_gain
-    selected = selected_auto_keep_name
-    if not bool(selected_item["feasible"]):
-        selected = "none"
-    if float(selected_item["gain"]) < INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_GAIN:
-        selected = "none"
-    if feasible_alternative_count < INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_FEASIBLE_ALTERNATIVES:
-        selected = "none"
-    if selected_rank != 1:
-        selected = "none"
-    if selected_margin < INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_MARGIN:
-        selected = "none"
-    top_feasible_summary = ",".join(
-        (
-            f"{str(item['name'])}|kind={str(item['kind'])}|gain={float(item['gain']):.8f}|"
-            f"exact_total={int(item['exact_submission_bytes'])}|current_extra={int(item['current_extra_payload_bytes'])}|"
-            f"selector_extra={int(item['selector_extra_payload_bytes'])}"
-            for item in feasible_ranked[: max(INT8_CURRENT_PATH_HEADROOM_AUDIT_LOG_TOPK, 0)]
-        )
-    )
-    selected_bytes_summary = (
-        f"name={selected_auto_keep_name}|selector_extra={int(selected_item['selector_extra_payload_bytes'])}|"
-        f"current_base={int(selected_item['current_base_payload_bytes'])}|"
-        f"current_whatif={int(selected_item['current_whatif_payload_bytes'])}|"
-        f"current_extra={int(selected_item['current_extra_payload_bytes'])}|"
-        f"exact_total={int(selected_item['exact_submission_bytes'])}|"
-        f"exact_quantized={int(selected_item['exact_quantized_bytes'])}"
-    )
-    return {
-        "candidate_count": len(results),
-        "feasible_count": len(feasible_ranked),
-        "selected": selected,
-        "selected_rank": selected_rank,
-        "selected_gain": float(selected_item["gain"]),
-        "selected_margin": selected_margin,
-        "selected_exact_submission_bytes": int(selected_item["exact_submission_bytes"]),
-        "selected_current_extra_payload_bytes": int(selected_item["current_extra_payload_bytes"]),
-        "selected_selector_extra_payload_bytes": int(selected_item["selector_extra_payload_bytes"]),
-        "selected_current_base_payload_bytes": int(selected_item["current_base_payload_bytes"]),
-        "selected_current_whatif_payload_bytes": int(selected_item["current_whatif_payload_bytes"]),
-        "feasible_alternative_count": feasible_alternative_count,
-        "top_feasible_summary": top_feasible_summary,
-        "selected_bytes_summary": selected_bytes_summary,
-    }
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -1655,12 +1445,6 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        current_path_headroom_audit = audit_current_path_headroom_options(
-            base_model.state_dict(),
-            quant_obj,
-            quant_file_bytes,
-            code_bytes,
-        )
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         if INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
             log0(
@@ -1727,33 +1511,6 @@ def main() -> None:
             )
             if quant_stats["keep_float_fp32_audit_candidate_summary"]:
                 log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
-        if current_path_headroom_audit is not None:
-            log0(
-                "Int8 current-path headroom audit: "
-                f"candidates:{current_path_headroom_audit['candidate_count']} "
-                f"feasible:{current_path_headroom_audit['feasible_count']} "
-                f"selected:{current_path_headroom_audit['selected']}"
-            )
-            log0(
-                "Int8 current-path headroom thresholds: "
-                f"min_gain:{INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_GAIN:.8f} "
-                f"min_margin:{INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_MARGIN:.8f} "
-                f"min_feasible_alternatives:{INT8_CURRENT_PATH_HEADROOM_AUDIT_MIN_FEASIBLE_ALTERNATIVES} "
-                f"selected_rank:{current_path_headroom_audit['selected_rank']} "
-                f"selected_gain:{current_path_headroom_audit['selected_gain']:.8f} "
-                f"selected_margin:{current_path_headroom_audit['selected_margin']:.8f} "
-                f"selected_exact_total:{current_path_headroom_audit['selected_exact_submission_bytes']} "
-                f"feasible_alternatives:{current_path_headroom_audit['feasible_alternative_count']}"
-            )
-            log0(
-                "Int8 current-path selected bytes: "
-                f"{current_path_headroom_audit['selected_bytes_summary']}"
-            )
-            if current_path_headroom_audit["top_feasible_summary"]:
-                log0(
-                    "Int8 current-path feasible top: "
-                    f"{current_path_headroom_audit['top_feasible_summary']}"
-                )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
