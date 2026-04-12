@@ -1269,6 +1269,14 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        "muon_schedule: "
+        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} "
+        "optimizer_step_semantics:pre_update "
+        "checkpoint_log_semantics:realized_last_update"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1292,6 +1300,10 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def muon_momentum_for_update(step: int) -> float:
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1327,6 +1339,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    last_applied_muon_momentum = args.muon_momentum_warmup_start if args.muon_momentum_warmup_steps > 0 else args.muon_momentum
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1352,7 +1365,8 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"muon_momentum:{last_applied_muon_momentum:.5f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1379,8 +1393,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_update(step)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1395,6 +1408,7 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        last_applied_muon_momentum = muon_momentum
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1403,7 +1417,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"muon_momentum:{last_applied_muon_momentum:.5f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1414,6 +1429,18 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    measured_stop_step = step
+    warmup_fraction_completed = (
+        min(measured_stop_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+    )
+    log0(
+        "muon_warmup_audit: "
+        f"measured_stop_step:{measured_stop_step} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"warmup_fraction_completed:{warmup_fraction_completed:.5f} "
+        f"last_muon_momentum:{last_applied_muon_momentum:.5f}"
+    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
