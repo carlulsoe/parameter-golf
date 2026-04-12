@@ -77,7 +77,6 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -1222,17 +1221,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if args.embed_weight_decay < 0:
-        raise ValueError(f"EMBED_WEIGHT_DECAY must be non-negative, got {args.embed_weight_decay}")
-    if args.embed_weight_decay > 0 and not args.tie_embeddings:
-        raise ValueError("EMBED_WEIGHT_DECAY ablation requires TIE_EMBEDDINGS=1")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    embed_optimizer_cls = torch.optim.AdamW if args.embed_weight_decay > 0 else torch.optim.Adam
-    optimizer_tok = embed_optimizer_cls(
+    optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        weight_decay=args.embed_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1266,7 +1259,6 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"embed_weight_decay:{args.embed_weight_decay} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
