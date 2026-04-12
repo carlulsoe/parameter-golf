@@ -828,6 +828,11 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+def muon_momentum_for_step(args: Hyperparameters, step: int) -> float:
+    frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1268,6 +1273,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"muon_schedule:warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"optimizer_step_semantics:pre_update"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1379,8 +1389,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_step(args, step)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1418,6 +1427,17 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    last_muon_step = max(step - 1, 0)
+    last_muon_momentum = muon_momentum_for_step(args, last_muon_step) if step > 0 else args.muon_momentum_warmup_start
+    warmup_fraction_completed = (
+        min(last_muon_step / args.muon_momentum_warmup_steps, 1.0)
+        if args.muon_momentum_warmup_steps > 0 and step > 0
+        else float(step > 0)
+    )
+    log0(
+        f"muon_warmup_audit:measured_stop_step:{step} last_applied_step:{last_muon_step if step > 0 else 'none'} "
+        f"last_muon_momentum:{last_muon_momentum:.5f} warmup_fraction_completed:{warmup_fraction_completed:.5f}"
     )
 
     # -----------------------------
