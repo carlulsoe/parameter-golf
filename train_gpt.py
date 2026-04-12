@@ -356,16 +356,6 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
 )
-TRAIN_SHARD_ORDER_AUDIT = bool(int(os.environ.get("TRAIN_SHARD_ORDER_AUDIT", "0")))
-TRAIN_SHARD_ORDER_AUDIT_LOG_TOPK = int(os.environ.get("TRAIN_SHARD_ORDER_AUDIT_LOG_TOPK", 4))
-TRAIN_SHARD_ORDER_AUDIT_COMPARE_MODES = tuple(
-    mode.strip()
-    for mode in os.environ.get(
-        "TRAIN_SHARD_ORDER_AUDIT_COMPARE_MODES",
-        "sorted,seed_shuffle,seed_rotate",
-    ).split(",")
-    if mode.strip()
-)
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
 for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
@@ -788,13 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def read_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -802,28 +785,14 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_token_counts = [read_data_shard_num_tokens(file) for file in self.files]
-        self.tokens_taken_by_file = [0 for _ in self.files]
-        self.file_visit_counts = [0 for _ in self.files]
-        self.file_visit_order: list[int] = []
-        self.total_tokens_taken = 0
-        self.wrap_count = 0
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self._record_file_visit()
-
-    def _record_file_visit(self) -> None:
-        self.file_visit_counts[self.file_idx] += 1
-        self.file_visit_order.append(self.file_idx)
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.wrap_count += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
-        self._record_file_visit()
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -837,8 +806,6 @@ class TokenStream:
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
             remaining -= k
-            self.tokens_taken_by_file[self.file_idx] += int(k)
-            self.total_tokens_taken += int(k)
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
@@ -860,111 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-
-def make_shard_order_indices(num_files: int, mode: str, seed: int) -> list[int]:
-    if num_files <= 0:
-        return []
-    if mode == "sorted":
-        return list(range(num_files))
-    if mode == "seed_shuffle":
-        rng = random.Random(seed)
-        order = list(range(num_files))
-        rng.shuffle(order)
-        return order
-    if mode == "seed_rotate":
-        offset = seed % num_files
-        base = list(range(num_files))
-        return base[offset:] + base[:offset]
-    raise ValueError(
-        f"Unsupported TRAIN_SHARD_ORDER_AUDIT_COMPARE_MODES entry: {mode}. "
-        "Expected one of sorted, seed_shuffle, seed_rotate."
-    )
-
-
-def summarize_shard_usage(
-    files: list[Path],
-    consumed_by_file: list[int],
-    visit_order: list[int],
-    wraps: int,
-    log_topk: int,
-) -> dict[str, object]:
-    total_tokens = int(sum(consumed_by_file))
-    unique_shards = sum(int(tokens > 0) for tokens in consumed_by_file)
-    ranked = sorted(
-        [
-            (idx, int(tokens))
-            for idx, tokens in enumerate(consumed_by_file)
-            if int(tokens) > 0
-        ],
-        key=lambda item: (item[1], -item[0]),
-        reverse=True,
-    )
-    top_summary = ",".join(
-        (
-            f"{files[idx].name}:{tokens}"
-            for idx, tokens in ranked[: max(log_topk, 0)]
-        )
-    )
-    visited_names: list[str] = []
-    seen: set[int] = set()
-    for idx in visit_order:
-        if idx in seen:
-            continue
-        seen.add(idx)
-        visited_names.append(files[idx].name)
-        if len(visited_names) >= max(log_topk, 0):
-            break
-    first_summary = ",".join(visited_names)
-    prefix_tokens = sum(
-        int(consumed_by_file[idx])
-        for idx in range(min(unique_shards, len(consumed_by_file)))
-    )
-    lexicographic_prefix_share = prefix_tokens / max(total_tokens, 1)
-    return {
-        "total_tokens": total_tokens,
-        "unique_shards": unique_shards,
-        "wraps": int(wraps),
-        "top_summary": top_summary,
-        "first_summary": first_summary,
-        "lexicographic_prefix_share": lexicographic_prefix_share,
-    }
-
-
-def simulate_shard_order_usage(
-    files: list[Path],
-    file_token_counts: list[int],
-    total_tokens: int,
-    order_indices: list[int],
-    log_topk: int,
-) -> dict[str, object]:
-    if len(files) != len(file_token_counts):
-        raise ValueError("files and file_token_counts must have the same length")
-    if not files:
-        return {
-            "total_tokens": 0,
-            "unique_shards": 0,
-            "wraps": 0,
-            "top_summary": "",
-            "first_summary": "",
-            "lexicographic_prefix_share": 0.0,
-        }
-    consumed_by_file = [0 for _ in files]
-    visit_order: list[int] = []
-    wraps = 0
-    order_pos = 0
-    remaining = int(total_tokens)
-    while remaining > 0:
-        file_idx = order_indices[order_pos]
-        visit_order.append(file_idx)
-        take = min(remaining, int(file_token_counts[file_idx]))
-        consumed_by_file[file_idx] += int(take)
-        remaining -= int(take)
-        order_pos += 1
-        if order_pos == len(order_indices) and remaining > 0:
-            order_pos = 0
-            wraps += 1
-    return summarize_shard_usage(files, consumed_by_file, visit_order, wraps, log_topk)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1407,12 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if TRAIN_SHARD_ORDER_AUDIT:
-        log0(
-            "train_shard_order_audit:enabled "
-            f"modes:{','.join(TRAIN_SHARD_ORDER_AUDIT_COMPARE_MODES)} "
-            f"log_topk:{TRAIN_SHARD_ORDER_AUDIT_LOG_TOPK}"
-        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1563,47 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if TRAIN_SHARD_ORDER_AUDIT:
-        nominal_train_tokens = int(step) * int(args.train_batch_tokens)
-        stream_summary = summarize_shard_usage(
-            train_loader.stream.files,
-            train_loader.stream.tokens_taken_by_file,
-            train_loader.stream.file_visit_order,
-            train_loader.stream.wrap_count,
-            TRAIN_SHARD_ORDER_AUDIT_LOG_TOPK,
-        )
-        exact_stream_tokens = int(stream_summary["total_tokens"])
-        extra_label_tokens = exact_stream_tokens - nominal_train_tokens
-        log0(
-            "train_shard_usage: "
-            f"nominal_tokens:{nominal_train_tokens} "
-            f"stream_tokens:{exact_stream_tokens} "
-            f"extra_label_tokens:{extra_label_tokens} "
-            f"unique_shards:{int(stream_summary['unique_shards'])}/{len(train_loader.stream.files)} "
-            f"wraps:{int(stream_summary['wraps'])} "
-            f"lexicographic_prefix_share:{float(stream_summary['lexicographic_prefix_share']):.6f} "
-            f"first_shards:{str(stream_summary['first_summary']) or 'none'} "
-            f"top_shards:{str(stream_summary['top_summary']) or 'none'}"
-        )
-        for mode in TRAIN_SHARD_ORDER_AUDIT_COMPARE_MODES:
-            order_indices = make_shard_order_indices(len(train_loader.stream.files), mode, args.seed)
-            audit_summary = simulate_shard_order_usage(
-                train_loader.stream.files,
-                train_loader.stream.file_token_counts,
-                exact_stream_tokens,
-                order_indices,
-                TRAIN_SHARD_ORDER_AUDIT_LOG_TOPK,
-            )
-            log0(
-                "train_shard_order_audit: "
-                f"mode:{mode} "
-                f"stream_tokens:{exact_stream_tokens} "
-                f"unique_shards:{int(audit_summary['unique_shards'])}/{len(train_loader.stream.files)} "
-                f"wraps:{int(audit_summary['wraps'])} "
-                f"lexicographic_prefix_share:{float(audit_summary['lexicographic_prefix_share']):.6f} "
-                f"first_shards:{str(audit_summary['first_summary']) or 'none'} "
-                f"top_shards:{str(audit_summary['top_summary']) or 'none'}"
-            )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
