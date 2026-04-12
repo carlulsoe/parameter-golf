@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    scalar_grad_clip_norm = float(os.environ.get("SCALAR_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.grad_clip_norm > 0 and args.scalar_grad_clip_norm > 0:
-        raise ValueError("SCALAR_GRAD_CLIP_NORM cannot be combined with GRAD_CLIP_NORM")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1265,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(f"grad_clip_norm:{args.grad_clip_norm} scalar_grad_clip_norm:{args.scalar_grad_clip_norm}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1392,9 +1388,6 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        scalar_grad_norm: Tensor | None = None
-        if args.scalar_grad_clip_norm > 0:
-            scalar_grad_norm = torch.nn.utils.clip_grad_norm_(scalar_params, args.scalar_grad_clip_norm)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1408,15 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            scalar_grad_norm_text = (
-                f" scalar_grad_norm:{float(scalar_grad_norm.item()):.4f}"
-                if scalar_grad_norm is not None
-                else ""
-            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{scalar_grad_norm_text}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
