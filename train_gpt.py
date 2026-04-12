@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    control_lr_scale = float(os.environ.get("CONTROL_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1214,13 +1215,26 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [p for _, p in scalar_named_params]
+    control_scalar_named_params = [
+        (name, p)
+        for name, p in scalar_named_params
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    other_scalar_named_params = [
+        (name, p)
+        for name, p in scalar_named_params
+        if not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    control_scalar_params = [p for _, p in control_scalar_named_params]
+    other_scalar_params = [p for _, p in other_scalar_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,13 +1250,33 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if args.control_lr_scale == 1.0:
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    else:
+        if not control_scalar_params or not other_scalar_params:
+            raise ValueError(
+                "CONTROL_LR_SCALE != 1.0 requires non-empty control and other scalar parameter groups"
+            )
+        optimizer_scalar_other = torch.optim.Adam(
+            [{"params": other_scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        control_lr = args.scalar_lr * args.control_lr_scale
+        optimizer_scalar_control = torch.optim.Adam(
+            [{"params": control_scalar_params, "lr": control_lr, "base_lr": control_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar_other, optimizer_scalar_control]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1296,24 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_betas:beta1:{args.beta1} beta2:{args.beta2} "
+        f"adam_eps:{args.adam_eps} control_lr_scale:{args.control_lr_scale}"
+    )
+    log0(
+        f"scalar_group_audit:control_param_tensors:{len(control_scalar_params)} "
+        f"control_param_numel:{sum(p.numel() for p in control_scalar_params)} "
+        f"other_scalar_param_tensors:{len(other_scalar_params)} "
+        f"other_scalar_param_numel:{sum(p.numel() for p in other_scalar_params)} "
+        "scalar_scope:block_named_params(ndim<2_or_control_name_match)+skip_weights"
+    )
+    if args.control_lr_scale == 1.0:
+        log0("scalar_optimizer_mode:combined_baseline control_lr:shared_scalar_lr other_scalar_lr:shared_scalar_lr")
+    else:
+        log0(
+            f"scalar_optimizer_mode:split_control_lr control_lr:{args.scalar_lr * args.control_lr_scale} "
+            f"other_scalar_lr:{args.scalar_lr}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
