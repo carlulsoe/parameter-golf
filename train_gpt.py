@@ -58,6 +58,8 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    eval_token_stride = int(os.environ.get("EVAL_TOKEN_STRIDE", 0))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -206,16 +208,53 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
-    usable = ((tokens.numel() - 1) // seq_len) * seq_len
-    if usable <= 0:
-        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return tokens[: usable + 1]
+    if tokens.numel() <= 1:
+        raise ValueError("Validation split must contain at least two tokens")
+    return tokens
+
+
+def standard_eval_batch_seqs(args: Hyperparameters, world_size: int, grad_accum_steps: int) -> int:
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.eval_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    return local_batch_tokens // args.eval_seq_len
+
+
+def build_exact_once_eval_windows(total_targets: int, seq_len: int, stride: int) -> list[tuple[int, int, int, int]]:
+    if total_targets <= 0:
+        raise ValueError("Validation split must contain at least one target token")
+    if seq_len <= 0:
+        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {seq_len}")
+    if stride <= 0 or stride > seq_len:
+        raise ValueError(f"EVAL_TOKEN_STRIDE must be in [1, EVAL_SEQ_LEN], got {stride}")
+    final_start = max(total_targets - seq_len, 0)
+    starts = list(range(0, final_start + 1, stride))
+    if not starts or starts[-1] != final_start:
+        starts.append(final_start)
+    windows: list[tuple[int, int, int, int]] = []
+    covered_until = 0
+    for start in starts:
+        window_targets = min(seq_len, total_targets - start)
+        score_start = max(covered_until - start, 0)
+        score_end = window_targets
+        if score_start < score_end:
+            windows.append((start, window_targets, score_start, score_end))
+            covered_until = start + score_end
+    if covered_until != total_targets:
+        raise RuntimeError(
+            f"Exact-once eval window construction failed: covered_until={covered_until} total_targets={total_targets}"
+        )
+    return windows
 
 
 def eval_val(
@@ -235,15 +274,10 @@ def eval_val(
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.eval_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // args.eval_seq_len
+    local_batch_seqs = standard_eval_batch_seqs(args, world_size, grad_accum_steps)
     total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
+    if total_seqs <= 0:
+        raise ValueError(f"Validation split is too short for EVAL_SEQ_LEN={args.eval_seq_len}")
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -280,6 +314,73 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_exact_once_overlap(
+    args: Hyperparameters,
+    model_for_logits: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float, dict[str, int | str]]:
+    windows = build_exact_once_eval_windows(val_tokens.numel() - 1, args.eval_seq_len, args.eval_token_stride)
+    batch_seqs = args.eval_batch_seqs if args.eval_batch_seqs > 0 else standard_eval_batch_seqs(args, world_size, grad_accum_steps)
+    local_windows = windows[rank::world_size]
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model_for_logits.eval()
+    with torch.inference_mode():
+        idx = 0
+        while idx < len(local_windows):
+            window_targets = local_windows[idx][1]
+            batch_windows: list[tuple[int, int, int, int]] = []
+            while idx < len(local_windows) and len(batch_windows) < batch_seqs and local_windows[idx][1] == window_targets:
+                batch_windows.append(local_windows[idx])
+                idx += 1
+            local = torch.stack(
+                [val_tokens[start : start + window_targets + 1] for start, _, _, _ in batch_windows]
+            ).to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:, :-1]
+            y = local[:, 1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = model_for_logits.forward_logits(x)
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y.reshape(-1),
+                reduction="none",
+            ).view_as(y)
+            score_mask = torch.zeros_like(y, dtype=torch.bool)
+            for row, (_, _, score_start, score_end) in enumerate(batch_windows):
+                score_mask[row, score_start:score_end] = True
+            val_loss_sum += token_loss.to(torch.float64).masked_select(score_mask).sum()
+            val_token_count += score_mask.sum().to(torch.float64)
+            token_bytes = base_bytes_lut[y].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[y] & ~is_boundary_token_lut[x]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).masked_select(score_mask).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model_for_logits.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte), {
+        "mode": "sliding_exact_once",
+        "stride": args.eval_token_stride,
+        "batch_seqs": batch_seqs,
+        "windows": len(windows),
+        "scored_tokens": val_tokens.numel() - 1,
+    }
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1053,7 +1154,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1068,15 +1169,18 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1171,7 +1275,7 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
+    val_tokens = load_validation_tokens(args.val_files)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1268,6 +1372,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.eval_token_stride > 0:
+        log0(
+            f"final_eval_overlap:enabled stride:{args.eval_token_stride} "
+            f"batch_seqs:{args.eval_batch_seqs if args.eval_batch_seqs > 0 else standard_eval_batch_seqs(args, world_size, grad_accum_steps)}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1533,18 +1642,39 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if 0 < args.eval_token_stride < args.eval_seq_len:
+        q_val_loss, q_val_bpb, final_eval_meta = eval_val_exact_once_overlap(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0(
+            "final_eval_mode:"
+            f"{final_eval_meta['mode']} stride:{final_eval_meta['stride']} "
+            f"batch_seqs:{final_eval_meta['batch_seqs']} windows:{final_eval_meta['windows']} "
+            f"scored_tokens:{final_eval_meta['scored_tokens']}"
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0("final_eval_mode:standard")
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
