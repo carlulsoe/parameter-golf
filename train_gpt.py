@@ -87,10 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    train_stream_coverage_audit = bool(int(os.environ.get("TRAIN_STREAM_COVERAGE_AUDIT", "0")))
-    train_stream_coverage_audit_shuffle_seed = int(
-        os.environ.get("TRAIN_STREAM_COVERAGE_AUDIT_SHUFFLE_SEED", os.environ.get("SEED", "1337"))
-    )
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -765,7 +761,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 # DATA LOADING 
 # -----------------------------
 
-def get_data_shard_num_tokens(file: Path) -> int:
+def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
@@ -776,88 +772,25 @@ def get_data_shard_num_tokens(file: Path) -> int:
     expected_size = header_bytes + num_tokens * token_bytes
     if file.stat().st_size != expected_size:
         raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    return num_tokens
-
-
-def load_data_shard(file: Path) -> Tensor:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    num_tokens = get_data_shard_num_tokens(file)
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def summarize_token_stream_exposure(files: list[Path], token_budget: int) -> dict[str, int | dict[str, int]]:
-    if token_budget < 0:
-        raise ValueError(f"token_budget must be non-negative, got {token_budget}")
-    if not files:
-        return {"token_budget": int(token_budget), "wrap_count": 0, "touched_shard_count": 0, "shard_token_counts": {}}
-    shard_lengths = [get_data_shard_num_tokens(file) for file in files]
-    shard_token_counts = [0] * len(files)
-    wrap_count = 0
-    file_idx = 0
-    pos = 0
-    remaining = token_budget
-    while remaining > 0:
-        avail = shard_lengths[file_idx] - pos
-        if avail <= 0:
-            file_idx = (file_idx + 1) % len(files)
-            wrap_count += int(file_idx == 0)
-            pos = 0
-            continue
-        k = min(remaining, avail)
-        shard_token_counts[file_idx] += k
-        pos += k
-        remaining -= k
-    return {
-        "token_budget": int(token_budget),
-        "wrap_count": int(wrap_count),
-        "touched_shard_count": int(sum(count > 0 for count in shard_token_counts)),
-        "shard_token_counts": {
-            files[i].name: int(count) for i, count in enumerate(shard_token_counts) if count > 0
-        },
-    }
-
-
-def summarize_token_stream_overlap(
-    sorted_counts: dict[str, int], shuffled_counts: dict[str, int]
-) -> dict[str, int]:
-    sorted_names = set(sorted_counts)
-    shuffled_names = set(shuffled_counts)
-    shared_names = sorted_names & shuffled_names
-    sorted_only_names = sorted_names - shuffled_names
-    shuffled_only_names = shuffled_names - sorted_names
-    return {
-        "shared_shard_count": len(shared_names),
-        "sorted_only_shard_count": len(sorted_only_names),
-        "shuffled_only_shard_count": len(shuffled_only_names),
-        "sorted_only_token_mass": sum(sorted_counts[name] for name in sorted_only_names),
-        "shuffled_only_token_mass": sum(shuffled_counts[name] for name in shuffled_only_names),
-        "shared_token_mass_sorted": sum(sorted_counts[name] for name in shared_names),
-        "shared_token_mass_shuffled": sum(shuffled_counts[name] for name in shared_names),
-        "shared_token_mass_overlap": sum(min(sorted_counts[name], shuffled_counts[name]) for name in shared_names),
-    }
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str, audit: bool = False):
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.audit = audit
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.token_budget = 0
-        self.wrap_count = 0
-        self.shard_token_counts = [0] * len(self.files)
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.wrap_count += int(self.file_idx == 0)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -872,31 +805,18 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            if self.audit:
-                self.token_budget += k
-                self.shard_token_counts[self.file_idx] += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def audit_snapshot(self) -> dict[str, int | dict[str, int]]:
-        return {
-            "token_budget": int(self.token_budget),
-            "wrap_count": int(self.wrap_count),
-            "touched_shard_count": int(sum(count > 0 for count in self.shard_token_counts)),
-            "shard_token_counts": {
-                self.files[i].name: int(count) for i, count in enumerate(self.shard_token_counts) if count > 0
-            },
-        }
 
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, audit: bool = False):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, audit=audit)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1354,13 +1274,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(
-        args.train_files,
-        rank,
-        world_size,
-        device,
-        audit=args.train_stream_coverage_audit and rank == 0,
-    )
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1405,13 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(
-            args.train_files,
-            rank,
-            world_size,
-            device,
-            audit=args.train_stream_coverage_audit and rank == 0,
-        )
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1511,36 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.train_stream_coverage_audit and master_process:
-        sorted_live_exposure = train_loader.stream.audit_snapshot()
-        shuffled_files = list(train_loader.stream.files)
-        random.Random(args.train_stream_coverage_audit_shuffle_seed).shuffle(shuffled_files)
-        shuffled_exposure = summarize_token_stream_exposure(
-            shuffled_files, int(sorted_live_exposure["token_budget"])
-        )
-        overlap = summarize_token_stream_overlap(
-            sorted_live_exposure["shard_token_counts"], shuffled_exposure["shard_token_counts"]
-        )
-        log0(
-            "Train stream live coverage: "
-            f"token_budget:{sorted_live_exposure['token_budget']} "
-            f"wraps:{sorted_live_exposure['wrap_count']} "
-            f"touched_shards:{sorted_live_exposure['touched_shard_count']}"
-        )
-        log0(
-            "Train stream sorted-vs-shuffled overlap: "
-            f"shuffle_seed:{args.train_stream_coverage_audit_shuffle_seed} "
-            f"sorted_touched_shards:{sorted_live_exposure['touched_shard_count']} "
-            f"shuffled_touched_shards:{shuffled_exposure['touched_shard_count']} "
-            f"shared_shards:{overlap['shared_shard_count']} "
-            f"sorted_only_shards:{overlap['sorted_only_shard_count']} "
-            f"sorted_only_token_mass:{overlap['sorted_only_token_mass']} "
-            f"shuffled_only_shards:{overlap['shuffled_only_shard_count']} "
-            f"shuffled_only_token_mass:{overlap['shuffled_only_token_mass']} "
-            f"shared_token_mass_overlap:{overlap['shared_token_mass_overlap']} "
-            f"shared_token_mass_sorted:{overlap['shared_token_mass_sorted']} "
-            f"shared_token_mass_shuffled:{overlap['shared_token_mass_shuffled']}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
