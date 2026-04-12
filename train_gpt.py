@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    embed_grad_clip_norm = float(os.environ.get("EMBED_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1159,12 +1158,6 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if args.embed_grad_clip_norm < 0:
-        raise ValueError(f"EMBED_GRAD_CLIP_NORM must be non-negative, got {args.embed_grad_clip_norm}")
-    if args.grad_clip_norm > 0 and args.embed_grad_clip_norm > 0:
-        raise ValueError("EMBED_GRAD_CLIP_NORM cannot be combined with GRAD_CLIP_NORM")
-    if args.embed_grad_clip_norm > 0 and not args.tie_embeddings:
-        raise ValueError("EMBED_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -1268,10 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"grad_clip_norm:{args.grad_clip_norm} embed_grad_clip_norm:{args.embed_grad_clip_norm} "
-        f"embed_grad_clip_scope:{'tied_tok_emb_and_output' if args.tie_embeddings else 'disabled_for_untied_embeddings'}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1399,32 +1388,22 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        next_step = step + 1
-        should_log_train = (
-            args.train_log_every > 0
-            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
-        )
-        embed_grad_norm_value: float | None = None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        elif args.embed_grad_clip_norm > 0:
-            embed_grad_norm = torch.nn.utils.clip_grad_norm_([base_model.tok_emb.weight], args.embed_grad_clip_norm)
-            if should_log_train:
-                embed_grad_norm_value = float(embed_grad_norm.item())
         for opt in optimizers:
             opt.step()
         zero_grad_all()
 
-        step = next_step
+        step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        should_log_train = (
+            args.train_log_every > 0
+            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         if should_log_train:
-            embed_grad_norm_fragment = (
-                f" embed_grad_norm:{embed_grad_norm_value:.4f}" if embed_grad_norm_value is not None else ""
-            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{embed_grad_norm_fragment}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
