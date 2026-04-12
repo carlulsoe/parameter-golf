@@ -74,7 +74,6 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.embed_weight_decay < 0.0:
-        raise ValueError(f"EMBED_WEIGHT_DECAY must be non-negative, got {args.embed_weight_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1225,17 +1222,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok_cls = torch.optim.AdamW if args.embed_weight_decay > 0.0 else torch.optim.Adam
-    optimizer_tok_name = "AdamW" if args.embed_weight_decay > 0.0 else "Adam"
-    optimizer_tok = optimizer_tok_cls(
-        [
-            {
-                "params": [base_model.tok_emb.weight],
-                "lr": token_lr,
-                "base_lr": token_lr,
-                "weight_decay": args.embed_weight_decay,
-            }
-        ],
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1271,7 +1259,6 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"embed_optimizer:{optimizer_tok_name} embed_weight_decay:{args.embed_weight_decay} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
