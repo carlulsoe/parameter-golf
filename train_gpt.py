@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    embed_eps = float(os.environ.get("EMBED_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1089,6 +1090,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be strictly positive, got {args.adam_eps}")
+    if args.embed_eps <= 0.0:
+        raise ValueError(f"EMBED_EPS must be strictly positive, got {args.embed_eps}")
+    if not args.tie_embeddings and args.embed_eps != args.adam_eps:
+        raise ValueError("EMBED_EPS can differ from ADAM_EPS only when TIE_EMBEDDINGS=1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1225,7 +1232,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.embed_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1261,6 +1268,15 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_betas:beta1:{args.beta1} beta2:{args.beta2} "
+        f"adam_eps:{args.adam_eps:.0e} embed_eps:{args.embed_eps:.0e}"
+    )
+    log0(
+        "optimizer_eps_scope:"
+        f"{'tied_tok_emb_only' if args.tie_embeddings else 'shared_adam_eps'} "
+        "head_eps:shared_adam_eps scalar_eps:shared_adam_eps muon_uses_momentum"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
