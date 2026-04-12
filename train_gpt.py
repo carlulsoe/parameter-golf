@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -375,6 +377,19 @@ def tensor_nbytes(t: Tensor) -> int:
 
 def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in name for pattern in patterns)
+
+def clone_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {name: tensor.detach().clone() for name, tensor in state_dict.items()}
+
+def update_ema_state(ema_state: dict[str, Tensor] | None, state_dict: dict[str, Tensor], decay: float) -> dict[str, Tensor]:
+    if ema_state is None:
+        return clone_state_dict(state_dict)
+    for name, tensor in state_dict.items():
+        if tensor.is_floating_point():
+            ema_state[name].mul_(decay).add_(tensor.detach(), alpha=1.0 - decay)
+        else:
+            ema_state[name].copy_(tensor.detach())
+    return ema_state
 
 def keep_float_tensor_with_fp32_patterns(
     name: str,
@@ -1171,6 +1186,10 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
+    if args.ema_start_step < 0:
+        raise ValueError(f"EMA_START_STEP must be non-negative, got {args.ema_start_step}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1287,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"ema_decay:{args.ema_decay:.6f} ema_start_step:{args.ema_start_step}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1347,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_state: dict[str, Tensor] | None = None
+    ema_update_count = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1395,6 +1417,9 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if args.ema_decay > 0.0 and step >= args.ema_start_step:
+            ema_state = update_ema_state(ema_state, base_model.state_dict(), args.ema_decay)
+            ema_update_count += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1425,16 +1450,31 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    raw_state = clone_state_dict(base_model.state_dict())
+    export_state = raw_state
+    if args.ema_decay > 0.0:
+        if ema_state is None:
+            log0(
+                f"ema_export:disabled reason:no_updates decay:{args.ema_decay:.6f} "
+                f"start_step:{args.ema_start_step} updates:{ema_update_count}"
+            )
+        else:
+            export_state = ema_state
+            log0(
+                f"ema_export:applied decay:{args.ema_decay:.6f} "
+                f"start_step:{args.ema_start_step} updates:{ema_update_count} "
+                "raw_checkpoint:final_model.pt export_checkpoint:ema_state"
+            )
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(raw_state, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
