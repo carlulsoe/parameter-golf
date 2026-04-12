@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.embed_weight_decay < 0:
-        raise ValueError(f"EMBED_WEIGHT_DECAY must be non-negative, got {args.embed_weight_decay}")
-    if args.embed_weight_decay > 0 and not args.tie_embeddings:
-        raise ValueError("EMBED_WEIGHT_DECAY requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1227,12 +1222,10 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_optimizer_cls = torch.optim.AdamW if args.embed_weight_decay > 0 else torch.optim.Adam
-    optimizer_tok = tok_optimizer_cls(
+    optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        weight_decay=args.embed_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1267,8 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"embed_weight_decay:{args.embed_weight_decay}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
