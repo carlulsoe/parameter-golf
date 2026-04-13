@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -355,6 +356,15 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 )
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
+)
+SCALAR_AUDIT_FAMILY_PATTERNS = (
+    ("attn_scale", ("attn_scale", "attn_scales")),
+    ("mlp_scale", ("mlp_scale", "mlp_scales")),
+    ("resid_mix", ("resid_mix", "resid_mixes")),
+    ("q_gain", ("q_gain",)),
+    ("biases", ("bias",)),
+    ("norm_gains", ("norm",)),
+    ("skip_weights", ("skip_weight", "skip_weights")),
 )
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
@@ -856,6 +866,51 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def summarize_named_tensors(named_tensors: list[tuple[str, Tensor]]) -> dict[str, float | int]:
+    tensor_count = len(named_tensors)
+    numel = sum(int(t.numel()) for _, t in named_tensors)
+    l2_sq = 0.0
+    max_abs = 0.0
+    for _, tensor in named_tensors:
+        tensor_f32 = tensor.detach().float()
+        l2_sq += float(tensor_f32.square().sum().item())
+        max_abs = max(max_abs, float(tensor_f32.abs().max().item()))
+    return {
+        "tensor_count": tensor_count,
+        "numel": numel,
+        "l2": math.sqrt(l2_sq),
+        "max_abs": max_abs,
+    }
+
+
+def format_named_tensor_membership(named_tensors: list[tuple[str, Tensor]]) -> str:
+    return ",".join(f"{name}:{int(tensor.numel())}" for name, tensor in named_tensors)
+
+
+def format_scalar_family_audit(named_tensors: list[tuple[str, Tensor]]) -> str:
+    summaries = []
+    claimed_names: set[str] = set()
+    for family, patterns in SCALAR_AUDIT_FAMILY_PATTERNS:
+        family_named_tensors = [
+            (name, tensor)
+            for name, tensor in named_tensors
+            if any(pattern in name for pattern in patterns)
+        ]
+        claimed_names.update(name for name, _ in family_named_tensors)
+        stats = summarize_named_tensors(family_named_tensors)
+        summaries.append(
+            f"{family}:tensors:{stats['tensor_count']} numel:{stats['numel']} "
+            f"l2:{stats['l2']:.6f} max_abs:{stats['max_abs']:.6f}"
+        )
+    other_named_tensors = [(name, tensor) for name, tensor in named_tensors if name not in claimed_names]
+    other_stats = summarize_named_tensors(other_named_tensors)
+    summaries.append(
+        f"other:tensors:{other_stats['tensor_count']} numel:{other_stats['numel']} "
+        f"l2:{other_stats['l2']:.6f} max_abs:{other_stats['max_abs']:.6f}"
+    )
+    return " | ".join(summaries)
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1171,6 +1226,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1214,13 +1271,17 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [p for _, p in scalar_named_params]
+    scalar_group_stats_before = summarize_named_tensors(scalar_named_params)
+    scalar_group_membership = format_named_tensor_membership(scalar_named_params)
+    scalar_family_audit_before = format_scalar_family_audit(scalar_named_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1297,16 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+    scalar_optimizer_class = torch.optim.AdamW if args.scalar_weight_decay > 0.0 else torch.optim.Adam
+    optimizer_scalar = scalar_optimizer_class(
+        [
+            {
+                "params": scalar_params,
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "weight_decay": args.scalar_weight_decay,
+            }
+        ],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,8 +1329,21 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"scalar_weight_decay:{args.scalar_weight_decay}"
     )
+    log0(
+        "optimizer_scalar_group: "
+        f"optimizer:{scalar_optimizer_class.__name__} "
+        f"tensors:{scalar_group_stats_before['tensor_count']} "
+        f"numel:{scalar_group_stats_before['numel']} "
+        f"decoupled_weight_decay:{'enabled' if args.scalar_weight_decay > 0.0 else 'disabled'} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} "
+        f"l2:{scalar_group_stats_before['l2']:.6f} "
+        f"max_abs:{scalar_group_stats_before['max_abs']:.6f}"
+    )
+    log0(f"optimizer_scalar_membership: {scalar_group_membership}")
+    log0(f"optimizer_scalar_family_audit_before: {scalar_family_audit_before}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1327,6 +1409,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    scalar_cumulative_lr_weight_decay = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1470,10 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        scalar_cumulative_lr_weight_decay += sum(
+            float(group["lr"]) * float(group.get("weight_decay", 0.0))
+            for group in optimizer_scalar.param_groups
+        )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1419,6 +1506,22 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    scalar_group_stats_after = summarize_named_tensors(scalar_named_params)
+    scalar_family_audit_after = format_scalar_family_audit(scalar_named_params)
+    log0(
+        "optimizer_scalar_decay_audit: "
+        f"optimizer:{scalar_optimizer_class.__name__} "
+        f"tensors:{scalar_group_stats_after['tensor_count']} "
+        f"numel:{scalar_group_stats_after['numel']} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} "
+        f"cumulative_lr_weight_decay:{scalar_cumulative_lr_weight_decay:.8f} "
+        f"l2_before:{scalar_group_stats_before['l2']:.6f} "
+        f"l2_after:{scalar_group_stats_after['l2']:.6f} "
+        f"max_abs_before:{scalar_group_stats_before['max_abs']:.6f} "
+        f"max_abs_after:{scalar_group_stats_after['max_abs']:.6f}"
+    )
+    log0(f"optimizer_scalar_membership_final: {scalar_group_membership}")
+    log0(f"optimizer_scalar_family_audit_after: {scalar_family_audit_after}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
