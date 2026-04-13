@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    embed_grad_clip_norm = float(os.environ.get("EMBED_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,6 +1091,12 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.embed_grad_clip_norm < 0:
+        raise ValueError(f"EMBED_GRAD_CLIP_NORM must be non-negative, got {args.embed_grad_clip_norm}")
+    if args.grad_clip_norm > 0 and args.embed_grad_clip_norm > 0:
+        raise ValueError("GRAD_CLIP_NORM and EMBED_GRAD_CLIP_NORM are mutually exclusive")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1260,7 +1267,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"grad_clip_norm:{args.grad_clip_norm} embed_grad_clip_norm:{args.embed_grad_clip_norm}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1367,6 +1375,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        next_step = step + 1
+        should_log_train = (
+            args.train_log_every > 0
+            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1388,22 +1401,25 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        embed_grad_norm = None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        elif args.embed_grad_clip_norm > 0:
+            embed_grad_norm = torch.nn.utils.clip_grad_norm_([base_model.tok_emb.weight], args.embed_grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
         if should_log_train:
+            embed_grad_norm_msg = ""
+            if embed_grad_norm is not None:
+                embed_grad_norm_msg = f" embed_grad_norm:{float(embed_grad_norm):.4f}"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{embed_grad_norm_msg}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
