@@ -1252,21 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    matrix_tensor_count = len(matrix_params)
-    matrix_param_count = sum(p.numel() for p in matrix_params)
-    matrix_lr_trace_steps = (0, 1, 9, 199)
-    matrix_lr_trace_reached = {trace_step: False for trace_step in matrix_lr_trace_steps}
-    matrix_lr_min_observed = float("inf")
-    matrix_lr_max_observed = 0.0
-    matrix_last_applied_step = -1
-    matrix_last_live_lr_min = 0.0
-    matrix_last_live_lr_max = 0.0
-
-    def summarize_group_lrs(optimizer: torch.optim.Optimizer) -> tuple[float, float, float, float]:
-        base_lrs = [float(group["base_lr"]) for group in optimizer.param_groups]
-        live_lrs = [float(group["lr"]) for group in optimizer.param_groups]
-        return min(base_lrs), max(base_lrs), min(live_lrs), max(live_lrs)
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1282,14 +1267,6 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    matrix_base_lr_min, matrix_base_lr_max, matrix_live_lr_min, matrix_live_lr_max = summarize_group_lrs(optimizer_muon)
-    log0(
-        f"matrix_lr_audit_setup: step_semantics:applied_step_zero_based groups:{len(optimizer_muon.param_groups)} "
-        f"tensor_count:{matrix_tensor_count} param_count:{matrix_param_count} "
-        f"base_lr_min:{matrix_base_lr_min:.8f} base_lr_max:{matrix_base_lr_max:.8f} "
-        f"live_lr_min:{matrix_live_lr_min:.8f} live_lr_max:{matrix_live_lr_max:.8f} "
-        f"trace_steps:{','.join(str(trace_step) for trace_step in matrix_lr_trace_steps)}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1410,19 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        _, _, matrix_live_lr_min, matrix_live_lr_max = summarize_group_lrs(optimizer_muon)
-        matrix_lr_min_observed = min(matrix_lr_min_observed, matrix_live_lr_min)
-        matrix_lr_max_observed = max(matrix_lr_max_observed, matrix_live_lr_max)
-        matrix_last_applied_step = step
-        matrix_last_live_lr_min = matrix_live_lr_min
-        matrix_last_live_lr_max = matrix_live_lr_max
-        if step in matrix_lr_trace_reached:
-            matrix_lr_trace_reached[step] = True
-            log0(
-                f"matrix_lr_trace: applied_step:{step} lr_mul:{scale:.8f} "
-                f"live_lr_min:{matrix_live_lr_min:.8f} live_lr_max:{matrix_live_lr_max:.8f} "
-                f"muon_momentum:{muon_momentum:.8f}"
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1455,14 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if matrix_last_applied_step >= 0:
-        log0(
-            f"matrix_lr_audit: completed_updates:{step} measured_stop_step:{step} "
-            f"last_applied_step:{matrix_last_applied_step} min_live_lr:{matrix_lr_min_observed:.8f} "
-            f"max_live_lr:{matrix_lr_max_observed:.8f} last_live_lr_min:{matrix_last_live_lr_min:.8f} "
-            f"last_live_lr_max:{matrix_last_live_lr_max:.8f} "
-            f"trace_steps_reached:{','.join(str(trace_step) for trace_step, reached in matrix_lr_trace_reached.items() if reached)}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
