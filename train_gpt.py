@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+DEFAULT_TIED_EMBED_LR = 0.05
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -75,7 +77,7 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", DEFAULT_TIED_EMBED_LR))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1089,6 +1091,15 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.tied_embed_lr <= 0.0:
+        raise ValueError(f"TIED_EMBED_LR must be positive, got {args.tied_embed_lr}")
+    tied_embed_lr_override_active = not math.isclose(
+        args.tied_embed_lr, DEFAULT_TIED_EMBED_LR, rel_tol=0.0, abs_tol=1e-12
+    )
+    if not args.tie_embeddings and tied_embed_lr_override_active:
+        raise ValueError(
+            "Non-default TIED_EMBED_LR requires TIE_EMBEDDINGS=1 so the override targets the shared embedding/logit matrix"
+        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1261,6 +1272,15 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "optimizer_tok_scope_audit: "
+        f"tie_embeddings:{base_model.tie_embeddings} "
+        f"tied_embed_lr_override_active:{tied_embed_lr_override_active} "
+        f"token_lr_source:{'TIED_EMBED_LR' if base_model.tie_embeddings else 'EMBED_LR'} "
+        f"optimizer_tok_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
+        f"optimizer_head:{'inactive' if base_model.lm_head is None else 'active'} "
+        f"lm_head_shape:{'none' if base_model.lm_head is None else 'x'.join(str(dim) for dim in base_model.lm_head.weight.shape)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
