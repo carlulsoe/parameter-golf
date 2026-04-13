@@ -58,6 +58,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    final_eval_seq_len_audit = int(os.environ.get("FINAL_EVAL_SEQ_LEN_AUDIT", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -280,6 +281,119 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_richer_context_audit(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float, float, float, int]:
+    audit_seq_len = args.final_eval_seq_len_audit
+    if audit_seq_len <= 0:
+        raise ValueError(f"FINAL_EVAL_SEQ_LEN_AUDIT must be positive, got {audit_seq_len}")
+    if audit_seq_len < args.eval_seq_len:
+        raise ValueError(
+            "FINAL_EVAL_SEQ_LEN_AUDIT must be at least EVAL_SEQ_LEN; "
+            f"got FINAL_EVAL_SEQ_LEN_AUDIT={audit_seq_len}, EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    left_context_tokens = audit_seq_len - args.eval_seq_len
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < audit_seq_len:
+        raise ValueError(
+            "FINAL_EVAL_SEQ_LEN_AUDIT does not fit under the configured per-rank validation token budget; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, local_batch_tokens={local_batch_tokens}, "
+            f"FINAL_EVAL_SEQ_LEN_AUDIT={audit_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // audit_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
+    eligible_seq_start = (left_context_tokens + args.eval_seq_len - 1) // args.eval_seq_len
+    eligible_total_seqs = total_seqs - eligible_seq_start
+    if eligible_total_seqs <= 0:
+        raise ValueError(
+            "Validation split is too short for the requested richer-context audit; "
+            f"got total_seqs={total_seqs}, EVAL_SEQ_LEN={args.eval_seq_len}, "
+            f"FINAL_EVAL_SEQ_LEN_AUDIT={audit_seq_len}"
+        )
+    seq_start = eligible_seq_start + (eligible_total_seqs * rank) // world_size
+    seq_end = eligible_seq_start + (eligible_total_seqs * (rank + 1)) // world_size
+    baseline_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    richer_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            batch_seqs = batch_seq_end - batch_seq_start
+            raw_start = batch_seq_start * args.eval_seq_len
+            raw_end = batch_seq_end * args.eval_seq_len + 1
+
+            baseline_local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            baseline_x = baseline_local[:-1].reshape(-1, args.eval_seq_len)
+            baseline_y = baseline_local[1:].reshape(-1, args.eval_seq_len)
+
+            richer_raw_start = raw_start - left_context_tokens
+            richer_local = val_tokens[richer_raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            richer_windows = richer_local.unfold(0, audit_seq_len + 1, args.eval_seq_len)
+            if richer_windows.size(0) != batch_seqs:
+                raise RuntimeError(
+                    "Richer-context audit window construction produced an unexpected batch shape; "
+                    f"expected {batch_seqs}, got {richer_windows.size(0)}"
+                )
+            richer_x = richer_windows[:, :-1]
+            richer_y = richer_windows[:, 1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                baseline_logits = model.forward_logits(baseline_x)
+                richer_logits = model.forward_logits(richer_x)
+            baseline_loss = F.cross_entropy(
+                baseline_logits.reshape(-1, baseline_logits.size(-1)).float(),
+                baseline_y.reshape(-1),
+                reduction="mean",
+            )
+            richer_loss = F.cross_entropy(
+                richer_logits[:, -args.eval_seq_len :, :].reshape(-1, richer_logits.size(-1)).float(),
+                richer_y[:, -args.eval_seq_len :].reshape(-1),
+                reduction="mean",
+            )
+
+            batch_token_count = float(baseline_y.numel())
+            baseline_loss_sum += baseline_loss.to(torch.float64) * batch_token_count
+            richer_loss_sum += richer_loss.to(torch.float64) * batch_token_count
+            token_count += batch_token_count
+
+            prev_ids = baseline_x.reshape(-1)
+            tgt_ids = baseline_y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(baseline_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(richer_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    baseline_val_loss = baseline_loss_sum / token_count
+    richer_val_loss = richer_loss_sum / token_count
+    tokens_per_byte = token_count.item() / byte_count.item()
+    model.train()
+    return (
+        float(baseline_val_loss.item()),
+        float((baseline_val_loss.item() / math.log(2.0)) * tokens_per_byte),
+        float(richer_val_loss.item()),
+        float((richer_val_loss.item() / math.log(2.0)) * tokens_per_byte),
+        int(token_count.item()),
+    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1053,7 +1167,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1068,15 +1182,18 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1265,6 +1382,7 @@ def main() -> None:
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
+        f"final_eval_seq_len_audit:{args.final_eval_seq_len_audit} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
@@ -1551,6 +1669,49 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.final_eval_seq_len_audit > 0:
+        left_context_tokens = args.final_eval_seq_len_audit - args.eval_seq_len
+        local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+        audit_local_batch_seqs = local_batch_tokens // args.final_eval_seq_len_audit
+        total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
+        eligible_seq_start = (left_context_tokens + args.eval_seq_len - 1) // args.eval_seq_len
+        eligible_total_seqs = total_seqs - eligible_seq_start
+        log0(
+            "final_int8_zlib_roundtrip_audit: "
+            f"audit_seq_len:{args.final_eval_seq_len_audit} "
+            f"left_context_tokens:{left_context_tokens} "
+            f"matched_windows:{eligible_total_seqs} "
+            f"local_batch_tokens:{local_batch_tokens} "
+            f"audit_local_batch_seqs:{audit_local_batch_seqs}"
+        )
+        torch.cuda.synchronize()
+        t_audit = time.perf_counter()
+        audit_baseline_loss, audit_baseline_bpb, audit_richer_loss, audit_richer_bpb, audit_token_count = (
+            eval_val_richer_context_audit(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+        )
+        torch.cuda.synchronize()
+        log0(
+            "final_int8_zlib_roundtrip_audit_matched "
+            f"baseline_val_loss:{audit_baseline_loss:.4f} baseline_val_bpb:{audit_baseline_bpb:.4f} "
+            f"richer_val_loss:{audit_richer_loss:.4f} richer_val_bpb:{audit_richer_bpb:.4f} "
+            f"tokens:{audit_token_count} eval_time:{1000.0 * (time.perf_counter() - t_audit):.0f}ms"
+        )
+        log0(
+            "final_int8_zlib_roundtrip_audit_matched_exact "
+            f"baseline_val_loss:{audit_baseline_loss:.8f} baseline_val_bpb:{audit_baseline_bpb:.8f} "
+            f"richer_val_loss:{audit_richer_loss:.8f} richer_val_bpb:{audit_richer_bpb:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
