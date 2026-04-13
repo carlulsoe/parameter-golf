@@ -79,6 +79,8 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_lr_warmup_steps = int(os.environ.get("SCALAR_LR_WARMUP_STEPS", 0))
+    scalar_lr_warmup_start_mult = float(os.environ.get("SCALAR_LR_WARMUP_START_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,6 +1092,13 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.scalar_lr_warmup_steps < 0:
+        raise ValueError(f"SCALAR_LR_WARMUP_STEPS must be non-negative, got {args.scalar_lr_warmup_steps}")
+    if not math.isfinite(args.scalar_lr_warmup_start_mult) or not (0.0 < args.scalar_lr_warmup_start_mult <= 1.0):
+        raise ValueError(
+            "SCALAR_LR_WARMUP_START_MULT must be finite and in (0, 1], "
+            f"got {args.scalar_lr_warmup_start_mult}"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1293,6 +1302,25 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def scalar_lr_warmup_mult(applied_step_zero_based: int) -> float:
+        if args.scalar_lr_warmup_steps <= 0:
+            return 1.0
+        if args.scalar_lr_warmup_steps == 1 or applied_step_zero_based >= args.scalar_lr_warmup_steps - 1:
+            return 1.0
+        frac = applied_step_zero_based / max(args.scalar_lr_warmup_steps - 1, 1)
+        return args.scalar_lr_warmup_start_mult + (1.0 - args.scalar_lr_warmup_start_mult) * frac
+
+    if args.scalar_lr_warmup_steps > 0:
+        log0(
+            "scalar_lr_warmup_schedule "
+            f"scope:optimizer_scalar "
+            f"step_semantics:applied_step_zero_based "
+            f"warmup_steps:{args.scalar_lr_warmup_steps} "
+            f"warmup_start_mult:{args.scalar_lr_warmup_start_mult:.5f} "
+            f"warmup_end_applied_step:{max(args.scalar_lr_warmup_steps - 1, 0)} "
+            f"step0_mult:{scalar_lr_warmup_mult(0):.5f}"
+        )
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1327,6 +1355,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    last_scalar_lr_mult = 1.0
+    last_scalar_lr = optimizer_scalar.param_groups[0]["lr"]
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1417,11 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        scalar_lr_mult = scalar_lr_warmup_mult(step)
+        for group in optimizer_scalar.param_groups:
+            group["lr"] *= scalar_lr_mult
+        last_scalar_lr_mult = scalar_lr_mult
+        last_scalar_lr = float(optimizer_scalar.param_groups[0]["lr"])
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1401,10 +1436,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_log = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.scalar_lr_warmup_steps > 0:
+                train_log += f" scalar_lr_mult:{last_scalar_lr_mult:.5f} scalar_lr:{last_scalar_lr:.8f}"
+            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1457,19 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.scalar_lr_warmup_steps > 0:
+        completed_updates = step
+        warmup_fraction_completed = min(completed_updates / max(args.scalar_lr_warmup_steps, 1), 1.0)
+        log0(
+            "scalar_lr_warmup_audit "
+            f"completed_updates:{completed_updates} "
+            f"warmup_steps:{args.scalar_lr_warmup_steps} "
+            f"warmup_start_mult:{args.scalar_lr_warmup_start_mult:.5f} "
+            f"warmup_end_applied_step:{max(args.scalar_lr_warmup_steps - 1, 0)} "
+            f"warmup_fraction_completed:{warmup_fraction_completed:.5f} "
+            f"last_scalar_lr_mult:{last_scalar_lr_mult:.5f} "
+            f"last_scalar_lr:{last_scalar_lr:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
