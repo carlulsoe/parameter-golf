@@ -81,7 +81,6 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_eps = float(os.environ.get("MUON_EPS", 1e-7))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -113,18 +112,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        eps: float,
-        nesterov: bool = True,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, eps=eps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -145,7 +136,6 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
-            eps = group["eps"]
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
@@ -162,7 +152,7 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps, eps=eps)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -1099,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.muon_eps <= 0.0:
-        raise ValueError(f"MUON_EPS must be strictly positive, got {args.muon_eps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1245,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        eps=args.muon_eps,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1270,13 +1257,6 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"muon_optimizer: momentum:{args.muon_momentum:.5f} "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"backend_steps:{args.muon_backend_steps} "
-        f"eps:{args.muon_eps:.8g}"
-    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
