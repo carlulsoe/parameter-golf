@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import copy
 import glob
+import hashlib
 import inspect
 import io
+import json
 import math
 import os
 import random
@@ -55,6 +57,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -786,27 +789,76 @@ class TokenStream:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
+        self.pass_idx = 0
+        self.transition_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
-    def _advance_file(self) -> None:
+    def _advance_file(self) -> dict[str, object]:
+        prev_file_idx = self.file_idx
+        prev_file = self.files[prev_file_idx].name
+        prev_pass_idx = self.pass_idx
         self.file_idx = (self.file_idx + 1) % len(self.files)
+        wrapped = self.file_idx == 0
+        if wrapped:
+            self.pass_idx += 1
+        self.transition_idx += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
+        return {
+            "transition_idx": self.transition_idx,
+            "from_pass_idx": prev_pass_idx,
+            "to_pass_idx": self.pass_idx,
+            "from_file_idx": prev_file_idx,
+            "to_file_idx": self.file_idx,
+            "from_file": prev_file,
+            "to_file": self.files[self.file_idx].name,
+            "wrapped": wrapped,
+        }
 
-    def take(self, n: int) -> Tensor:
+    def snapshot_state(self) -> dict[str, object]:
+        return {
+            "pass_idx": self.pass_idx,
+            "file_idx": self.file_idx,
+            "file": self.files[self.file_idx].name,
+            "pos": self.pos,
+            "file_tokens": self.tokens.numel(),
+            "num_files": len(self.files),
+        }
+
+    def describe_state(self) -> str:
+        state = self.snapshot_state()
+        return (
+            f"pass_idx:{state['pass_idx']} file_idx:{state['file_idx']} file:{state['file']} "
+            f"pos:{state['pos']} file_tokens:{state['file_tokens']} num_files:{state['num_files']}"
+        )
+
+    def take(self, n: int) -> tuple[Tensor, list[dict[str, object]], list[dict[str, object]]]:
         chunks: list[Tensor] = []
+        segments: list[dict[str, object]] = []
+        transitions: list[dict[str, object]] = []
         remaining = n
         while remaining > 0:
             avail = self.tokens.numel() - self.pos
             if avail <= 0:
-                self._advance_file()
+                transitions.append(self._advance_file())
                 continue
             k = min(remaining, avail)
+            start = self.pos
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
+            segments.append(
+                {
+                    "pass_idx": self.pass_idx,
+                    "file_idx": self.file_idx,
+                    "file": self.files[self.file_idx].name,
+                    "start": start,
+                    "end": self.pos,
+                    "tokens": k,
+                }
+            )
             remaining -= k
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        return (chunks[0] if len(chunks) == 1 else torch.cat(chunks), segments, transitions)
 
 
 class DistributedTokenLoader:
@@ -817,16 +869,87 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.next_batch_call_idx = 0
+        self.phase_call_counts: dict[str, int] = {}
+        self.segment_history: list[dict[str, object]] = []
+        self.transition_history: list[dict[str, object]] = []
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def batch_geometry(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[int, int, int]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        raw_tokens = per_rank_span * self.world_size
+        if local_tokens % seq_len != 0:
+            raise ValueError(f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}")
+        return local_tokens, per_rank_span, raw_tokens
+
+    def describe_state(self) -> str:
+        return f"rank:{self.rank} world_size:{self.world_size} {self.stream.describe_state()}"
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int, phase: str) -> tuple[Tensor, Tensor]:
+        local_tokens, per_rank_span, raw_tokens = self.batch_geometry(global_tokens, seq_len, grad_accum_steps)
+        self.next_batch_call_idx += 1
+        phase_call_idx = self.phase_call_counts.get(phase, 0) + 1
+        self.phase_call_counts[phase] = phase_call_idx
+        chunk, segments, transitions = self.stream.take(raw_tokens)
+        for segment in segments:
+            self.segment_history.append(
+                {
+                    "phase": phase,
+                    "global_call_idx": self.next_batch_call_idx,
+                    "phase_call_idx": phase_call_idx,
+                    **segment,
+                }
+            )
+        for transition in transitions:
+            self.transition_history.append(
+                {
+                    "phase": phase,
+                    "global_call_idx": self.next_batch_call_idx,
+                    "phase_call_idx": phase_call_idx,
+                    **transition,
+                }
+            )
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def phase_segments(self, phase: str) -> list[dict[str, object]]:
+        return [entry for entry in self.segment_history if entry["phase"] == phase]
+
+    def phase_transitions(self, phase: str) -> list[dict[str, object]]:
+        return [entry for entry in self.transition_history if entry["phase"] == phase]
+
+
+def _stable_json_dumps(obj: object) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def emit_loader_manifest(log_fn, loader: DistributedTokenLoader, phase: str, label: str, chunk_size: int = 32) -> None:
+    segments = loader.phase_segments(phase)
+    transitions = loader.phase_transitions(phase)
+    digest = hashlib.sha256(
+        _stable_json_dumps({"segments": segments, "transitions": transitions}).encode("utf-8")
+    ).hexdigest()
+    wrap_count = sum(1 for entry in transitions if entry["wrapped"])
+    log_fn(
+        f"train_loader_manifest_digest phase:{phase} label:{label} "
+        f"next_batch_calls:{loader.phase_call_counts.get(phase, 0)} "
+        f"segment_entries:{len(segments)} transition_entries:{len(transitions)} wraps:{wrap_count} "
+        f"sha256:{digest}"
+    )
+    for kind, entries in (("segments", segments), ("transitions", transitions)):
+        if not entries:
+            log_fn(f"train_loader_manifest_chunk phase:{phase} label:{label} kind:{kind} chunk:0/0 entries:[]")
+            continue
+        total_chunks = math.ceil(len(entries) / chunk_size)
+        for chunk_idx in range(total_chunks):
+            chunk = entries[chunk_idx * chunk_size : (chunk_idx + 1) * chunk_size]
+            log_fn(
+                f"train_loader_manifest_chunk phase:{phase} label:{label} kind:{kind} "
+                f"chunk:{chunk_idx + 1}/{total_chunks} entries:{_stable_json_dumps(chunk)}"
+            )
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1266,6 +1389,7 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1275,6 +1399,25 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    local_tokens_per_micro_batch, per_rank_span, raw_tokens_per_micro_batch = train_loader.batch_geometry(
+        args.train_batch_tokens, args.train_seq_len, grad_accum_steps
+    )
+    warmup_total_micro_batches = args.warmup_steps * grad_accum_steps
+    warmup_total_raw_tokens = warmup_total_micro_batches * raw_tokens_per_micro_batch
+    warmup_total_shift_overhead = warmup_total_micro_batches * world_size
+    log0(
+        f"train_loader_batch_geometry local_tokens_per_micro_batch:{local_tokens_per_micro_batch} "
+        f"per_rank_span:{per_rank_span} raw_tokens_per_micro_batch:{raw_tokens_per_micro_batch} "
+        f"shift_overhead_tokens_per_micro_batch:{world_size}"
+    )
+    log0(
+        f"warmup_loader_plan warmup_steps:{args.warmup_steps} grad_accum_steps:{grad_accum_steps} "
+        f"total_micro_batches:{warmup_total_micro_batches} "
+        f"exact_raw_stream_advance_tokens:{warmup_total_raw_tokens} "
+        f"exact_shift_overhead_tokens:{warmup_total_shift_overhead} "
+        f"exact_payload_tokens:{warmup_total_micro_batches * local_tokens_per_micro_batch * world_size}"
+    )
+    log0(f"train_loader_state phase:startup {train_loader.describe_state()}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1304,7 +1447,9 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(
+                    args.train_batch_tokens, args.train_seq_len, grad_accum_steps, phase="warmup"
+                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1313,13 +1458,20 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        log0(f"train_loader_state phase:post_warmup_consumed {train_loader.describe_state()}")
+        emit_loader_manifest(log0, train_loader, phase="warmup", label="post_warmup_consumed")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.reset_train_loader_after_warmup:
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+            log0("train_loader_warmup_transition action:reset reason:rewind_measured_training_to_stream_start")
+        else:
+            log0("train_loader_warmup_transition action:resume reason:continue_measured_training_from_warmup_consumed_stream_state")
+        log0(f"train_loader_state phase:active_after_warmup_branch {train_loader.describe_state()}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1372,7 +1524,9 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(
+                args.train_batch_tokens, args.train_seq_len, grad_accum_steps, phase="measured"
+            )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1419,6 +1573,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(f"train_loader_state phase:run_end {train_loader.describe_state()}")
+    emit_loader_manifest(log0, train_loader, phase="measured", label="run_end")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
