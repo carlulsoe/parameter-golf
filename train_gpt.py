@@ -1263,11 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"muon_matrix_lr_schedule:base_lr:{args.matrix_lr:.5f} "
-        f"warmdown_iters:{args.warmdown_iters} max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
-        f"matrix_param_tensors:{len(matrix_params)} matrix_param_numel:{sum(p.numel() for p in matrix_params)}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1332,11 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    muon_matrix_lr_sum = 0.0
-    muon_matrix_lr_peak = 0.0
-    muon_matrix_lr_last = 0.0
-    muon_matrix_lr_step1: float | None = None
-    muon_matrix_lr_step200: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1377,7 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        matrix_lr_applied = args.matrix_lr * scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1406,13 +1395,6 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        muon_matrix_lr_sum += matrix_lr_applied
-        muon_matrix_lr_peak = max(muon_matrix_lr_peak, matrix_lr_applied)
-        muon_matrix_lr_last = matrix_lr_applied
-        if muon_matrix_lr_step1 is None:
-            muon_matrix_lr_step1 = matrix_lr_applied
-        if step == 200:
-            muon_matrix_lr_step200 = matrix_lr_applied
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1436,16 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    completed_updates = step
-    mean_matrix_lr = muon_matrix_lr_sum / completed_updates if completed_updates > 0 else 0.0
-    log0(
-        f"muon_matrix_lr_audit:completed_updates:{completed_updates} "
-        f"step1_matrix_lr:{0.0 if muon_matrix_lr_step1 is None else muon_matrix_lr_step1:.5f} "
-        f"step200_reached:{int(muon_matrix_lr_step200 is not None)} "
-        f"step200_matrix_lr:{0.0 if muon_matrix_lr_step200 is None else muon_matrix_lr_step200:.5f} "
-        f"last_matrix_lr:{muon_matrix_lr_last:.5f} peak_matrix_lr:{muon_matrix_lr_peak:.5f} "
-        f"mean_matrix_lr:{mean_matrix_lr:.5f}"
     )
 
     # -----------------------------
