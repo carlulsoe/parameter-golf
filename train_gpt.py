@@ -60,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    train_loader_audit = bool(int(os.environ.get("TRAIN_LOADER_AUDIT", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -779,13 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=3)
-    if header.size != 3 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -793,18 +785,12 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_token_counts = [load_data_shard_num_tokens(file) for file in self.files]
-        self.total_dataset_tokens = sum(self.file_token_counts)
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_stream_tokens = 0
-        self.wrap_count = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.wrap_count += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -819,20 +805,8 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.total_stream_tokens += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def snapshot(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "current_file_tokens": self.file_token_counts[self.file_idx],
-            "num_files": len(self.files),
-            "total_dataset_tokens": self.total_dataset_tokens,
-            "total_stream_tokens": self.total_stream_tokens,
-            "wrap_count": self.wrap_count,
-        }
 
 
 class DistributedTokenLoader:
@@ -853,9 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def snapshot(self) -> dict[str, int]:
-        return self.stream.snapshot()
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1304,45 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    warmup_loader_snapshot: dict[str, int] | None = None
-    measured_loader_start_snapshot: dict[str, int] | None = None
-
-    local_tokens_per_micro_step = args.train_batch_tokens // (world_size * grad_accum_steps)
-    stream_tokens_per_micro_step = (local_tokens_per_micro_step + 1) * world_size
-    boundary_tokens_per_micro_step = stream_tokens_per_micro_step - (local_tokens_per_micro_step * world_size)
-
-    def overlap_with_prefix(start: int, length: int, prefix_len: int, total_tokens: int) -> int:
-        if length <= 0 or prefix_len <= 0 or total_tokens <= 0:
-            return 0
-        prefix_len = min(prefix_len, total_tokens)
-        full_cycles, remainder = divmod(length, total_tokens)
-        overlap = full_cycles * prefix_len
-        start %= total_tokens
-        end = start + remainder
-        if end <= total_tokens:
-            if start < prefix_len:
-                overlap += max(min(end, prefix_len) - start, 0)
-            return overlap
-        if start < prefix_len:
-            overlap += prefix_len - start
-        overlap += min(end - total_tokens, prefix_len)
-        return overlap
-
-    if args.train_loader_audit:
-        startup_loader_snapshot = train_loader.snapshot()
-        log0(
-            "train_loader_audit: "
-            f"enabled:True "
-            f"requested_global_tokens_per_step:{args.train_batch_tokens} "
-            f"effective_global_tokens_per_step:{local_tokens_per_micro_step * grad_accum_steps * world_size} "
-            f"local_tokens_per_micro_step:{local_tokens_per_micro_step} "
-            f"stream_tokens_per_micro_step:{stream_tokens_per_micro_step} "
-            f"boundary_tokens_per_micro_step:{boundary_tokens_per_micro_step} "
-            f"grad_accum_steps:{grad_accum_steps} "
-            f"world_size:{world_size} "
-            f"train_shards:{startup_loader_snapshot['num_files']} "
-            f"dataset_total_tokens:{startup_loader_snapshot['total_dataset_tokens']}"
-        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1387,43 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.train_loader_audit:
-            warmup_loader_snapshot = train_loader.snapshot()
-            warmup_micro_steps = args.warmup_steps * grad_accum_steps
-            warmup_supervised_tokens = warmup_micro_steps * local_tokens_per_micro_step * world_size
-            warmup_stream_tokens = warmup_loader_snapshot["total_stream_tokens"]
-            warmup_boundary_tokens = warmup_stream_tokens - warmup_supervised_tokens
-            log0(
-                "warmup_loader_audit: "
-                f"warmup_steps:{args.warmup_steps} "
-                f"warmup_micro_steps:{warmup_micro_steps} "
-                f"warmup_supervised_tokens:{warmup_supervised_tokens} "
-                f"warmup_stream_tokens:{warmup_stream_tokens} "
-                f"warmup_boundary_tokens:{warmup_boundary_tokens} "
-                f"post_warmup_file_idx:{warmup_loader_snapshot['file_idx']} "
-                f"post_warmup_pos:{warmup_loader_snapshot['pos']} "
-                f"post_warmup_total_stream_tokens:{warmup_loader_snapshot['total_stream_tokens']} "
-                f"post_warmup_wrap_count:{warmup_loader_snapshot['wrap_count']}"
-            )
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        if args.train_loader_audit:
-            measured_loader_start_snapshot = train_loader.snapshot()
-            rewound_after_warmup = (
-                warmup_loader_snapshot is not None
-                and measured_loader_start_snapshot["file_idx"] == 0
-                and measured_loader_start_snapshot["pos"] == 0
-                and measured_loader_start_snapshot["total_stream_tokens"] == 0
-            )
-            replayed_stream_tokens = warmup_loader_snapshot["total_stream_tokens"] if warmup_loader_snapshot is not None else 0
-            log0(
-                "measured_loader_start: "
-                f"rewound_after_warmup:{rewound_after_warmup} "
-                f"measured_start_file_idx:{measured_loader_start_snapshot['file_idx']} "
-                f"measured_start_pos:{measured_loader_start_snapshot['pos']} "
-                f"measured_start_total_stream_tokens:{measured_loader_start_snapshot['total_stream_tokens']} "
-                f"measured_start_wrap_count:{measured_loader_start_snapshot['wrap_count']} "
-                f"replayed_stream_tokens:{replayed_stream_tokens}"
-            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1523,33 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.train_loader_audit:
-        measured_loader_end_snapshot = train_loader.snapshot()
-        warmup_stream_tokens = warmup_loader_snapshot["total_stream_tokens"] if warmup_loader_snapshot is not None else 0
-        dataset_total_tokens = measured_loader_end_snapshot["total_dataset_tokens"]
-        measured_stream_tokens = measured_loader_end_snapshot["total_stream_tokens"]
-        baseline_replayed_warmup_tokens = min(warmup_stream_tokens, measured_stream_tokens)
-        continue_mode_replayed_warmup_tokens = overlap_with_prefix(
-            start=warmup_stream_tokens,
-            length=measured_stream_tokens,
-            prefix_len=warmup_stream_tokens,
-            total_tokens=dataset_total_tokens,
-        )
-        continue_mode_avoided_replay_tokens = baseline_replayed_warmup_tokens - continue_mode_replayed_warmup_tokens
-        continue_mode_wraps_into_prefix = continue_mode_replayed_warmup_tokens > 0
-        log0(
-            "train_loader_final_audit: "
-            f"dataset_total_tokens:{dataset_total_tokens} "
-            f"warmup_stream_tokens:{warmup_stream_tokens} "
-            f"measured_stream_tokens:{measured_stream_tokens} "
-            f"measured_end_file_idx:{measured_loader_end_snapshot['file_idx']} "
-            f"measured_end_pos:{measured_loader_end_snapshot['pos']} "
-            f"measured_wrap_count:{measured_loader_end_snapshot['wrap_count']} "
-            f"baseline_replayed_warmup_tokens:{baseline_replayed_warmup_tokens} "
-            f"continue_mode_replayed_warmup_tokens:{continue_mode_replayed_warmup_tokens} "
-            f"continue_mode_avoided_replay_tokens:{continue_mode_avoided_replay_tokens} "
-            f"continue_mode_wraps_into_prefix:{continue_mode_wraps_into_prefix}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
