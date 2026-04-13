@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    warmup_use_synthetic_batch = bool(int(os.environ.get("WARMUP_USE_SYNTHETIC_BATCH", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -1269,10 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"warmup_data_source:{'synthetic' if args.warmup_use_synthetic_batch else 'train_loader'} "
-        f"warmup_use_synthetic_batch:{args.warmup_use_synthetic_batch}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1280,17 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    warmup_local_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-
-    def synthetic_warmup_batch() -> tuple[Tensor, Tensor]:
-        # Compile warmup only needs stable shapes/dtypes; synthetic tokens avoid
-        # consuming and then replaying real training data before measured updates.
-        token_count = warmup_local_tokens + 1
-        offset = rank * token_count
-        local = (torch.arange(token_count, device=device, dtype=torch.int64) + offset) % args.vocab_size
-        x = local[:-1].reshape(-1, args.train_seq_len)
-        y = local[1:].reshape(-1, args.train_seq_len)
-        return x, y
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1320,10 +1304,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                if args.warmup_use_synthetic_batch:
-                    x, y = synthetic_warmup_batch()
-                else:
-                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1338,15 +1319,6 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        warmup_real_loader_tokens = (
-            0
-            if args.warmup_use_synthetic_batch
-            else args.warmup_steps * grad_accum_steps * world_size * (warmup_local_tokens + 1)
-        )
-        log0(
-            f"warmup_post_reset:data_source:{'synthetic' if args.warmup_use_synthetic_batch else 'train_loader'} "
-            f"real_loader_tokens:{warmup_real_loader_tokens}"
-        )
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
