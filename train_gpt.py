@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    resid_mix_lr_scale = float(os.environ.get("RESID_MIX_LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1207,17 +1208,22 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # - resid_mix control tensors can optionally use a scaled SCALAR_LR
+    # - remaining vectors/scalars use SCALAR_LR via Adam
+    if args.resid_mix_lr_scale < 0.0:
+        raise ValueError(f"RESID_MIX_LR_SCALE must be non-negative, got {args.resid_mix_lr_scale}")
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith("resid_mix")]
+    resid_mix_params = [p for _, p in resid_mix_named_params]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and not name.endswith("resid_mix")
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1242,7 +1248,14 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    resid_mix_lr = args.scalar_lr * args.resid_mix_lr_scale
+    optimizer_resid_mix = torch.optim.Adam(
+        [{"params": resid_mix_params, "lr": resid_mix_lr, "base_lr": resid_mix_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_resid_mix]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1275,14 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        "optimizer_scalar_groups: "
+        f"scalar_tensors:{len(scalar_params)} scalar_numel:{sum(p.numel() for p in scalar_params)} "
+        f"resid_mix_tensors:{len(resid_mix_params)} resid_mix_numel:{sum(p.numel() for p in resid_mix_params)} "
+        f"resid_mix_lr_scale:{args.resid_mix_lr_scale:.5f} resid_mix_lr:{resid_mix_lr:.8f}"
+    )
+    if resid_mix_named_params:
+        log0("optimizer_resid_mix_names: " + ",".join(name for name, _ in resid_mix_named_params))
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1418,6 +1439,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_scalar_final: "
+        f"completed_updates:{step} "
+        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"resid_mix_lr:{optimizer_resid_mix.param_groups[0]['lr']:.8f} "
+        f"resid_mix_lr_scale:{args.resid_mix_lr_scale:.5f}"
     )
 
     # -----------------------------
