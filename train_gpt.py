@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    skip_lr_scale = float(os.environ.get("SKIP_LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.skip_lr_scale < 0.0:
+        raise ValueError(f"SKIP_LR_SCALE must be non-negative, got {args.skip_lr_scale}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1219,8 +1222,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    skip_params = [base_model.skip_weights] if base_model.skip_weights.numel() > 0 else []
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,12 +1238,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
+    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "scalar"}]
+    if skip_params:
+        skip_lr = args.scalar_lr * args.skip_lr_scale
+        scalar_param_groups.append(
+            {"params": skip_params, "lr": skip_lr, "base_lr": skip_lr, "group_name": "skip"}
+        )
+    optimizer_scalar = torch.optim.Adam(scalar_param_groups, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1262,6 +1265,14 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_scalar_groups: scalar_tensors:{len(scalar_params)} "
+        f"scalar_numel:{sum(p.numel() for p in scalar_params)} "
+        f"skip_tensors:{len(skip_params)} skip_numel:{sum(p.numel() for p in skip_params)} "
+        f"skip_lr_scale:{args.skip_lr_scale:.5f} skip_lr:{args.scalar_lr * args.skip_lr_scale:.8f}"
+    )
+    if skip_params:
+        log0("optimizer_skip_names: skip_weights")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1418,6 +1429,18 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    scalar_group_lr = 0.0
+    skip_group_lr = 0.0
+    for group in optimizer_scalar.param_groups:
+        if group.get("group_name") == "scalar":
+            scalar_group_lr = float(group["lr"])
+        elif group.get("group_name") == "skip":
+            skip_group_lr = float(group["lr"])
+    log0(
+        f"optimizer_scalar_final: completed_updates:{step} "
+        f"scalar_lr:{scalar_group_lr:.8f} skip_lr:{skip_group_lr:.8f} "
+        f"skip_lr_scale:{args.skip_lr_scale:.5f}"
     )
 
     # -----------------------------
