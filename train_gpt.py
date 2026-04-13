@@ -76,7 +76,6 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1172,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.token_lr_mult <= 0.0:
-        raise ValueError(f"TOKEN_LR_MULT must be positive, got {args.token_lr_mult}")
-    if args.token_lr_mult != 1.0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_LR_MULT != 1.0 requires TIE_EMBEDDINGS=1 so the scope stays on the tied token/logit matrix")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1226,8 +1221,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    configured_token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_lr = configured_token_lr * args.token_lr_mult
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1267,13 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "optimizer_tok audit: "
-        f"scope:{'tied_only' if args.tie_embeddings else 'tok_emb_only'} "
-        f"configured_token_lr:{configured_token_lr:.8f} "
-        f"token_lr_mult:{args.token_lr_mult:.8f} "
-        f"base_lr:{token_lr:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1414,11 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            live_token_lr = float(optimizer_tok.param_groups[0]["lr"])
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"token_lr:{live_token_lr:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1433,14 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "optimizer_tok final_audit: "
-        f"scope:{'tied_only' if args.tie_embeddings else 'tok_emb_only'} "
-        f"configured_token_lr:{configured_token_lr:.8f} "
-        f"token_lr_mult:{args.token_lr_mult:.8f} "
-        f"last_token_lr:{float(optimizer_tok.param_groups[0]['lr']):.8f} "
-        f"completed_updates:{step}"
     )
 
     # -----------------------------
