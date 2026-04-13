@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_audit_decay = float(os.environ.get("EMA_AUDIT_DECAY", 0.0))
+    ema_audit_start_step = int(os.environ.get("EMA_AUDIT_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -467,6 +469,25 @@ def median_float(values: list[float]) -> float:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
 
+def clone_state_dict_tensors(state_dict: dict[str, Tensor], device: torch.device | str | None = None) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    for name, tensor in state_dict.items():
+        cloned = tensor.detach().clone()
+        if device is not None:
+            cloned = cloned.to(device=device)
+        out[name] = cloned.contiguous()
+    return out
+
+@torch.no_grad()
+def update_ema_state_dict_(ema_state_dict: dict[str, Tensor], state_dict: dict[str, Tensor], decay: float) -> None:
+    for name, tensor in state_dict.items():
+        source = tensor.detach()
+        target = ema_state_dict[name]
+        if source.is_floating_point():
+            target.lerp_(source, 1.0 - decay)
+        else:
+            target.copy_(source)
+
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
         return None
@@ -566,7 +587,10 @@ def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
         "extra_payload_bytes": keep_payload_bytes - quantized_payload_bytes,
     }
 
-def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
+def select_auto_keep_float_tensor(
+    state_dict: dict[str, Tensor],
+    selected_name_override: str | None = None,
+) -> dict[str, object] | None:
     if not INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
         return None
     candidates: list[dict[str, object]] = []
@@ -597,18 +621,32 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
         key=lambda item: (float(item["estimated_gain"]), -int(item["keep_payload_bytes"])),
         reverse=True,
     )
-    best = ranked[0]
-    best["candidate_count"] = len(candidates)
-    best["selected_name"] = str(best["name"])
-    best["top_candidates_summary"] = ",".join(
+    natural_best = ranked[0]
+    selected = natural_best
+    selection_mode = "natural"
+    if selected_name_override:
+        matched = next((item for item in candidates if str(item["name"]) == selected_name_override), None)
+        if matched is None:
+            raise ValueError(f"Forced auto-keep tensor not found in candidates: {selected_name_override}")
+        selected = matched
+        selection_mode = "forced"
+    result = dict(selected)
+    result["candidate_count"] = len(candidates)
+    result["selected_name"] = str(selected["name"])
+    result["natural_selected_name"] = str(natural_best["name"])
+    result["selection_mode"] = selection_mode
+    result["top_candidates_summary"] = ",".join(
         (
             f"{str(item['name'])}|gain={float(item['estimated_gain']):.8f}|extra={int(item['extra_payload_bytes'])}"
             for item in ranked[: max(INT8_AUTO_KEEP_FLOAT_LOG_TOPK, 0)]
         )
     )
-    return best
+    return result
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(
+    state_dict: dict[str, Tensor],
+    selected_auto_keep_name_override: str | None = None,
+):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -620,7 +658,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
-    auto_keep = select_auto_keep_float_tensor(state_dict)
+    auto_keep = select_auto_keep_float_tensor(
+        state_dict,
+        selected_name_override=selected_auto_keep_name_override,
+    )
     keep_float_fp32_audit = audit_keep_float_fp32_family(state_dict)
     selected_auto_keep_name = ""
     if auto_keep is not None:
@@ -647,6 +688,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     )
     stats["auto_keep_candidate_count"] = int(auto_keep["candidate_count"]) if auto_keep is not None else 0
     stats["auto_keep_selected_name"] = selected_auto_keep_name
+    stats["auto_keep_natural_selected_name"] = str(auto_keep["natural_selected_name"]) if auto_keep is not None else ""
+    stats["auto_keep_selection_mode"] = str(auto_keep["selection_mode"]) if auto_keep is not None else "disabled"
     stats["auto_keep_estimated_gain"] = float(auto_keep["estimated_gain"]) if auto_keep is not None else 0.0
     stats["auto_keep_quantized_error"] = float(auto_keep["quantized_error"]) if auto_keep is not None else 0.0
     stats["auto_keep_keep_error"] = float(auto_keep["keep_error"]) if auto_keep is not None else 0.0
@@ -736,6 +779,23 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
+
+def serialize_quantized_state_dict(
+    state_dict: dict[str, Tensor],
+    selected_auto_keep_name_override: str | None = None,
+) -> tuple[bytes, dict[str, object], dict[str, object], int]:
+    quant_obj, quant_stats = quantize_state_dict_int8(
+        state_dict,
+        selected_auto_keep_name_override=selected_auto_keep_name_override,
+    )
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
+    return quant_blob, quant_obj, quant_stats, len(quant_raw)
+
+def load_quantized_state_dict_blob(quant_blob: bytes) -> dict[str, object]:
+    return torch.load(io.BytesIO(zlib.decompress(quant_blob)), map_location="cpu")
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -1103,6 +1163,10 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    if not 0.0 <= args.ema_audit_decay < 1.0:
+        raise ValueError(f"EMA_AUDIT_DECAY must satisfy 0 <= EMA_AUDIT_DECAY < 1, got {args.ema_audit_decay}")
+    if args.ema_audit_start_step < 0:
+        raise ValueError(f"EMA_AUDIT_START_STEP must be non-negative, got {args.ema_audit_start_step}")
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
@@ -1268,6 +1332,15 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    ema_audit_enabled = 0.0 < args.ema_audit_decay < 1.0
+    if ema_audit_enabled:
+        log0(
+            "ema_audit: "
+            f"enabled:True decay:{args.ema_audit_decay:.6f} start_step:{args.ema_audit_start_step} "
+            "raw_artifact_pinned:True"
+        )
+    else:
+        log0("ema_audit: enabled:False")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,10 +1400,16 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_state_dict: dict[str, Tensor] | None = None
+    ema_update_count = 0
+    ema_tracked_tensors = 0
+    ema_tracked_numel = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
+    last_val_loss = float("nan")
+    last_val_bpb = float("nan")
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1350,6 +1429,8 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            last_val_loss = val_loss
+            last_val_bpb = val_bpb
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1392,6 +1473,15 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_audit_enabled and step >= args.ema_audit_start_step:
+            current_state_dict = base_model.state_dict()
+            if ema_state_dict is None:
+                ema_state_dict = clone_state_dict_tensors(current_state_dict)
+                ema_tracked_tensors = sum(1 for tensor in ema_state_dict.values() if tensor.is_floating_point())
+                ema_tracked_numel = sum(int(tensor.numel()) for tensor in ema_state_dict.values() if tensor.is_floating_point())
+            else:
+                update_ema_state_dict_(ema_state_dict, current_state_dict, args.ema_audit_decay)
+            ema_update_count += 1
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1509,16 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(
+        "training_stop_audit: "
+        f"completed_updates:{step} "
+        f"stop_after_step:{stop_after_step if stop_after_step is not None else -1} "
+        f"train_time:{training_time_ms:.0f}ms "
+        f"step_avg:{training_time_ms / max(step, 1):.2f}ms "
+        f"ema_updates:{ema_update_count} "
+        f"ema_tracked_tensors:{ema_tracked_tensors} "
+        f"ema_tracked_numel:{ema_tracked_numel}"
+    )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1426,20 +1526,17 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    raw_state_dict = clone_state_dict_tensors(base_model.state_dict(), device="cpu")
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(raw_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"final_raw_exact val_loss:{last_val_loss:.8f} val_bpb:{last_val_bpb:.8f}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    quant_blob, _, quant_stats, quant_raw_bytes = serialize_quantized_state_dict(raw_state_dict)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1451,6 +1548,8 @@ def main() -> None:
                 "Int8 auto-keep selector: "
                 f"candidates:{quant_stats['auto_keep_candidate_count']} "
                 f"selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
+                f"natural_selected:{quant_stats['auto_keep_natural_selected_name'] or 'none'} "
+                f"selection_mode:{quant_stats['auto_keep_selection_mode']} "
                 f"estimated_gain:{quant_stats['auto_keep_estimated_gain']:.8f} "
                 f"quantized_error:{quant_stats['auto_keep_quantized_error']:.8f} "
                 f"keep_error:{quant_stats['auto_keep_keep_error']:.8f}"
@@ -1527,9 +1626,84 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
+    if ema_audit_enabled and ema_state_dict is not None:
+        ema_state_dict_cpu = clone_state_dict_tensors(ema_state_dict, device="cpu")
+        raw_selected_name = str(quant_stats["auto_keep_selected_name"])
+        ema_auto_keep = select_auto_keep_float_tensor(ema_state_dict_cpu)
+        ema_natural_selected_name = str(ema_auto_keep["selected_name"]) if ema_auto_keep is not None else ""
+        base_model.load_state_dict(ema_state_dict_cpu, strict=True)
+        torch.cuda.synchronize()
+        ema_float_t0 = time.perf_counter()
+        ema_val_loss, ema_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        ema_quant_blob, _, ema_quant_stats, ema_quant_raw_bytes = serialize_quantized_state_dict(
+            ema_state_dict_cpu,
+            selected_auto_keep_name_override=raw_selected_name or None,
+        )
+        ema_quant_file_bytes = len(ema_quant_blob)
+        base_model.load_state_dict(
+            dequantize_state_dict_int8(load_quantized_state_dict_blob(ema_quant_blob)),
+            strict=True,
+        )
+        torch.cuda.synchronize()
+        ema_qeval_t0 = time.perf_counter()
+        ema_q_val_loss, ema_q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        base_model.load_state_dict(raw_state_dict, strict=True)
+        log0(
+            "EMA audit selector: "
+            f"raw_selected:{raw_selected_name or 'none'} "
+            f"ema_natural_selected:{ema_natural_selected_name or 'none'} "
+            f"ema_pinned_selected:{ema_quant_stats['auto_keep_selected_name'] or 'none'} "
+            f"selection_mode:{ema_quant_stats['auto_keep_selection_mode']} "
+            f"candidates:{ema_quant_stats['auto_keep_candidate_count']}"
+        )
+        log0(
+            f"EMA audit float_exact val_loss:{ema_val_loss:.8f} val_bpb:{ema_val_bpb:.8f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - ema_float_t0):.0f}ms"
+        )
+        log0(
+            "EMA audit int8_ptz_roundtrip: "
+            f"file_bytes:{ema_quant_file_bytes} "
+            f"payload:{ema_quant_stats['int8_payload_bytes']} "
+            f"raw_torch:{ema_quant_raw_bytes}"
+        )
+        log0(
+            f"EMA audit int8_ptz_roundtrip_exact val_loss:{ema_q_val_loss:.8f} val_bpb:{ema_q_val_bpb:.8f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - ema_qeval_t0):.0f}ms"
+        )
+        log0(
+            "EMA audit deltas: "
+            f"checkpoint_float_val_loss_delta:{ema_val_loss - last_val_loss:.8f} "
+            f"checkpoint_float_val_bpb_delta:{ema_val_bpb - last_val_bpb:.8f} "
+            f"ema_quant_gap_val_loss:{ema_q_val_loss - ema_val_loss:.8f} "
+            f"ema_quant_gap_val_bpb:{ema_q_val_bpb - ema_val_bpb:.8f}"
+        )
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = load_quantized_state_dict_blob(quant_blob_disk)
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
