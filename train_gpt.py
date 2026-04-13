@@ -83,6 +83,8 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_late_lr_mult = float(os.environ.get("MUON_LATE_LR_MULT", 1.0))
+    muon_late_lr_remaining_ms = float(os.environ.get("MUON_LATE_LR_REMAINING_MS", 0.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1171,6 +1173,20 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.muon_late_lr_mult <= 0:
+        raise ValueError(f"MUON_LATE_LR_MULT must be positive, got {args.muon_late_lr_mult}")
+    if args.muon_late_lr_remaining_ms < 0:
+        raise ValueError(
+            f"MUON_LATE_LR_REMAINING_MS must be non-negative, got {args.muon_late_lr_remaining_ms}"
+        )
+    if args.muon_late_lr_mult != 1.0 and args.muon_late_lr_remaining_ms <= 0:
+        raise ValueError(
+            "MUON_LATE_LR_REMAINING_MS must be positive when MUON_LATE_LR_MULT differs from 1.0"
+        )
+    if args.muon_late_lr_mult != 1.0 and args.max_wallclock_seconds <= 0:
+        raise ValueError(
+            "MUON_LATE_LR_MULT requires MAX_WALLCLOCK_SECONDS > 0 so the late gate can use remaining_ms"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1284,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        "muon_late_lr_schedule: "
+        f"target_mult:{args.muon_late_lr_mult:.5f} "
+        f"remaining_ms_start:{args.muon_late_lr_remaining_ms:.1f}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1292,6 +1313,18 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def muon_late_lr_mul(elapsed_ms: float) -> tuple[float, float]:
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0) if max_wallclock_ms is not None else math.inf
+        if (
+            max_wallclock_ms is None
+            or args.muon_late_lr_mult == 1.0
+            or args.muon_late_lr_remaining_ms <= 0
+            or remaining_ms >= args.muon_late_lr_remaining_ms
+        ):
+            return 1.0, remaining_ms
+        frac = (args.muon_late_lr_remaining_ms - remaining_ms) / max(args.muon_late_lr_remaining_ms, 1e-9)
+        return 1.0 + frac * (args.muon_late_lr_mult - 1.0), remaining_ms
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1367,6 +1400,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        muon_scale, remaining_ms = muon_late_lr_mul(elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1421,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_muon.param_groups:
+            group["lr"] *= muon_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1403,7 +1439,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"remaining_ms:{remaining_ms:.0f} shared_lr_mult:{scale:.5f} "
+                f"muon_late_lr_mult:{muon_scale:.5f} muon_lr:{optimizer_muon.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1456,14 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    final_muon_late_lr_mult, final_remaining_ms = muon_late_lr_mul(training_time_ms)
+    log0(
+        "muon_late_lr_audit: "
+        f"target_mult:{args.muon_late_lr_mult:.5f} "
+        f"remaining_ms_start:{args.muon_late_lr_remaining_ms:.1f} "
+        f"last_remaining_ms:{final_remaining_ms:.1f} "
+        f"last_muon_late_lr_mult:{final_muon_late_lr_mult:.5f}"
     )
 
     # -----------------------------
