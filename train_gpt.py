@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -466,6 +467,23 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+def ema_abs_delta_stats(named_params: list[tuple[str, nn.Parameter]], ema_params: dict[str, Tensor]) -> tuple[int, float, float]:
+    if not ema_params:
+        return 0, 0.0, 0.0
+    total_elems = 0
+    total_abs_delta = 0.0
+    max_abs_delta = 0.0
+    for name, param in named_params:
+        ema_t = ema_params.get(name)
+        if ema_t is None:
+            continue
+        delta = (param.detach().float() - ema_t).abs()
+        total_elems += int(delta.numel())
+        total_abs_delta += float(delta.sum().item())
+        max_abs_delta = max(max_abs_delta, float(delta.max().item()))
+    mean_abs_delta = total_abs_delta / max(total_elems, 1)
+    return total_elems, mean_abs_delta, max_abs_delta
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1089,6 +1107,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must satisfy 0 <= EMA_DECAY < 1, got {args.ema_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1268,6 +1288,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"ema:enabled:{args.ema_decay > 0.0} decay:{args.ema_decay:.8f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1348,24 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_params: dict[str, Tensor] = {}
+    ema_update_count = 0
+    named_params = list(base_model.named_parameters())
+
+    def update_ema() -> None:
+        nonlocal ema_update_count
+        if args.ema_decay <= 0.0:
+            return
+        if not ema_params:
+            for name, param in named_params:
+                ema_params[name] = param.detach().float().clone()
+            ema_update_count = 1
+            return
+        one_minus_decay = 1.0 - args.ema_decay
+        for name, param in named_params:
+            ema_params[name].mul_(args.ema_decay).add_(param.detach().float(), alpha=one_minus_decay)
+        ema_update_count += 1
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1392,6 +1431,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        update_ema()
         zero_grad_all()
 
         step += 1
@@ -1426,15 +1466,30 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    export_state_dict = base_model.state_dict()
+    if ema_params:
+        export_state_dict = dict(export_state_dict)
+        for name, ema_t in ema_params.items():
+            export_state_dict[name] = ema_t.to(device=device, dtype=export_state_dict[name].dtype).contiguous()
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        if args.ema_decay > 0.0:
+            ema_numel, ema_mean_abs_delta, ema_max_abs_delta = ema_abs_delta_stats(named_params, ema_params)
+            log0(
+                "EMA export: "
+                f"updates:{ema_update_count} "
+                f"tracked_numel:{ema_numel} "
+                f"mean_abs_delta:{ema_mean_abs_delta:.8e} "
+                f"max_abs_delta:{ema_max_abs_delta:.8e}"
+            )
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
