@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    token_beta1 = float(os.environ.get("TOKEN_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1089,6 +1090,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    for name, value in (("BETA1", args.beta1), ("TOKEN_BETA1", args.token_beta1), ("BETA2", args.beta2)):
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be in [0, 1), got {value}")
+    if args.token_beta1 != args.beta1 and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA1 override requires TIE_EMBEDDINGS=1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1224,7 +1230,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.token_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1258,6 +1264,15 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
+        f"optimizer_beta_config beta1:{args.beta1:.5f} "
+        f"token_beta1:{args.token_beta1:.5f} beta2:{args.beta2:.5f}"
+    )
+    log0(
+        f"optimizer_tok audit: optimizer:Adam tie_embeddings:{args.tie_embeddings} "
+        f"scope:{'tied_only' if args.tie_embeddings else 'token_only'} "
+        f"tensor_count:1 names:tok_emb.weight"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1280,6 +1295,20 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    def log_optimizer_betas(stage: str) -> None:
+        tok_beta1, tok_beta2 = optimizer_tok.param_groups[0]["betas"]
+        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
+        head_summary = "inactive"
+        if base_model.lm_head is not None:
+            head_beta1, head_beta2 = optimizer_head.param_groups[0]["betas"]
+            head_summary = f"({head_beta1:.5f},{head_beta2:.5f})"
+        log0(
+            f"optimizer_betas stage:{stage} "
+            f"tok:({tok_beta1:.5f},{tok_beta2:.5f}) "
+            f"scalar:({scalar_beta1:.5f},{scalar_beta2:.5f}) "
+            f"head:{head_summary} muon:none"
+        )
+
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -1295,6 +1324,7 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
+    log_optimizer_betas("startup")
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1320,6 +1350,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1450,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
