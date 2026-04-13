@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_embed_init_audit_steps = int(os.environ.get("TOKEN_EMBED_INIT_AUDIT_STEPS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1269,6 +1270,30 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.token_embed_init_audit_steps < 0:
+        raise ValueError(f"TOKEN_EMBED_INIT_AUDIT_STEPS must be non-negative, got {args.token_embed_init_audit_steps}")
+    token_embed_init_audit_enabled = args.token_embed_init_audit_steps > 0
+    token_embed_initial_rms = 0.0
+    token_embed_audit_applied_updates = 0
+    token_embed_peak_relative_update = 0.0
+    token_embed_peak_relative_update_step = 0
+    token_embed_peak_rms_ratio = 1.0
+    token_embed_peak_rms_ratio_step = 0
+    token_embed_min_rms_ratio = 1.0
+    token_embed_min_rms_ratio_step = 0
+    if token_embed_init_audit_enabled:
+        tok_weight = base_model.tok_emb.weight.detach().float()
+        token_embed_initial_rms = float(tok_weight.square().mean().sqrt().item())
+        log0(
+            "token_embed_init_audit "
+            "scope:optimizer_tok target:tok_emb.weight "
+            f"tie_embeddings:{int(args.tie_embeddings)} "
+            f"configured_steps:{args.token_embed_init_audit_steps} "
+            f"tied_embed_init_std:{args.tied_embed_init_std:.8f} "
+            f"initial_param_rms:{token_embed_initial_rms:.8f} "
+            f"token_lr:{token_lr:.8f} "
+            f"global_grad_clip_norm:{args.grad_clip_norm:.5f}"
+        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1390,8 +1415,45 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        token_weight_before_step = None
+        if token_embed_init_audit_enabled and step < args.token_embed_init_audit_steps:
+            token_weight_before_step = base_model.tok_emb.weight.detach().float().clone()
         for opt in optimizers:
             opt.step()
+            if opt is optimizer_tok and token_weight_before_step is not None:
+                token_weight_after_step = base_model.tok_emb.weight.detach().float()
+                token_update = token_weight_after_step - token_weight_before_step
+                current_param_rms = float(token_weight_after_step.square().mean().sqrt().item())
+                update_rms = float(token_update.square().mean().sqrt().item())
+                relative_update_rms = update_rms / max(current_param_rms, 1e-12)
+                rms_ratio_to_init = current_param_rms / max(token_embed_initial_rms, 1e-12)
+                audited_step = step + 1
+                token_embed_audit_applied_updates += 1
+                if relative_update_rms >= token_embed_peak_relative_update:
+                    token_embed_peak_relative_update = relative_update_rms
+                    token_embed_peak_relative_update_step = audited_step
+                if rms_ratio_to_init >= token_embed_peak_rms_ratio:
+                    token_embed_peak_rms_ratio = rms_ratio_to_init
+                    token_embed_peak_rms_ratio_step = audited_step
+                if rms_ratio_to_init <= token_embed_min_rms_ratio:
+                    token_embed_min_rms_ratio = rms_ratio_to_init
+                    token_embed_min_rms_ratio_step = audited_step
+                should_log_audit_trace = (
+                    audited_step <= 2
+                    or (audited_step & (audited_step - 1)) == 0
+                    or audited_step == args.token_embed_init_audit_steps
+                )
+                if should_log_audit_trace:
+                    log0(
+                        "token_embed_init_audit_trace "
+                        "scope:optimizer_tok target:tok_emb.weight "
+                        f"step:{audited_step} "
+                        f"param_rms:{current_param_rms:.8f} "
+                        f"rms_ratio_to_init:{rms_ratio_to_init:.8f} "
+                        f"update_rms:{update_rms:.8f} "
+                        f"relative_update_rms:{relative_update_rms:.8f} "
+                        f"lr:{optimizer_tok.param_groups[0]['lr']:.8f}"
+                    )
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1481,19 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if token_embed_init_audit_enabled:
+        log0(
+            "token_embed_init_audit_summary "
+            "scope:optimizer_tok target:tok_emb.weight "
+            f"configured_steps:{args.token_embed_init_audit_steps} "
+            f"applied_updates:{token_embed_audit_applied_updates} "
+            f"peak_relative_update_step:{token_embed_peak_relative_update_step} "
+            f"peak_relative_update_rms:{token_embed_peak_relative_update:.8f} "
+            f"peak_rms_ratio_step:{token_embed_peak_rms_ratio_step} "
+            f"peak_rms_ratio_to_init:{token_embed_peak_rms_ratio:.8f} "
+            f"min_rms_ratio_step:{token_embed_min_rms_ratio_step} "
+            f"min_rms_ratio_to_init:{token_embed_min_rms_ratio:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
