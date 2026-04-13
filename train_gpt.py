@@ -1282,31 +1282,6 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    def shared_lr_schedule_mode() -> str:
-        if args.warmdown_iters <= 0:
-            return "disabled"
-        return "wallclock" if max_wallclock_ms is not None else "iteration"
-
-    def shared_lr_trace_steps() -> tuple[int, ...]:
-        late_trace_offsets = (0, 16, 24, 32, 36)
-        steps = {0, 1, 9}
-        if args.warmdown_iters > 0:
-            for offset in late_trace_offsets:
-                steps.add(max(args.warmdown_iters - 1 + offset, 0))
-        return tuple(sorted(steps))
-
-    shared_lr_mode = shared_lr_schedule_mode()
-    shared_lr_trace_step_set = set(shared_lr_trace_steps())
-    shared_lr_trace_steps_str = ",".join(str(step) for step in sorted(shared_lr_trace_step_set))
-    shared_lr_trace_reached: list[int] = []
-    last_realized_lr_mul = 1.0
-    min_realized_lr_mul = 1.0
-
-    log0(
-        f"shared_lr_schedule mode:{shared_lr_mode} warmdown_iters:{args.warmdown_iters} "
-        f"step_semantics:applied_step_zero_based trace_steps:{shared_lr_trace_steps_str}"
-    )
-
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -1412,14 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        last_realized_lr_mul = scale
-        min_realized_lr_mul = min(min_realized_lr_mul, scale)
-        if step in shared_lr_trace_step_set:
-            shared_lr_trace_reached.append(step)
-            log0(
-                f"shared_lr_trace step:{step} lr_mul:{scale:.8f} elapsed_ms:{elapsed_ms:.0f} "
-                f"mode:{shared_lr_mode} warmdown_iters:{args.warmdown_iters}"
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1447,13 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    log0(
-        f"shared_lr_audit mode:{shared_lr_mode} warmdown_iters:{args.warmdown_iters} "
-        f"completed_updates:{step} last_realized_lr_mul:{last_realized_lr_mul:.8f} "
-        f"min_realized_lr_mul:{min_realized_lr_mul:.8f} "
-        f"trace_steps_reached:{','.join(str(s) for s in shared_lr_trace_reached)}"
-    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
