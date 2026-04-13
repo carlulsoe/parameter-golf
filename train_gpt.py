@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1171,6 +1172,14 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.scalar_beta1 < 1.0:
+        raise ValueError(f"SCALAR_BETA1 must be in [0, 1), got {args.scalar_beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1221,6 +1230,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    named_params_by_id = {id(param): name for name, param in base_model.named_parameters()}
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1238,7 +1248,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.scalar_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1262,6 +1272,36 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    optimizer_head_beta1 = (
+        f"{optimizers[1].param_groups[0]['betas'][0]:.5f}" if base_model.lm_head is not None else "inactive"
+    )
+    log0(
+        "optimizer_beta1_scope: "
+        f"optimizer_tok:{optimizer_tok.param_groups[0]['betas'][0]:.5f} "
+        f"optimizer_scalar:{optimizer_scalar.param_groups[0]['betas'][0]:.5f} "
+        f"optimizer_head:{optimizer_head_beta1} "
+        "optimizer_muon:none"
+    )
+    scalar_group_names: list[str] = []
+    scalar_tensor_count = 0
+    scalar_numel = 0
+    scalar_control_tensor_count = 0
+    scalar_control_numel = 0
+    for group in optimizer_scalar.param_groups:
+        for param in group["params"]:
+            name = named_params_by_id.get(id(param), "<unnamed>")
+            scalar_group_names.append(f"{name}:{param.numel()}")
+            scalar_tensor_count += 1
+            scalar_numel += int(param.numel())
+            if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                scalar_control_tensor_count += 1
+                scalar_control_numel += int(param.numel())
+    log0(
+        "optimizer_scalar_group: "
+        f"tensors:{scalar_tensor_count} numel:{scalar_numel} "
+        f"control_tensors:{scalar_control_tensor_count} control_numel:{scalar_control_numel}"
+    )
+    log0(f"optimizer_scalar_membership:{','.join(scalar_group_names)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
