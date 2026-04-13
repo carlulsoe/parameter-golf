@@ -87,6 +87,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_lr_tail_start_step = int(os.environ.get("TOKEN_LR_TAIL_START_STEP", 0))
+    token_lr_tail_steps = int(os.environ.get("TOKEN_LR_TAIL_STEPS", 0))
+    token_lr_tail_target_mult = float(os.environ.get("TOKEN_LR_TAIL_TARGET_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1174,17 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.token_lr_tail_start_step < 0:
+        raise ValueError(f"TOKEN_LR_TAIL_START_STEP must be non-negative, got {args.token_lr_tail_start_step}")
+    if args.token_lr_tail_steps < 0:
+        raise ValueError(f"TOKEN_LR_TAIL_STEPS must be non-negative, got {args.token_lr_tail_steps}")
+    if not 0.0 < args.token_lr_tail_target_mult <= 1.0:
+        raise ValueError(
+            "TOKEN_LR_TAIL_TARGET_MULT must be in (0, 1], "
+            f"got {args.token_lr_tail_target_mult}"
+        )
+    if args.token_lr_tail_steps > 0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_LR_TAIL_* requires TIE_EMBEDDINGS=1 so optimizer_tok stays on the shared token/logit path")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1293,6 +1307,22 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def token_lr_tail_mult(applied_step: int) -> float:
+        if args.token_lr_tail_steps <= 0 or applied_step < args.token_lr_tail_start_step:
+            return 1.0
+        if args.token_lr_tail_steps == 1:
+            return args.token_lr_tail_target_mult
+        tail_last_step = args.token_lr_tail_start_step + args.token_lr_tail_steps - 1
+        if applied_step >= tail_last_step:
+            return args.token_lr_tail_target_mult
+        progress = (applied_step - args.token_lr_tail_start_step) / max(args.token_lr_tail_steps - 1, 1)
+        return 1.0 + (args.token_lr_tail_target_mult - 1.0) * progress
+
+    def optimizer_group_lr_bounds(optimizer: torch.optim.Optimizer) -> tuple[float, float, float, float]:
+        live_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        live_base_lrs = [float(group.get("base_lr", group["lr"])) for group in optimizer.param_groups]
+        return min(live_lrs), max(live_lrs), min(live_base_lrs), max(live_base_lrs)
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1320,6 +1350,19 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    tok_lr_min, tok_lr_max, tok_base_lr_min, tok_base_lr_max = optimizer_group_lr_bounds(optimizer_tok)
+    log0(
+        "token_lr_tail_schedule: "
+        f"scope:optimizer_tok active:{args.token_lr_tail_steps > 0} "
+        f"step_semantics:applied_step_zero_based "
+        f"start_step:{args.token_lr_tail_start_step} "
+        f"tail_steps:{args.token_lr_tail_steps} "
+        f"target_mult:{args.token_lr_tail_target_mult:.5f} "
+        f"tail_end_step:{args.token_lr_tail_start_step + max(args.token_lr_tail_steps - 1, 0)} "
+        f"live_base_lr_min:{tok_base_lr_min:.8f} live_base_lr_max:{tok_base_lr_max:.8f} "
+        f"live_lr_min:{tok_lr_min:.8f} live_lr_max:{tok_lr_max:.8f}"
+    )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1387,6 +1430,9 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        token_tail_mult = token_lr_tail_mult(step)
+        for group in optimizer_tok.param_groups:
+            group["lr"] = group["base_lr"] * scale * token_tail_mult
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1401,9 +1447,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            tok_lr_min, tok_lr_max, tok_base_lr_min, tok_base_lr_max = optimizer_group_lr_bounds(optimizer_tok)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"token_lr_mult:{token_tail_mult:.5f} "
+                f"token_base_lr_min:{tok_base_lr_min:.8f} token_base_lr_max:{tok_base_lr_max:.8f} "
+                f"token_lr_min:{tok_lr_min:.8f} token_lr_max:{tok_lr_max:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1468,18 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    tok_lr_min, tok_lr_max, tok_base_lr_min, tok_base_lr_max = optimizer_group_lr_bounds(optimizer_tok)
+    log0(
+        "token_lr_tail_audit: "
+        f"completed_updates:{step} "
+        f"active:{args.token_lr_tail_steps > 0} "
+        f"start_step:{args.token_lr_tail_start_step} "
+        f"tail_steps:{args.token_lr_tail_steps} "
+        f"target_mult:{args.token_lr_tail_target_mult:.5f} "
+        f"last_applied_mult:{token_lr_tail_mult(max(step - 1, 0)):.5f} "
+        f"live_base_lr_min:{tok_base_lr_min:.8f} live_base_lr_max:{tok_base_lr_max:.8f} "
+        f"live_lr_min:{tok_lr_min:.8f} live_lr_max:{tok_lr_max:.8f}"
     )
 
     # -----------------------------
