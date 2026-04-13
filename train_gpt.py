@@ -58,7 +58,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
-    eval_audit_context_len = int(os.environ.get("EVAL_AUDIT_CONTEXT_LEN", "0"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -281,122 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def eval_val_with_left_context_audit(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    context_len: int,
-) -> tuple[float, float, dict[str, int]]:
-    if args.eval_seq_len <= 0:
-        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if context_len < args.eval_seq_len:
-        raise ValueError(
-            "EVAL_AUDIT_CONTEXT_LEN must be at least EVAL_SEQ_LEN for left-context audit; "
-            f"got EVAL_AUDIT_CONTEXT_LEN={context_len}, EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < context_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one full audit-context sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_AUDIT_CONTEXT_LEN={context_len}"
-        )
-    local_batch_seqs = local_batch_tokens // context_len
-    target_seq_len = args.eval_seq_len
-    total_seqs = (val_tokens.numel() - 1) // target_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
-    extra_left_context = context_len - target_seq_len
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    audit_total_input_tokens = torch.zeros((), device=device, dtype=torch.float64)
-    audit_extra_context_tokens = torch.zeros((), device=device, dtype=torch.float64)
-    audit_short_context_seqs = torch.zeros((), device=device, dtype=torch.float64)
-    audit_full_context_seqs = torch.zeros((), device=device, dtype=torch.float64)
-    eval_model = model.module if isinstance(model, DDP) else model
-    eval_model = getattr(eval_model, "_orig_mod", eval_model)
-
-    model.eval()
-    with torch.inference_mode():
-        batch_seq_start = seq_start
-        while batch_seq_start < seq_end:
-            available_left_context = min(batch_seq_start * target_seq_len, extra_left_context)
-            effective_context_len = target_seq_len + available_left_context
-            if effective_context_len < context_len:
-                batch_seq_end = batch_seq_start + 1
-            else:
-                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            batch_size = batch_seq_end - batch_seq_start
-            batch_tokens = torch.empty((batch_size, effective_context_len + 1), device=device, dtype=torch.int64)
-            for row, seq_idx in enumerate(range(batch_seq_start, batch_seq_end)):
-                target_start = seq_idx * target_seq_len
-                context_start = target_start - min(target_start, extra_left_context)
-                context_end = target_start + target_seq_len
-                batch_tokens[row].copy_(
-                    val_tokens[context_start : context_end + 1].to(
-                        device=device, dtype=torch.int64, non_blocking=True
-                    )
-                )
-            x = batch_tokens[:, :-1]
-            y = batch_tokens[:, 1:]
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = eval_model.forward_logits(x)
-            losses = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y.reshape(-1),
-                reduction="none",
-            ).view(batch_size, effective_context_len)
-            target_losses = losses[:, available_left_context:]
-            val_loss_sum += target_losses.to(torch.float64).sum()
-            val_token_count += float(target_losses.numel())
-            prev_ids = x[:, available_left_context:].reshape(-1)
-            tgt_ids = y[:, available_left_context:].reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
-            audit_total_input_tokens += float(x.numel())
-            audit_extra_context_tokens += float(batch_size * available_left_context)
-            if effective_context_len < context_len:
-                audit_short_context_seqs += float(batch_size)
-            else:
-                audit_full_context_seqs += float(batch_size)
-            batch_seq_start = batch_seq_end
-
-    if dist.is_available() and dist.is_initialized():
-        for tensor in (
-            val_loss_sum,
-            val_token_count,
-            val_byte_count,
-            audit_total_input_tokens,
-            audit_extra_context_tokens,
-            audit_short_context_seqs,
-            audit_full_context_seqs,
-        ):
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    audit_stats = {
-        "target_tokens": int(val_token_count.item()),
-        "target_seqs": int(total_seqs),
-        "effective_context_tokens": int(audit_total_input_tokens.item()),
-        "extra_context_tokens": int(audit_extra_context_tokens.item()),
-        "short_context_seqs": int(audit_short_context_seqs.item()),
-        "full_context_seqs": int(audit_full_context_seqs.item()),
-    }
-    model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte), audit_stats
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1170,7 +1053,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1186,17 +1069,14 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        targets = target_ids.reshape(-1)
-        logits = self.forward_logits(input_ids)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1291,13 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.eval_audit_context_len < 0:
-        raise ValueError(f"EVAL_AUDIT_CONTEXT_LEN must be non-negative, got {args.eval_audit_context_len}")
-    if 0 < args.eval_audit_context_len < args.eval_seq_len:
-        raise ValueError(
-            "EVAL_AUDIT_CONTEXT_LEN must be 0 or at least EVAL_SEQ_LEN; "
-            f"got EVAL_AUDIT_CONTEXT_LEN={args.eval_audit_context_len}, EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1305,13 +1178,6 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    if args.eval_audit_context_len > 0:
-        log0(
-            "eval_context_audit: "
-            f"enabled target_seq_len:{args.eval_seq_len} "
-            f"context_len:{args.eval_audit_context_len} "
-            "mode:final_only_matched_targets batch_basis:effective_context_len"
-        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1685,39 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    if args.eval_audit_context_len > 0:
-        torch.cuda.synchronize()
-        t_audit_eval = time.perf_counter()
-        audit_val_loss, audit_val_bpb, audit_stats = eval_val_with_left_context_audit(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            context_len=args.eval_audit_context_len,
-        )
-        torch.cuda.synchronize()
-        log0(
-            "final_int8_zlib_roundtrip_context_audit "
-            f"val_loss:{audit_val_loss:.4f} val_bpb:{audit_val_bpb:.4f} "
-            f"target_seq_len:{args.eval_seq_len} context_len:{args.eval_audit_context_len} "
-            f"target_tokens:{audit_stats['target_tokens']} target_seqs:{audit_stats['target_seqs']} "
-            f"effective_context_tokens:{audit_stats['effective_context_tokens']} "
-            f"extra_context_tokens:{audit_stats['extra_context_tokens']} "
-            f"short_context_seqs:{audit_stats['short_context_seqs']} "
-            f"full_context_seqs:{audit_stats['full_context_seqs']} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_audit_eval):.0f}ms"
-        )
-        log0(
-            "final_int8_zlib_roundtrip_context_audit_exact "
-            f"val_loss:{audit_val_loss:.8f} val_bpb:{audit_val_bpb:.8f} "
-            f"target_seq_len:{args.eval_seq_len} context_len:{args.eval_audit_context_len}"
-        )
 
     if distributed:
         dist.destroy_process_group()
