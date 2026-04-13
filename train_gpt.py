@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_update_audit_steps = int(os.environ.get("TOKEN_UPDATE_AUDIT_STEPS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -280,6 +281,12 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def should_log_audit_step(step: int, max_steps: int) -> bool:
+    if max_steps <= 0 or step <= 0 or step > max_steps:
+        return False
+    return (step & (step - 1) == 0) or step == max_steps
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1171,6 +1178,10 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.token_update_audit_steps < 0:
+        raise ValueError(f"TOKEN_UPDATE_AUDIT_STEPS must be non-negative, got {args.token_update_audit_steps}")
+    if args.token_update_audit_steps > 0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_UPDATE_AUDIT_STEPS requires TIE_EMBEDDINGS=1 because the audit targets the shared embedding/logit matrix")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1269,6 +1280,15 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    token_init_param_rms = 0.0
+    if args.token_update_audit_steps > 0:
+        token_init_param_rms = base_model.tok_emb.weight.detach().float().square().mean().sqrt().item()
+        log0(
+            "token_update_audit "
+            f"scope:optimizer_tok target:tok_emb.weight configured_steps:{args.token_update_audit_steps} "
+            f"tie_embeddings:{args.tie_embeddings} tied_embed_init_std:{args.tied_embed_init_std:.8f} "
+            f"initial_param_rms:{token_init_param_rms:.8f}"
+        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1327,6 +1347,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    token_audit_max_relative_update_rms = 0.0
+    token_audit_max_rms_ratio_drift = 0.0
+    token_audit_max_global_grad_norm = 0.0
+    token_audit_clip_trigger_steps = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1388,10 +1412,45 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        audited_step = step + 1
+        run_token_audit = args.token_update_audit_steps > 0 and audited_step <= args.token_update_audit_steps
+        token_weight_before = None
+        token_param_rms_before = None
+        token_grad_rms_preclip = None
+        if run_token_audit:
+            token_weight_before = base_model.tok_emb.weight.detach().float().clone()
+            token_param_rms_before = token_weight_before.square().mean().sqrt().item()
+            tok_grad = base_model.tok_emb.weight.grad
+            if tok_grad is None:
+                raise RuntimeError(f"tok_emb.weight.grad is None on audited step {audited_step}")
+            token_grad_rms_preclip = tok_grad.detach().float().square().mean().sqrt().item()
+
+        global_grad_norm = None
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            global_grad_norm = float(torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm).item())
         for opt in optimizers:
             opt.step()
+        if run_token_audit:
+            token_weight_after = base_model.tok_emb.weight.detach().float()
+            token_update_rms = token_weight_after.sub(token_weight_before).square().mean().sqrt().item()
+            token_param_rms_after = token_weight_after.square().mean().sqrt().item()
+            relative_update_rms = token_update_rms / max(token_param_rms_before, 1e-12)
+            rms_ratio_to_init = token_param_rms_after / max(token_init_param_rms, 1e-12)
+            global_grad_norm_value = global_grad_norm if global_grad_norm is not None else -1.0
+            clip_triggered = bool(global_grad_norm is not None and global_grad_norm > args.grad_clip_norm)
+            token_audit_max_relative_update_rms = max(token_audit_max_relative_update_rms, relative_update_rms)
+            token_audit_max_rms_ratio_drift = max(token_audit_max_rms_ratio_drift, abs(rms_ratio_to_init - 1.0))
+            token_audit_max_global_grad_norm = max(token_audit_max_global_grad_norm, max(global_grad_norm_value, 0.0))
+            token_audit_clip_trigger_steps += int(clip_triggered)
+            if should_log_audit_step(audited_step, args.token_update_audit_steps):
+                log0(
+                    "token_update_audit_trace "
+                    f"step:{audited_step} token_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+                    f"param_rms_before:{token_param_rms_before:.8f} param_rms_after:{token_param_rms_after:.8f} "
+                    f"rms_ratio_to_init:{rms_ratio_to_init:.8f} grad_rms_preclip:{token_grad_rms_preclip:.8f} "
+                    f"update_rms:{token_update_rms:.8f} relative_update_rms:{relative_update_rms:.8f} "
+                    f"global_grad_norm:{global_grad_norm_value:.8f} clip_triggered:{int(clip_triggered)}"
+                )
         zero_grad_all()
 
         step += 1
@@ -1414,6 +1473,17 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if args.token_update_audit_steps > 0:
+        log0(
+            "token_update_audit_summary "
+            f"configured_steps:{args.token_update_audit_steps} completed_steps:{min(step, args.token_update_audit_steps)} "
+            f"max_relative_update_rms:{token_audit_max_relative_update_rms:.8f} "
+            f"max_abs_rms_ratio_drift:{token_audit_max_rms_ratio_drift:.8f} "
+            f"max_global_grad_norm:{token_audit_max_global_grad_norm:.8f} "
+            f"clip_trigger_steps:{token_audit_clip_trigger_steps} "
+            f"global_clip_enabled:{int(args.grad_clip_norm > 0)}"
+        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
