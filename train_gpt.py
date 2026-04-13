@@ -87,8 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    token_startup_grad_clip_norm = float(os.environ.get("TOKEN_STARTUP_GRAD_CLIP_NORM", 0.0))
-    token_startup_grad_clip_steps = int(os.environ.get("TOKEN_STARTUP_GRAD_CLIP_STEPS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1271,20 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    token_startup_grad_clip_enabled = (
-        args.token_startup_grad_clip_norm > 0.0 and args.token_startup_grad_clip_steps > 0
-    )
-    token_startup_grad_clip_applied_updates = 0
-    token_startup_grad_clip_last_update = 0
-    if token_startup_grad_clip_enabled:
-        log0(
-            "token_startup_grad_clip "
-            f"scope:optimizer_tok target:tok_emb.weight tie_embeddings:{int(args.tie_embeddings)} "
-            f"token_param_tensors:1 token_param_numel:{base_model.tok_emb.weight.numel()} "
-            f"clip_norm:{args.token_startup_grad_clip_norm:.5f} "
-            f"clip_steps:{args.token_startup_grad_clip_steps} "
-            f"global_grad_clip_norm:{args.grad_clip_norm:.5f}"
-        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1406,10 +1390,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        if token_startup_grad_clip_enabled and step < args.token_startup_grad_clip_steps:
-            torch.nn.utils.clip_grad_norm_([base_model.tok_emb.weight], args.token_startup_grad_clip_norm)
-            token_startup_grad_clip_applied_updates += 1
-            token_startup_grad_clip_last_update = step + 1
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1439,16 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if token_startup_grad_clip_enabled:
-        log0(
-            "token_startup_grad_clip_audit "
-            "scope:optimizer_tok target:tok_emb.weight "
-            f"configured_steps:{args.token_startup_grad_clip_steps} "
-            f"applied_updates:{token_startup_grad_clip_applied_updates} "
-            f"completed_updates:{step} "
-            f"clip_window_completed:{int(step >= args.token_startup_grad_clip_steps)} "
-            f"last_clipped_update:{token_startup_grad_clip_last_update}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
