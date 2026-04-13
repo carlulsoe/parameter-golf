@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    global_lr_audit_steps = os.environ.get("GLOBAL_LR_AUDIT_STEPS", "")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1270,25 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    global_lr_audit_steps: list[int] = []
-    global_lr_audit_steps_raw = args.global_lr_audit_steps.strip()
-    if global_lr_audit_steps_raw:
-        for raw_step in global_lr_audit_steps_raw.split(","):
-            raw_step = raw_step.strip()
-            if not raw_step:
-                continue
-            audit_step = int(raw_step)
-            if audit_step <= 0:
-                raise ValueError(f"GLOBAL_LR_AUDIT_STEPS entries must be positive, got {audit_step}")
-            global_lr_audit_steps.append(audit_step)
-        global_lr_audit_steps = sorted(set(global_lr_audit_steps))
-    global_lr_audit_steps_set = set(global_lr_audit_steps)
-    global_lr_audit_reached_steps: list[int] = []
-    log0(
-        f"global_lr_audit enabled:{bool(global_lr_audit_steps)} "
-        f"steps:{','.join(str(step) for step in global_lr_audit_steps) if global_lr_audit_steps else 'none'} "
-        f"step_semantics:applied_step_one_based scope:shared_unfloored"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1347,7 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_unfloored_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1388,14 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        applied_step = step + 1
-        last_unfloored_scale = scale
-        if applied_step in global_lr_audit_steps_set:
-            global_lr_audit_reached_steps.append(applied_step)
-            log0(
-                f"global_lr_audit_trace step:{applied_step} elapsed_ms:{elapsed_ms:.0f} "
-                f"unfloored_mult:{scale:.5f}"
-            )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1447,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"global_lr_audit_summary enabled:{bool(global_lr_audit_steps)} "
-        f"configured_steps:{','.join(str(step) for step in global_lr_audit_steps) if global_lr_audit_steps else 'none'} "
-        f"reached_steps:{','.join(str(step) for step in global_lr_audit_reached_steps) if global_lr_audit_reached_steps else 'none'} "
-        f"completed_updates:{step} last_unfloored_mult:{last_unfloored_scale:.5f}"
     )
 
     # -----------------------------
