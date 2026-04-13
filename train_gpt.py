@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_lr_warmup_steps = int(os.environ.get("TOKEN_LR_WARMUP_STEPS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1281,6 +1282,8 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    if args.token_lr_warmup_steps < 0:
+        raise ValueError(f"TOKEN_LR_WARMUP_STEPS must be non-negative, got {args.token_lr_warmup_steps}")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1292,6 +1295,20 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def token_lr_mul(completed_updates: int) -> float:
+        if args.token_lr_warmup_steps <= 0:
+            return 1.0
+        return min(completed_updates / args.token_lr_warmup_steps, 1.0)
+
+    if args.token_lr_warmup_steps > 0:
+        log0(
+            "token_lr_schedule: "
+            f"scope:optimizer_tok token_param_tensors:1 "
+            f"token_param_numel:{base_model.tok_emb.weight.numel()} "
+            f"base_lr:{token_lr:.5f} warmup_steps:{args.token_lr_warmup_steps} "
+            f"step1_mul:{token_lr_mul(1):.5f}"
+        )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1331,6 +1348,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    token_warmup_active_steps = 0
+    last_token_lr_mul = 1.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1384,9 +1403,15 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
+        current_update = step + 1
+        token_scale = token_lr_mul(current_update)
+        last_token_lr_mul = token_scale
+        if token_scale < 1.0:
+            token_warmup_active_steps += 1
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+                group_scale = token_scale if opt is optimizer_tok else 1.0
+                group["lr"] = group["base_lr"] * scale * group_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1405,6 +1430,15 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+        if args.token_lr_warmup_steps > 0 and (
+            (((step & (step - 1)) == 0) and step <= args.token_lr_warmup_steps)
+            or step == args.token_lr_warmup_steps
+        ):
+            log0(
+                "token_lr_warmup_trace: "
+                f"step:{step} scope:optimizer_tok token_lr_mul:{token_scale:.5f} "
+                f"token_lr:{optimizer_tok.param_groups[0]['lr']:.5f} global_lr_mul:{scale:.5f}"
+            )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1453,15 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.token_lr_warmup_steps > 0:
+        log0(
+            "token_lr_warmup_audit: "
+            f"scope:optimizer_tok completed_updates:{step} "
+            f"warmup_steps:{args.token_lr_warmup_steps} "
+            f"warmup_fraction_completed:{min(step / args.token_lr_warmup_steps, 1.0):.5f} "
+            f"active_steps:{token_warmup_active_steps} "
+            f"last_token_lr_mul:{last_token_lr_mul:.5f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
