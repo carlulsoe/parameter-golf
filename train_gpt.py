@@ -79,6 +79,8 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_lr_floor_mult = float(os.environ.get("SCALAR_LR_FLOOR_MULT", 0.0))
+    scalar_lr_floor_start_step = int(os.environ.get("SCALAR_LR_FLOOR_START_STEP", 0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1262,6 +1264,21 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if not 0.0 <= args.scalar_lr_floor_mult <= 1.0:
+        raise ValueError(
+            f"SCALAR_LR_FLOOR_MULT must be in [0, 1], got {args.scalar_lr_floor_mult}"
+        )
+    if args.scalar_lr_floor_start_step < 0:
+        raise ValueError(
+            f"SCALAR_LR_FLOOR_START_STEP must be non-negative, got {args.scalar_lr_floor_start_step}"
+        )
+    if args.scalar_lr_floor_mult > 0.0:
+        log0(
+            "scalar_lr_floor: "
+            f"enabled:True start_step:{args.scalar_lr_floor_start_step} "
+            f"floor_mult:{args.scalar_lr_floor_mult:.5f} "
+            "step_semantics:applied_step_one_based scope:optimizer_scalar"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1327,6 +1344,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    scalar_lr_floor_first_activation_step: int | None = None
+    last_scalar_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1386,19 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        applied_step = step + 1
+        scalar_scale = scale
+        if args.scalar_lr_floor_mult > 0.0 and applied_step >= args.scalar_lr_floor_start_step:
+            scalar_scale = max(scale, args.scalar_lr_floor_mult)
+            if scalar_lr_floor_first_activation_step is None and scalar_scale > scale:
+                scalar_lr_floor_first_activation_step = applied_step
+                log0(
+                    "scalar_lr_floor_activation: "
+                    f"first_step:{scalar_lr_floor_first_activation_step} "
+                    f"shared_lr_mult:{scale:.5f} "
+                    f"scalar_lr_mult:{scalar_scale:.5f}"
+                )
+        last_scalar_scale = scalar_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1419,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_scalar.param_groups:
+            group["lr"] = group["base_lr"] * scalar_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1401,10 +1435,16 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.scalar_lr_floor_mult > 0.0:
+                train_msg += (
+                    f" scalar_lr_mult:{scalar_scale:.5f} "
+                    f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
+                )
+            log0(train_msg)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1459,15 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.scalar_lr_floor_mult > 0.0:
+        log0(
+            "scalar_lr_floor_audit: "
+            f"configured_start_step:{args.scalar_lr_floor_start_step} "
+            f"floor_mult:{args.scalar_lr_floor_mult:.5f} "
+            f"first_activation_step:{scalar_lr_floor_first_activation_step if scalar_lr_floor_first_activation_step is not None else 'none'} "
+            f"completed_updates:{step} "
+            f"last_scalar_lr_mult:{last_scalar_scale:.5f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
