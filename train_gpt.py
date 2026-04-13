@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1168,10 +1167,6 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    if not 0.0 <= args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not 0.0 <= args.token_beta2 < 1.0:
-        raise ValueError(f"TOKEN_BETA2 must be in [0, 1), got {args.token_beta2}")
     if args.train_seq_len <= 0:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
@@ -1226,12 +1221,10 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 override requires TIE_EMBEDDINGS=1")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1276,26 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        "optimizer_tok audit: "
-        f"optimizer:Adam tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_only' if args.tie_embeddings else 'input_embedding_only'} "
-        f"beta1:{args.beta1:.5f} beta2:{args.token_beta2:.5f} "
-        f"tensor_count:1 names:tok_emb.weight"
-    )
-
-    def format_betas(opt: torch.optim.Optimizer) -> str:
-        beta1, beta2 = opt.param_groups[0]["betas"]
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def log_optimizer_betas(stage: str) -> None:
-        head_betas = format_betas(optimizer_head) if base_model.lm_head is not None else "inactive"
-        log0(
-            f"optimizer_betas stage:{stage} "
-            f"tok:{format_betas(optimizer_tok)} head:{head_betas} scalar:{format_betas(optimizer_scalar)}"
-        )
-
-    log_optimizer_betas("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1347,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_optimizer_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1447,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
