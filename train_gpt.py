@@ -58,6 +58,12 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    final_eval_max_context = int(
+        os.environ.get(
+            "FINAL_EVAL_MAX_CONTEXT",
+            os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)),
+        )
+    )
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -266,6 +272,122 @@ def eval_val(
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def gpt_logits(model: GPT, input_ids: Tensor) -> Tensor:
+    x = model.tok_emb(input_ids)
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+
+    for i in range(model.num_encoder_layers):
+        x = model.blocks[i](x, x0)
+        skips.append(x)
+    for i in range(model.num_decoder_layers):
+        if skips:
+            x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        x = model.blocks[model.num_encoder_layers + i](x, x0)
+
+    x = model.final_norm(x)
+    if model.tie_embeddings:
+        logits_proj = F.linear(x, model.tok_emb.weight)
+    else:
+        if model.lm_head is None:
+            raise RuntimeError("lm_head is required when tie_embeddings=False")
+        logits_proj = model.lm_head(x)
+    return model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+
+
+def eval_val_richer_context(
+    args: Hyperparameters,
+    model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    if args.final_eval_max_context <= args.eval_seq_len:
+        raise ValueError(
+            "FINAL_EVAL_MAX_CONTEXT must exceed EVAL_SEQ_LEN for richer-context final eval; "
+            f"got FINAL_EVAL_MAX_CONTEXT={args.final_eval_max_context}, EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.final_eval_max_context:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one richer-context sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, FINAL_EVAL_MAX_CONTEXT={args.final_eval_max_context}"
+        )
+    local_batch_seqs = max(local_batch_tokens // args.final_eval_max_context, 1)
+    total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            batch_x: list[Tensor] = []
+            batch_y: list[Tensor] = []
+            batch_score_mask: list[Tensor] = []
+            max_context_len = 0
+            for seq_idx in range(batch_seq_start, batch_seq_end):
+                raw_end = (seq_idx + 1) * args.eval_seq_len + 1
+                raw_start = max(0, raw_end - (args.final_eval_max_context + 1))
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1]
+                y = local[1:]
+                context_len = int(x.numel())
+                score_mask = torch.zeros(context_len, device=device, dtype=torch.bool)
+                score_mask[-args.eval_seq_len :] = True
+                batch_x.append(x)
+                batch_y.append(y)
+                batch_score_mask.append(score_mask)
+                max_context_len = max(max_context_len, context_len)
+
+            x_padded = torch.zeros((len(batch_x), max_context_len), device=device, dtype=torch.int64)
+            y_padded = torch.zeros((len(batch_y), max_context_len), device=device, dtype=torch.int64)
+            score_mask = torch.zeros((len(batch_score_mask), max_context_len), device=device, dtype=torch.bool)
+            for row_idx, (x, y, mask) in enumerate(zip(batch_x, batch_y, batch_score_mask, strict=True)):
+                context_len = x.numel()
+                x_padded[row_idx, :context_len] = x
+                y_padded[row_idx, :context_len] = y
+                score_mask[row_idx, :context_len] = mask
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = gpt_logits(model, x_padded)
+            token_losses = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_padded.reshape(-1),
+                reduction="none",
+            ).reshape_as(y_padded)
+            masked_losses = token_losses[score_mask]
+            batch_token_count = float(masked_losses.numel())
+            val_loss_sum += masked_losses.to(torch.float64).sum()
+            val_token_count += batch_token_count
+            prev_ids = x_padded[score_mask]
+            tgt_ids = y_padded[score_mask]
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
@@ -1171,6 +1293,10 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.final_eval_max_context < args.eval_seq_len:
+        raise ValueError(
+            f"FINAL_EVAL_MAX_CONTEXT must be >= EVAL_SEQ_LEN, got {args.final_eval_max_context} < {args.eval_seq_len}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1394,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.final_eval_max_context > args.eval_seq_len:
+        log0(
+            f"final_eval_richer_context:enabled eval_seq_len:{args.eval_seq_len} "
+            f"final_eval_max_context:{args.final_eval_max_context}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1551,6 +1682,32 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.final_eval_max_context > args.eval_seq_len:
+        torch.cuda.synchronize()
+        t_qeval_richer = time.perf_counter()
+        q_val_loss_richer, q_val_bpb_richer = eval_val_richer_context(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip_richer_context val_loss:{q_val_loss_richer:.4f} "
+            f"val_bpb:{q_val_bpb_richer:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval_richer):.0f}ms "
+            f"eval_seq_len:{args.eval_seq_len} final_eval_max_context:{args.final_eval_max_context}"
+        )
+        log0(
+            f"final_int8_zlib_roundtrip_richer_context_exact "
+            f"val_loss:{q_val_loss_richer:.8f} val_bpb:{q_val_bpb_richer:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
