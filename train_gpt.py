@@ -83,6 +83,9 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    scalar_lr_warmdown_start_step = int(os.environ.get("SCALAR_LR_WARMDOWN_START_STEP", 0))
+    scalar_lr_warmdown_steps = int(os.environ.get("SCALAR_LR_WARMDOWN_STEPS", 0))
+    scalar_lr_warmdown_target = float(os.environ.get("SCALAR_LR_WARMDOWN_TARGET", 1.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -466,6 +469,37 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+def summarize_optimizer_param_groups(
+    optimizer: torch.optim.Optimizer,
+    param_name_by_id: dict[int, str],
+) -> dict[str, object]:
+    total_tensors = 0
+    total_numel = 0
+    group_summaries: list[str] = []
+    ordered_names: list[str] = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        params = list(group["params"])
+        group_tensor_count = len(params)
+        group_numel = sum(int(param.numel()) for param in params)
+        total_tensors += group_tensor_count
+        total_numel += group_numel
+        group_members: list[str] = []
+        for param in params:
+            name = param_name_by_id.get(id(param), f"<unnamed_{id(param)}>")
+            ordered_names.append(name)
+            group_members.append(f"{name}:{int(param.numel())}")
+        group_summaries.append(
+            f"group{group_idx}_tensors:{group_tensor_count} "
+            f"group{group_idx}_numel:{group_numel} "
+            f"group{group_idx}_members:{','.join(group_members)}"
+        )
+    return {
+        "tensor_count": total_tensors,
+        "numel": total_numel,
+        "ordered_names": ordered_names,
+        "summary": " ".join(group_summaries),
+    }
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1183,6 +1217,17 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.scalar_lr_warmdown_start_step < 0:
+        raise ValueError(
+            f"SCALAR_LR_WARMDOWN_START_STEP must be non-negative, got {args.scalar_lr_warmdown_start_step}"
+        )
+    if args.scalar_lr_warmdown_steps < 0:
+        raise ValueError(f"SCALAR_LR_WARMDOWN_STEPS must be non-negative, got {args.scalar_lr_warmdown_steps}")
+    if not 0.0 <= args.scalar_lr_warmdown_target <= 1.0:
+        raise ValueError(
+            f"SCALAR_LR_WARMDOWN_TARGET must be in [0, 1], got {args.scalar_lr_warmdown_target}"
+        )
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1200,6 +1245,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1253,6 +1299,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    optimizer_scalar_scope = summarize_optimizer_param_groups(optimizer_scalar, param_name_by_id)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1267,6 +1314,21 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"scalar_lr_warmdown_start_step:{args.scalar_lr_warmdown_start_step} "
+        f"scalar_lr_warmdown_steps:{args.scalar_lr_warmdown_steps} "
+        f"scalar_lr_warmdown_target:{args.scalar_lr_warmdown_target:.5f}"
+    )
+    log0(
+        "optimizer_scalar_group: "
+        f"tensors:{optimizer_scalar_scope['tensor_count']} "
+        f"numel:{optimizer_scalar_scope['numel']}"
+    )
+    log0(
+        "optimizer_scalar_param_groups: "
+        f"{optimizer_scalar_scope['summary']} "
+        f"ordered_names:{','.join(str(name) for name in optimizer_scalar_scope['ordered_names'])}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1292,6 +1354,15 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def scalar_lr_mul(step: int) -> float:
+        if args.scalar_lr_warmdown_steps <= 0:
+            return 1.0
+        if step < args.scalar_lr_warmdown_start_step:
+            return 1.0
+        progress = min(step - args.scalar_lr_warmdown_start_step, args.scalar_lr_warmdown_steps)
+        frac = progress / max(args.scalar_lr_warmdown_steps, 1)
+        return 1.0 + (args.scalar_lr_warmdown_target - 1.0) * frac
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1331,6 +1402,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    last_scalar_lr_mult = 1.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1367,6 +1439,8 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        scalar_scale = scalar_lr_mul(step)
+        last_scalar_lr_mult = scalar_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1461,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_scalar.param_groups:
+            group["lr"] = group["base_lr"] * scale * scalar_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1403,7 +1479,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"scalar_lr_mult:{scalar_scale:.5f} scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1495,19 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    optimizer_scalar_scope_final = summarize_optimizer_param_groups(optimizer_scalar, param_name_by_id)
+    log0(
+        "scalar_lr_warmdown_audit: "
+        f"completed_updates:{step} "
+        f"last_scalar_lr_mult:{last_scalar_lr_mult:.5f} "
+        f"tensors:{optimizer_scalar_scope_final['tensor_count']} "
+        f"numel:{optimizer_scalar_scope_final['numel']}"
+    )
+    log0(
+        "optimizer_scalar_param_groups_final: "
+        f"{optimizer_scalar_scope_final['summary']} "
+        f"ordered_names:{','.join(str(name) for name in optimizer_scalar_scope_final['ordered_names'])}"
     )
 
     # -----------------------------
