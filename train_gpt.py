@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    embed_grad_clip_norm = float(os.environ.get("EMBED_GRAD_CLIP_NORM", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.embed_grad_clip_norm < 0.0:
+        raise ValueError(f"EMBED_GRAD_CLIP_NORM must be non-negative, got {args.embed_grad_clip_norm}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1263,6 +1266,14 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"optimizer_betas:beta1:{args.beta1} beta2:{args.beta2} adam_eps:{args.adam_eps:.0e} "
+        f"embed_grad_clip_norm:{args.embed_grad_clip_norm} global_grad_clip_norm:{args.grad_clip_norm}"
+    )
+    log0(
+        f"embed_grad_clip_scope:tok_emb_only embed_param_tensors:1 "
+        f"embed_param_numel:{base_model.tok_emb.weight.numel()}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1327,6 +1338,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    embed_grad_clip_trigger_steps = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1388,6 +1400,11 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        if args.embed_grad_clip_norm > 0 and base_model.tok_emb.weight.grad is not None:
+            embed_grad_norm = float(base_model.tok_emb.weight.grad.detach().float().norm().item())
+            if embed_grad_norm > args.embed_grad_clip_norm:
+                embed_grad_clip_trigger_steps += 1
+            torch.nn.utils.clip_grad_norm_([base_model.tok_emb.weight], args.embed_grad_clip_norm)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1419,6 +1436,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.embed_grad_clip_norm > 0:
+        log0(
+            f"embed_grad_clip_summary:threshold:{args.embed_grad_clip_norm} "
+            f"triggered_steps:{embed_grad_clip_trigger_steps} total_steps:{step}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
