@@ -58,6 +58,8 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    overlap_eval_prefix_tokens = int(os.environ.get("OVERLAP_EVAL_PREFIX_TOKENS", 0))
+    overlap_eval_score_tokens = int(os.environ.get("OVERLAP_EVAL_SCORE_TOKENS", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -266,6 +268,101 @@ def eval_val(
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_overlap_audit(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    prefix_tokens: int,
+    score_tokens: int,
+) -> tuple[float, float]:
+    if prefix_tokens <= 0:
+        raise ValueError(f"OVERLAP_EVAL_PREFIX_TOKENS must be positive when enabled, got {prefix_tokens}")
+    if score_tokens <= 0:
+        raise ValueError(f"OVERLAP_EVAL_SCORE_TOKENS must be positive when enabled, got {score_tokens}")
+    if (val_tokens.numel() - 1) % score_tokens != 0:
+        raise ValueError(
+            f"Validation tokens must be divisible by OVERLAP_EVAL_SCORE_TOKENS={score_tokens}, "
+            f"got {val_tokens.numel() - 1}"
+        )
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    window_tokens = prefix_tokens + score_tokens
+    if local_batch_tokens < window_tokens:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one overlap-audit window per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, window_tokens={window_tokens}"
+        )
+    local_batch_windows = max(local_batch_tokens // window_tokens, 1)
+    total_seqs = (val_tokens.numel() - 1) // score_tokens
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        if seq_start < seq_end and seq_start == 0:
+            raw_end = score_tokens + 1
+            local = val_tokens[:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(1, score_tokens)
+            y = local[1:].reshape(1, score_tokens)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+            seq_start = 1
+
+        for batch_seq_start in range(seq_start, seq_end, local_batch_windows):
+            batch_seq_end = min(batch_seq_start + local_batch_windows, seq_end)
+            raw_start = batch_seq_start * score_tokens - prefix_tokens
+            raw_end = batch_seq_end * score_tokens + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            num_windows = batch_seq_end - batch_seq_start
+            full = local.unfold(0, window_tokens + 1, score_tokens)
+            x_full = full[:, :-1]
+            y_full = full[:, 1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                full_loss = model(x_full, y_full).detach()
+                prefix_loss = model(x_full[:, :prefix_tokens], y_full[:, :prefix_tokens]).detach()
+            full_token_count = float(y_full.numel())
+            prefix_token_count = float(num_windows * prefix_tokens)
+            val_loss_sum += (
+                full_loss.to(torch.float64) * full_token_count - prefix_loss.to(torch.float64) * prefix_token_count
+            )
+            batch_token_count = float(num_windows * score_tokens)
+            val_token_count += batch_token_count
+            prev_ids = x_full[:, prefix_tokens:].reshape(-1)
+            tgt_ids = y_full[:, prefix_tokens:].reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
@@ -1171,6 +1268,18 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.overlap_eval_prefix_tokens < 0:
+        raise ValueError(
+            f"OVERLAP_EVAL_PREFIX_TOKENS must be non-negative, got {args.overlap_eval_prefix_tokens}"
+        )
+    if args.overlap_eval_score_tokens < 0:
+        raise ValueError(
+            f"OVERLAP_EVAL_SCORE_TOKENS must be non-negative, got {args.overlap_eval_score_tokens}"
+        )
+    if (args.overlap_eval_prefix_tokens == 0) != (args.overlap_eval_score_tokens == 0):
+        raise ValueError(
+            "OVERLAP_EVAL_PREFIX_TOKENS and OVERLAP_EVAL_SCORE_TOKENS must both be zero or both be positive"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1377,13 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.overlap_eval_prefix_tokens > 0:
+        log0(
+            "overlap_eval_audit:"
+            f"enabled prefix_tokens:{args.overlap_eval_prefix_tokens} "
+            f"score_tokens:{args.overlap_eval_score_tokens} "
+            f"live_metric:reset_eval_seq_len_{args.eval_seq_len}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1551,6 +1667,39 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.overlap_eval_prefix_tokens > 0:
+        torch.cuda.synchronize()
+        t_qaudit = time.perf_counter()
+        audit_val_loss, audit_val_bpb = eval_val_overlap_audit(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            prefix_tokens=args.overlap_eval_prefix_tokens,
+            score_tokens=args.overlap_eval_score_tokens,
+        )
+        torch.cuda.synchronize()
+        log0(
+            "final_int8_zlib_roundtrip_overlap_audit "
+            f"prefix_tokens:{args.overlap_eval_prefix_tokens} "
+            f"score_tokens:{args.overlap_eval_score_tokens} "
+            f"val_loss:{audit_val_loss:.4f} val_bpb:{audit_val_bpb:.4f} "
+            f"delta_vs_reset_bpb:{audit_val_bpb - q_val_bpb:+.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qaudit):.0f}ms"
+        )
+        log0(
+            "final_int8_zlib_roundtrip_overlap_audit_exact "
+            f"prefix_tokens:{args.overlap_eval_prefix_tokens} "
+            f"score_tokens:{args.overlap_eval_score_tokens} "
+            f"val_loss:{audit_val_loss:.8f} val_bpb:{audit_val_bpb:.8f} "
+            f"delta_vs_reset_bpb:{audit_val_bpb - q_val_bpb:+.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
