@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    resume_train_loader_after_warmup = bool(int(os.environ.get("RESUME_TRAIN_LOADER_AFTER_WARMUP", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -795,25 +794,6 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
-    def cursor(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "token_pos": self.pos,
-        }
-
-    def set_cursor(self, cursor: dict[str, int]) -> None:
-        file_idx = int(cursor["file_idx"])
-        token_pos = int(cursor["token_pos"])
-        if not 0 <= file_idx < len(self.files):
-            raise ValueError(f"TokenStream cursor file_idx out of range: {file_idx}")
-        self.file_idx = file_idx
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        if not 0 <= token_pos <= self.tokens.numel():
-            raise ValueError(
-                f"TokenStream cursor token_pos out of range for shard {self.files[self.file_idx].name}: {token_pos}"
-            )
-        self.pos = token_pos
-
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
@@ -837,27 +817,6 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
-
-    def cursor(self) -> dict[str, int]:
-        stream_cursor = self.stream.cursor()
-        return {
-            "file_idx": int(stream_cursor["file_idx"]),
-            "token_pos": int(stream_cursor["token_pos"]),
-        }
-
-    def set_cursor(self, cursor: dict[str, int]) -> None:
-        self.stream.set_cursor(cursor)
-
-    def describe_cursor(self) -> str:
-        cursor = self.cursor()
-        file_idx = int(cursor["file_idx"])
-        return (
-            f"shard_idx:{file_idx} shard:{self.stream.files[file_idx].name} "
-            f"token_pos:{int(cursor['token_pos'])}"
-        )
-
-    def shard_order_summary(self) -> str:
-        return ",".join(path.name for path in self.stream.files)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1316,11 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log0(
-        f"warmup_loader_resume:enabled:{int(args.resume_train_loader_after_warmup)} "
-        f"shard_order:{train_loader.shard_order_summary()}"
-    )
-    log0(f"warmup_cursor:start {train_loader.describe_cursor()}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1359,8 +1313,6 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        warmup_end_cursor = train_loader.cursor()
-        log0(f"warmup_cursor:end {train_loader.describe_cursor()}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1368,21 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log0(f"warmup_cursor:reset {train_loader.describe_cursor()}")
-        if args.resume_train_loader_after_warmup:
-            train_loader.set_cursor(warmup_end_cursor)
-            log0(f"warmup_cursor:resumed {train_loader.describe_cursor()}")
-            restored_exact = int(train_loader.cursor() == warmup_end_cursor)
-            log0(f"warmup_cursor:restored_exact {restored_exact}")
-        else:
-            log0("warmup_cursor:resumed disabled")
-            log0("warmup_cursor:restored_exact 0")
-    else:
-        log0("warmup_cursor:end skipped")
-        log0("warmup_cursor:reset skipped")
-        log0("warmup_cursor:resumed skipped")
-        log0("warmup_cursor:restored_exact skipped")
-    log0(f"warmup_cursor:measured_start {train_loader.describe_cursor()}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
