@@ -330,6 +330,11 @@ INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
@@ -608,7 +613,10 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
     )
     return best
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(
+    state_dict: dict[str, Tensor],
+    extra_keep_float_name_patterns: tuple[str, ...] = (),
+):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -642,6 +650,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "min_clip_override_tensor_count",
             "extra_fp32_keep_tensor_count",
             "extra_fp32_keep_extra_bytes",
+            "eval_extra_keep_tensor_count",
+            "eval_extra_keep_payload_bytes",
+            "eval_extra_keep_extra_bytes",
         ),
         0,
     )
@@ -692,7 +703,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
         keep_auto = name == selected_auto_keep_name
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
+        keep_eval_extra = matches_name_patterns(name, extra_keep_float_name_patterns)
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto or keep_eval_extra:
             baseline_kept_bytes = tensor_nbytes(keep_float_tensor(name, t, {}))
             kept = keep_float_tensor_for_export(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -706,6 +718,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             if keep_auto:
                 stats["auto_keep_tensor_count"] += 1
                 stats["auto_keep_payload_bytes"] += tensor_nbytes(kept)
+            if keep_eval_extra and not (keep_large or keep_auto or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL):
+                stats["eval_extra_keep_tensor_count"] += 1
+                stats["eval_extra_keep_payload_bytes"] += tensor_nbytes(kept)
+                stats["eval_extra_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
             continue
 
         stats["num_float_tensors"] += 1
@@ -1434,7 +1450,15 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    live_state_dict = base_model.state_dict()
+    quant_obj, quant_stats = quantize_state_dict_int8(live_state_dict)
+    extra_keep_eval_obj = None
+    extra_keep_eval_stats = None
+    if INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS:
+        extra_keep_eval_obj, extra_keep_eval_stats = quantize_state_dict_int8(
+            live_state_dict,
+            extra_keep_float_name_patterns=INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS,
+        )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1489,6 +1513,15 @@ def main() -> None:
                 f"extra_fp32_tensors:{quant_stats['extra_fp32_keep_tensor_count']} "
                 f"extra_fp32_extra_bytes:{quant_stats['extra_fp32_keep_extra_bytes']} "
                 f"patterns:{override_summary}"
+            )
+        if INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS and extra_keep_eval_stats is not None:
+            pattern_summary = ",".join(INT8_EXTRA_KEEP_FLOAT_EVAL_NAME_PATTERNS)
+            log0(
+                "Int8 extra keep-float eval: "
+                f"tensors:{extra_keep_eval_stats['eval_extra_keep_tensor_count']} "
+                f"payload:{extra_keep_eval_stats['eval_extra_keep_payload_bytes']} "
+                f"extra_payload:{extra_keep_eval_stats['eval_extra_keep_extra_bytes']} "
+                f"patterns:{pattern_summary}"
             )
         if INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
             audit_summary = ",".join(INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS)
@@ -1551,6 +1584,33 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if extra_keep_eval_obj is not None:
+        base_model.load_state_dict(dequantize_state_dict_int8(extra_keep_eval_obj), strict=True)
+        torch.cuda.synchronize()
+        t_extra_eval = time.perf_counter()
+        extra_q_val_loss, extra_q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_extra_keep_eval val_loss:{extra_q_val_loss:.4f} val_bpb:{extra_q_val_bpb:.4f} "
+            f"delta_val_loss:{extra_q_val_loss - q_val_loss:+.6f} "
+            f"delta_val_bpb:{extra_q_val_bpb - q_val_bpb:+.6f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_extra_eval):.0f}ms"
+        )
+        log0(
+            f"final_int8_extra_keep_eval_exact val_loss:{extra_q_val_loss:.8f} "
+            f"val_bpb:{extra_q_val_bpb:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
