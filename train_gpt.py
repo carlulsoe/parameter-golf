@@ -60,6 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    shuffle_train_shards = bool(int(os.environ.get("SHUFFLE_TRAIN_SHARDS", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -781,17 +782,27 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
+    def __init__(self, pattern: str, seed: int = 0, shuffle_shards: bool = False):
+        files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.files = files
+        self.shuffle_shards = shuffle_shards
+        self.rng = random.Random(seed)
+        self.file_order = list(range(len(self.files)))
+        if self.shuffle_shards and len(self.file_order) > 1:
+            self.rng.shuffle(self.file_order)
         self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
+        self.tokens = load_data_shard(self.files[self.file_order[0]])
         self.pos = 0
 
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.file_idx += 1
+        if self.file_idx >= len(self.file_order):
+            self.file_idx = 0
+            if self.shuffle_shards and len(self.file_order) > 1:
+                self.rng.shuffle(self.file_order)
+        self.tokens = load_data_shard(self.files[self.file_order[self.file_idx]])
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
@@ -812,11 +823,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, seed: int, shuffle_shards: bool):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, seed=seed, shuffle_shards=shuffle_shards)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1274,7 +1285,18 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        seed=args.seed,
+        shuffle_shards=args.shuffle_train_shards,
+    )
+    log0(
+        f"train_loader_mode:shuffle_train_shards:{args.shuffle_train_shards} "
+        f"seed:{args.seed} shard_count:{len(train_loader.stream.files)}"
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1319,7 +1341,14 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            seed=args.seed,
+            shuffle_shards=args.shuffle_train_shards,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
