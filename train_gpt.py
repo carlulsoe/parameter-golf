@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    q_gain_beta2 = float(os.environ.get("Q_GAIN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,11 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    for name, value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("Q_GAIN_BETA2", args.q_gain_beta2)):
-        if not 0.0 <= value < 1.0:
-            raise ValueError(f"{name} must be in [0, 1), got {value}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1215,8 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    q_gain_params = [p for name, p in block_named_params if name.endswith("attn.q_gain")]
-    q_gain_param_ids = {id(p) for p in q_gain_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1225,13 +1217,10 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and id(p) not in q_gain_param_ids
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    q_gain_split_active = args.q_gain_beta2 != args.beta2
-    if not q_gain_split_active:
-        scalar_params.extend(q_gain_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1254,15 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_q_gain: torch.optim.Optimizer | None = None
-    if q_gain_split_active:
-        optimizer_q_gain = torch.optim.Adam(
-            [{"params": q_gain_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.q_gain_beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_q_gain)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1271,45 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    block_param_name_lookup = {id(p): f"blocks.{name}" for name, p in block_named_params}
-    if base_model.skip_weights.numel() > 0:
-        block_param_name_lookup[id(base_model.skip_weights)] = "skip_weights"
-
-    def optimizer_tensor_count(opt: torch.optim.Optimizer) -> int:
-        return sum(len(group["params"]) for group in opt.param_groups)
-
-    def optimizer_numel(opt: torch.optim.Optimizer) -> int:
-        return sum(int(p.numel()) for group in opt.param_groups for p in group["params"])
-
-    def optimizer_names(opt: torch.optim.Optimizer) -> list[str]:
-        return [
-            block_param_name_lookup.get(id(p), f"unknown_{i}")
-            for i, group in enumerate(opt.param_groups)
-            for p in group["params"]
-        ]
-
-    def log_q_gain_optimizer_audit(stage: str, completed_updates: int | None = None) -> None:
-        q_gain_lr = optimizer_q_gain.param_groups[0]["lr"] if optimizer_q_gain is not None else args.scalar_lr
-        q_gain_beta2 = optimizer_q_gain.param_groups[0]["betas"][1] if optimizer_q_gain is not None else args.beta2
-        msg = (
-            "optimizer_scalar_groups: "
-            f"stage:{stage} "
-            f"scalar_tensors:{optimizer_tensor_count(optimizer_scalar)} "
-            f"scalar_numel:{optimizer_numel(optimizer_scalar)} "
-            f"q_gain_split_active:{q_gain_split_active} "
-            f"q_gain_tensors:{len(q_gain_params)} "
-            f"q_gain_numel:{sum(int(p.numel()) for p in q_gain_params)} "
-            f"q_gain_beta2:{q_gain_beta2:.5f} "
-            f"scalar_beta2:{optimizer_scalar.param_groups[0]['betas'][1]:.5f} "
-            f"q_gain_lr:{q_gain_lr:.8f} "
-            f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
-        )
-        if completed_updates is not None:
-            msg += f" completed_updates:{completed_updates}"
-        log0(msg)
-        if q_gain_split_active:
-            log0(f"optimizer_q_gain_names: {','.join(optimizer_names(optimizer_q_gain))}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1328,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_q_gain_optimizer_audit(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1380,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_q_gain_optimizer_audit(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1480,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_q_gain_optimizer_audit(stage="final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
