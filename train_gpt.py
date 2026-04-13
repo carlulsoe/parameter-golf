@@ -87,9 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    embed_lr_warmdown_start_step = int(os.environ.get("EMBED_LR_WARMDOWN_START_STEP", 0))
-    embed_lr_warmdown_steps = int(os.environ.get("EMBED_LR_WARMDOWN_STEPS", 0))
-    embed_lr_warmdown_target = float(os.environ.get("EMBED_LR_WARMDOWN_TARGET", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -232,8 +229,6 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-    metric_tag: str = "",
-    extra_log_fields: str = "",
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -283,11 +278,6 @@ def eval_val(
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    if metric_tag:
-        log0(
-            f"{metric_tag} scored_tokens:{int(val_token_count.item())} "
-            f"scored_bytes:{int(val_byte_count.item())}{extra_log_fields}"
-        )
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
@@ -1181,16 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.embed_lr_warmdown_start_step < 0:
-        raise ValueError(
-            f"EMBED_LR_WARMDOWN_START_STEP must be non-negative, got {args.embed_lr_warmdown_start_step}"
-        )
-    if args.embed_lr_warmdown_steps < 0:
-        raise ValueError(f"EMBED_LR_WARMDOWN_STEPS must be non-negative, got {args.embed_lr_warmdown_steps}")
-    if not (0.0 < args.embed_lr_warmdown_target <= 1.0):
-        raise ValueError(
-            f"EMBED_LR_WARMDOWN_TARGET must be in (0, 1], got {args.embed_lr_warmdown_target}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1288,18 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        "embed_lr_schedule: "
-        f"warmdown_start_step:{args.embed_lr_warmdown_start_step} "
-        f"warmdown_steps:{args.embed_lr_warmdown_steps} "
-        f"warmdown_target:{args.embed_lr_warmdown_target:.5f} "
-        f"enabled:{int(args.embed_lr_warmdown_steps > 0)} "
-        f"scope:optimizer_tok_only "
-        "optimizer_step_semantics:pre_update "
-        f"first_affected_update:{args.embed_lr_warmdown_start_step if args.embed_lr_warmdown_steps > 0 else 'none'} "
-        f"first_affected_checkpoint_step:{args.embed_lr_warmdown_start_step + 1 if args.embed_lr_warmdown_steps > 0 else 'none'} "
-        "checkpoint_log_semantics:last_applied_update"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1324,25 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def embed_lr_mul(step: int) -> float:
-        if args.embed_lr_warmdown_steps <= 0:
-            return 1.0
-        if step < args.embed_lr_warmdown_start_step:
-            return 1.0
-        progress = min((step - args.embed_lr_warmdown_start_step + 1) / max(args.embed_lr_warmdown_steps, 1), 1.0)
-        return 1.0 + (args.embed_lr_warmdown_target - 1.0) * progress
-
-    def format_embed_lr_fields(update_step: int | None, base_scale: float | None) -> str:
-        if update_step is None or base_scale is None:
-            return " embed_lr_update:none embed_lr_mult:none embed_lr:none"
-        embed_scale = embed_lr_mul(update_step)
-        embed_lr = token_lr * base_scale * embed_scale
-        return (
-            f" embed_lr_update:{update_step} "
-            f"embed_lr_mult:{embed_scale:.6f} "
-            f"embed_lr:{embed_lr:.6f}"
-        )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1382,8 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    last_applied_base_lr_scale: float | None = None
-    last_applied_embed_update_step: int | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1402,13 +1349,10 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
-                metric_tag="val_eval_coverage",
-                extra_log_fields=format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale),
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-                f"{format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale)}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1443,17 +1387,12 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        embed_scale = embed_lr_mul(step)
-        for group in optimizer_tok.param_groups:
-            group["lr"] = group["base_lr"] * scale * embed_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
-        last_applied_base_lr_scale = scale
-        last_applied_embed_update_step = step
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1465,7 +1404,6 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale)}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1606,20 +1544,13 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
-        metric_tag="final_eval_coverage",
-        extra_log_fields=format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale),
     )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-        f"{format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale)}"
     )
-    log0(
-        "final_int8_zlib_roundtrip_exact "
-        f"val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
-        f"{format_embed_lr_fields(last_applied_embed_update_step, last_applied_base_lr_scale)}"
-    )
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
