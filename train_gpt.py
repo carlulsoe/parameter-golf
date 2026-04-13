@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    attn_scale_lr_scale = float(os.environ.get("ATTN_SCALE_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.attn_scale_lr_scale < 0.0:
+        raise ValueError(f"ATTN_SCALE_LR_SCALE must be non-negative, got {args.attn_scale_lr_scale}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1209,6 +1212,9 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    attn_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith("attn_scale")]
+    attn_scale_names = [name for name, _ in attn_scale_named_params]
+    attn_scale_params = [p for _, p in attn_scale_named_params]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1217,10 +1223,14 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and name not in attn_scale_names
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if args.attn_scale_lr_scale == 1.0:
+        scalar_params.extend(attn_scale_params)
+        attn_scale_params = []
+        attn_scale_names = []
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1243,6 +1253,16 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_attn_scale = None
+    if attn_scale_params:
+        attn_scale_lr = args.scalar_lr * args.attn_scale_lr_scale
+        optimizer_attn_scale = torch.optim.Adam(
+            [{"params": attn_scale_params, "lr": attn_scale_lr, "base_lr": attn_scale_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_attn_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1282,17 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if optimizer_attn_scale is not None:
+        scalar_numel = sum(p.numel() for p in scalar_params)
+        attn_scale_numel = sum(p.numel() for p in attn_scale_params)
+        attn_scale_lr = optimizer_attn_scale.param_groups[0]["base_lr"]
+        log0(
+            "optimizer_scalar_groups: "
+            f"scalar_tensors:{len(scalar_params)} scalar_numel:{scalar_numel} "
+            f"attn_scale_tensors:{len(attn_scale_params)} attn_scale_numel:{attn_scale_numel} "
+            f"attn_scale_lr_scale:{args.attn_scale_lr_scale:.5f} attn_scale_lr:{attn_scale_lr:.8f}"
+        )
+        log0(f"optimizer_attn_scale_names: {','.join(attn_scale_names)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1419,6 +1450,13 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if optimizer_attn_scale is not None:
+        log0(
+            "optimizer_scalar_final: "
+            f"completed_updates:{step} "
+            f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+            f"attn_scale_lr:{optimizer_attn_scale.param_groups[0]['lr']:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
