@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    scalar_adam_eps = float(os.environ.get("SCALAR_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -539,23 +538,6 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in results),
         "candidate_summary": candidate_summary,
     }
-
-def format_optimizer_param_group_membership(
-    optimizer: torch.optim.Optimizer,
-    named_params: list[tuple[str, nn.Parameter]],
-) -> str:
-    param_name_by_id = {id(param): name for name, param in named_params}
-    group_summaries: list[str] = []
-    for group_idx, group in enumerate(optimizer.param_groups):
-        members = [
-            f"{param_name_by_id.get(id(param), '<unnamed>')}|numel={int(param.numel())}"
-            for param in group["params"]
-        ]
-        group_summaries.append(
-            f"group{group_idx}[lr={float(group.get('lr', 0.0)):.8f}|"
-            f"eps={float(group.get('eps', 0.0)):.2e}|params={';'.join(members)}]"
-        )
-    return " ".join(group_summaries)
 
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
@@ -1175,10 +1157,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be strictly positive, got {args.adam_eps}")
-    if args.scalar_adam_eps <= 0.0:
-        raise ValueError(f"SCALAR_ADAM_EPS must be strictly positive, got {args.scalar_adam_eps}")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1231,11 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    optimizer_scalar_named_params = [
-        (name, param)
-        for name, param in block_named_params
-        if param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1248,7 +1221,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-        optimizer_scalar_named_params.append(("skip_weights", base_model.skip_weights))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1267,7 +1239,7 @@ def main() -> None:
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.scalar_adam_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1289,16 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    head_eps_display = f"{args.adam_eps:.2e}" if base_model.lm_head is not None else "inactive"
-    log0(
-        f"optimizer_eps_scope: optimizer_tok:{args.adam_eps:.2e} "
-        f"optimizer_scalar:{args.scalar_adam_eps:.2e} "
-        f"optimizer_head:{head_eps_display} muon_eps:none"
-    )
-    log0(
-        "optimizer_scalar_param_groups:"
-        f" {format_optimizer_param_group_membership(optimizer_scalar, optimizer_scalar_named_params)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
