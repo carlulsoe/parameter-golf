@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    resid_mix_beta2 = float(os.environ.get("RESID_MIX_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1084,6 +1085,293 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+def format_betas(betas: tuple[float, float]) -> str:
+    return f"({betas[0]:.5f},{betas[1]:.5f})"
+
+
+def make_adam(
+    params: list[Tensor],
+    lr: float,
+    betas: tuple[float, float],
+    eps: float,
+    use_fused: bool,
+) -> torch.optim.Adam:
+    return torch.optim.Adam(
+        [{"params": params, "lr": lr, "base_lr": lr}],
+        betas=betas,
+        eps=eps,
+        fused=use_fused,
+    )
+
+
+def expected_resid_mix_names(base_model: GPT) -> list[str]:
+    return [f"blocks.{i}.resid_mix" for i in range(len(base_model.blocks))]
+
+
+def build_optimizer_splits(
+    base_model: GPT,
+    split_resid_mix: bool,
+) -> tuple[list[Tensor], list[tuple[str, Tensor]], list[tuple[str, Tensor]], dict[str, object]]:
+    block_named_params = [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_named_params = [
+        (name, p)
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    resid_mix_names = expected_resid_mix_names(base_model)
+    block_param_map = {name: p for name, p in block_named_params}
+    resid_mix_named_params = []
+    for name in resid_mix_names:
+        param = block_param_map.get(name)
+        if param is None:
+            raise ValueError(f"Missing expected resid_mix parameter {name}")
+        resid_mix_named_params.append((name, param))
+    scalar_name_set = {name for name, _ in scalar_named_params}
+    missing_scalar_resid_mix = [name for name in resid_mix_names if name not in scalar_name_set]
+    if missing_scalar_resid_mix:
+        raise ValueError(f"Expected resid_mix parameters missing from scalar group: {missing_scalar_resid_mix}")
+    if split_resid_mix:
+        resid_mix_name_set = set(resid_mix_names)
+        scalar_named_params = [(name, p) for name, p in scalar_named_params if name not in resid_mix_name_set]
+    if base_model.skip_weights.numel() > 0:
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    return matrix_params, scalar_named_params, resid_mix_named_params, {"resid_mix_names": resid_mix_names}
+
+
+def build_optimizers(
+    base_model: GPT,
+    args: Hyperparameters,
+    use_fused_adam: bool,
+) -> tuple[
+    torch.optim.Adam,
+    Muon,
+    torch.optim.Adam,
+    torch.optim.Adam | None,
+    torch.optim.Adam | None,
+    list[torch.optim.Optimizer],
+    dict[str, object],
+]:
+    resid_mix_split_active = args.resid_mix_beta2 != args.beta2
+    matrix_params, scalar_named_params, resid_mix_named_params, split_info = build_optimizer_splits(
+        base_model,
+        split_resid_mix=resid_mix_split_active,
+    )
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_tok = make_adam(
+        [base_model.tok_emb.weight],
+        token_lr,
+        (args.beta1, args.beta2),
+        args.adam_eps,
+        use_fused_adam,
+    )
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
+    optimizer_scalar = make_adam(
+        [p for _, p in scalar_named_params],
+        args.scalar_lr,
+        (args.beta1, args.beta2),
+        args.adam_eps,
+        use_fused_adam,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_resid_mix = None
+    if resid_mix_split_active:
+        optimizer_resid_mix = make_adam(
+            [p for _, p in resid_mix_named_params],
+            args.scalar_lr,
+            (args.beta1, args.resid_mix_beta2),
+            args.adam_eps,
+            use_fused_adam,
+        )
+        optimizers.append(optimizer_resid_mix)
+    optimizer_head = None
+    if base_model.lm_head is not None:
+        optimizer_head = make_adam(
+            [base_model.lm_head.weight],
+            args.head_lr,
+            (args.beta1, args.beta2),
+            args.adam_eps,
+            use_fused_adam,
+        )
+        optimizers.insert(1, optimizer_head)
+    split_info["resid_mix_split_active"] = optimizer_resid_mix is not None
+    return optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_resid_mix, optimizer_head, optimizers, split_info
+
+
+def audit_resid_mix_split(
+    base_model: GPT,
+    optimizer_scalar: torch.optim.Optimizer,
+    optimizer_resid_mix: torch.optim.Optimizer | None,
+) -> dict[str, object]:
+    expected_names = expected_resid_mix_names(base_model)
+    expected_name_set = set(expected_names)
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
+
+    def group_names_and_numel(optimizer: torch.optim.Optimizer) -> tuple[list[str], int]:
+        names: list[str] = []
+        numel = 0
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                name = param_name_by_id.get(id(param))
+                if name is None:
+                    raise ValueError("Optimizer owns a parameter not present in base_model.named_parameters()")
+                names.append(name)
+                numel += int(param.numel())
+        return names, numel
+
+    scalar_names, scalar_numel = group_names_and_numel(optimizer_scalar)
+    resid_mix_names, resid_mix_numel = ([], 0)
+    if optimizer_resid_mix is not None:
+        resid_mix_names, resid_mix_numel = group_names_and_numel(optimizer_resid_mix)
+
+    scalar_name_set = set(scalar_names)
+    resid_mix_name_set = set(resid_mix_names)
+    if scalar_name_set & resid_mix_name_set:
+        raise ValueError(f"optimizer_scalar and optimizer_resid_mix overlap: {sorted(scalar_name_set & resid_mix_name_set)}")
+    if optimizer_resid_mix is not None:
+        if resid_mix_names != expected_names:
+            raise ValueError(f"optimizer_resid_mix names do not match expected order: {resid_mix_names}")
+        if resid_mix_name_set != expected_name_set:
+            raise ValueError(f"optimizer_resid_mix names do not match expected set: {sorted(resid_mix_name_set)}")
+        leaked_resid_mix = sorted(expected_name_set & scalar_name_set)
+        if leaked_resid_mix:
+            raise ValueError(f"optimizer_scalar still owns resid_mix tensors: {leaked_resid_mix}")
+    else:
+        missing_from_scalar = sorted(expected_name_set - scalar_name_set)
+        if missing_from_scalar:
+            raise ValueError(f"optimizer_scalar is missing resid_mix tensors: {missing_from_scalar}")
+
+    return {
+        "resid_mix_split_active": optimizer_resid_mix is not None,
+        "scalar_tensor_count": len(scalar_names),
+        "scalar_numel": scalar_numel,
+        "resid_mix_tensor_count": len(resid_mix_names),
+        "resid_mix_numel": resid_mix_numel,
+        "resid_mix_names": resid_mix_names,
+    }
+
+
+def log_resid_mix_optimizer_audit(
+    log0,
+    stage: str,
+    base_model: GPT,
+    optimizer_scalar: torch.optim.Optimizer,
+    optimizer_resid_mix: torch.optim.Optimizer | None,
+) -> dict[str, object]:
+    audit = audit_resid_mix_split(base_model, optimizer_scalar, optimizer_resid_mix)
+    resid_mix_lr = optimizer_resid_mix.param_groups[0]["lr"] if optimizer_resid_mix is not None else optimizer_scalar.param_groups[0]["lr"]
+    log0(
+        f"optimizer_scalar_groups: stage:{stage} "
+        f"resid_mix_split_active:{audit['resid_mix_split_active']} "
+        f"scalar_tensors:{audit['scalar_tensor_count']} "
+        f"scalar_numel:{audit['scalar_numel']} "
+        f"resid_mix_tensors:{audit['resid_mix_tensor_count']} "
+        f"resid_mix_numel:{audit['resid_mix_numel']} "
+        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"resid_mix_lr:{resid_mix_lr:.8f}"
+    )
+    if optimizer_resid_mix is not None:
+        log0(f"optimizer_resid_mix_names: stage:{stage} " + ",".join(audit["resid_mix_names"]))
+    log0(
+        f"optimizer_betas:stage:{stage} "
+        f"scalar:{format_betas(optimizer_scalar.param_groups[0]['betas'])} "
+        f"resid_mix:{format_betas(optimizer_resid_mix.param_groups[0]['betas']) if optimizer_resid_mix is not None else format_betas(optimizer_scalar.param_groups[0]['betas'])} "
+        f"resid_mix_split_active:{optimizer_resid_mix is not None}"
+    )
+    return audit
+
+
+def run_resid_mix_beta2_smoke_test() -> None:
+    args = Hyperparameters()
+    if not math.isclose(args.resid_mix_beta2, 0.98, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError(
+            f"RESID_MIX_BETA2_SMOKE_TEST expects RESID_MIX_BETA2=0.98, got {args.resid_mix_beta2}"
+        )
+    torch.manual_seed(args.seed)
+    base_model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+    )
+    restore_low_dim_params_to_fp32(base_model)
+    (
+        _optimizer_tok,
+        _optimizer_muon,
+        optimizer_scalar,
+        optimizer_resid_mix,
+        _optimizer_head,
+        optimizers,
+        _split_info,
+    ) = build_optimizers(base_model, args, use_fused_adam=False)
+    if optimizer_resid_mix is None:
+        raise AssertionError("Smoke test expected resid_mix split to be active")
+    startup_audit = audit_resid_mix_split(base_model, optimizer_scalar, optimizer_resid_mix)
+    if startup_audit["resid_mix_names"] != expected_resid_mix_names(base_model):
+        raise AssertionError(f"Unexpected resid_mix names: {startup_audit['resid_mix_names']}")
+    if startup_audit["resid_mix_numel"] != 9216:
+        raise AssertionError(f"Unexpected resid_mix_numel: {startup_audit['resid_mix_numel']}")
+    if startup_audit["scalar_numel"] != 11336:
+        raise AssertionError(f"Unexpected scalar_numel: {startup_audit['scalar_numel']}")
+    if optimizer_scalar.param_groups[0]["betas"] != (args.beta1, args.beta2):
+        raise AssertionError("optimizer_scalar betas do not match baseline")
+    if optimizer_resid_mix.param_groups[0]["betas"] != (args.beta1, args.resid_mix_beta2):
+        raise AssertionError("optimizer_resid_mix betas do not match override")
+
+    initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+    initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+    x = torch.randint(0, args.vocab_size, (2, 8), dtype=torch.int64)
+    y = torch.randint(0, args.vocab_size, (2, 8), dtype=torch.int64)
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
+    loss = base_model(x, y)
+    loss.backward()
+    for opt in optimizers:
+        opt.step()
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
+    base_model.load_state_dict(initial_model_state, strict=True)
+    for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+        opt.load_state_dict(state)
+
+    restored_audit = audit_resid_mix_split(base_model, optimizer_scalar, optimizer_resid_mix)
+    if restored_audit["resid_mix_names"] != expected_resid_mix_names(base_model):
+        raise AssertionError("optimizer_resid_mix names changed across restore")
+    if restored_audit["resid_mix_numel"] != 9216 or restored_audit["scalar_numel"] != 11336:
+        raise AssertionError(
+            f"Unexpected restored split accounting scalar_numel:{restored_audit['scalar_numel']} resid_mix_numel:{restored_audit['resid_mix_numel']}"
+        )
+    if optimizer_scalar.param_groups[0]["betas"] != (args.beta1, args.beta2):
+        raise AssertionError("optimizer_scalar betas changed across restore")
+    if optimizer_resid_mix.param_groups[0]["betas"] != (args.beta1, args.resid_mix_beta2):
+        raise AssertionError("optimizer_resid_mix betas changed across restore")
+    print(
+        "resid_mix_beta2_smoke_test:ok "
+        f"scalar_betas:{format_betas(optimizer_scalar.param_groups[0]['betas'])} "
+        f"resid_mix_betas:{format_betas(optimizer_resid_mix.param_groups[0]['betas'])} "
+        f"resid_mix_names:{','.join(restored_audit['resid_mix_names'])} "
+        f"scalar_numel:{restored_audit['scalar_numel']} "
+        f"resid_mix_numel:{restored_audit['resid_mix_numel']}"
+    )
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -1208,49 +1496,18 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    if not 0.0 <= args.resid_mix_beta2 < 1.0:
+        raise ValueError(f"RESID_MIX_BETA2 must be in [0, 1), got {args.resid_mix_beta2}")
+    (
+        optimizer_tok,
+        optimizer_muon,
+        optimizer_scalar,
+        optimizer_resid_mix,
+        optimizer_head,
+        optimizers,
+        _optimizer_split_info,
+    ) = build_optimizers(base_model, args, device.type == "cuda")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1262,6 +1519,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log_resid_mix_optimizer_audit(log0, "startup", base_model, optimizer_scalar, optimizer_resid_mix)
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1578,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_resid_mix_optimizer_audit(log0, "post_restore_startup", base_model, optimizer_scalar, optimizer_resid_mix)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1677,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    final_resid_mix_audit = log_resid_mix_optimizer_audit(log0, "final", base_model, optimizer_scalar, optimizer_resid_mix)
+    resid_mix_live_lr = optimizer_resid_mix.param_groups[0]["lr"] if optimizer_resid_mix is not None else optimizer_scalar.param_groups[0]["lr"]
+    log0(
+        f"optimizer_scalar_final: resid_mix_split_active:{final_resid_mix_audit['resid_mix_split_active']} "
+        f"completed_updates:{step} scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"resid_mix_lr:{resid_mix_live_lr:.8f} "
+        f"scalar_betas:{format_betas(optimizer_scalar.param_groups[0]['betas'])} "
+        f"resid_mix_betas:{format_betas(optimizer_resid_mix.param_groups[0]['betas']) if optimizer_resid_mix is not None else format_betas(optimizer_scalar.param_groups[0]['betas'])}"
     )
 
     # -----------------------------
@@ -1557,4 +1825,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if bool(int(os.environ.get("RESID_MIX_BETA2_SMOKE_TEST", "0"))):
+        run_resid_mix_beta2_smoke_test()
+    else:
+        main()
