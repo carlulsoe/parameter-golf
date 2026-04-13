@@ -79,8 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    matrix_lr_warmup_steps = int(os.environ.get("MATRIX_LR_WARMUP_STEPS", 0))
-    matrix_lr_warmup_start_mult = float(os.environ.get("MATRIX_LR_WARMUP_START_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1092,13 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if args.matrix_lr_warmup_steps < 0:
-        raise ValueError(f"MATRIX_LR_WARMUP_STEPS must be non-negative, got {args.matrix_lr_warmup_steps}")
-    if not 0.0 <= args.matrix_lr_warmup_start_mult <= 1.0:
-        raise ValueError(
-            "MATRIX_LR_WARMUP_START_MULT must be in [0, 1], "
-            f"got {args.matrix_lr_warmup_start_mult}"
-        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1269,9 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"matrix_lr_warmup_steps:{args.matrix_lr_warmup_steps} "
-        f"matrix_lr_warmup_start_mult:{args.matrix_lr_warmup_start_mult:.5f}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1303,16 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def matrix_lr_warmup_mul(step: int) -> float:
-        if args.matrix_lr_warmup_steps <= 0:
-            return 1.0
-        if step >= args.matrix_lr_warmup_steps:
-            return 1.0
-        if args.matrix_lr_warmup_steps == 1:
-            return args.matrix_lr_warmup_start_mult
-        frac = step / (args.matrix_lr_warmup_steps - 1)
-        return (1.0 - frac) * args.matrix_lr_warmup_start_mult + frac * 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1408,9 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        matrix_scale = scale * matrix_lr_warmup_mul(step)
-        for group in optimizer_muon.param_groups:
-            group["lr"] = group["base_lr"] * matrix_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1427,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"matrix_lr_mult:{matrix_lr_warmup_mul(step - 1):.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
