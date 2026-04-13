@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1208,19 +1211,29 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [param for _, param in scalar_named_params]
+    scalar_control_tensor_count = sum(
+        1 for name, _ in scalar_named_params if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    scalar_control_numel = sum(
+        int(param.numel())
+        for name, param in scalar_named_params
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,10 +1249,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    scalar_optimizer_cls = torch.optim.AdamW if args.scalar_weight_decay > 0 else torch.optim.Adam
+    optimizer_scalar = scalar_optimizer_cls(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.scalar_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1260,8 +1275,21 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"scalar_weight_decay:{args.scalar_weight_decay}"
     )
+    scalar_live_weight_decay = float(optimizer_scalar.param_groups[0].get("weight_decay", 0.0))
+    scalar_membership = ",".join(
+        f"{param_name_by_id.get(id(param), '<unnamed>')}:{int(param.numel())}"
+        for param in optimizer_scalar.param_groups[0]["params"]
+    )
+    log0(
+        f"optimizer_scalar_group optimizer:{type(optimizer_scalar).__name__} "
+        f"tensors:{len(scalar_named_params)} numel:{sum(int(param.numel()) for param in scalar_params)} "
+        f"control_tensors:{scalar_control_tensor_count} control_numel:{scalar_control_numel} "
+        f"weight_decay:{scalar_live_weight_decay:.8f}"
+    )
+    log0(f"optimizer_scalar_membership:{scalar_membership}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
