@@ -170,12 +170,6 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_muon_momentum_schedule(step: int, args: Hyperparameters) -> tuple[float, float]:
-    warmup_fraction = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-    momentum = (1 - warmup_fraction) * args.muon_momentum_warmup_start + warmup_fraction * args.muon_momentum
-    return momentum, warmup_fraction
-
-
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
@@ -1266,10 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} "
-        f"muon_momentum_warmup_start:{args.muon_momentum_warmup_start} "
-        f"muon_momentum_warmup_steps:{args.muon_momentum_warmup_steps}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1336,9 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_muon_schedule_step: int | None = None
-    last_muon_momentum = args.muon_momentum_warmup_start if args.muon_momentum_warmup_steps > 0 else args.muon_momentum
-    last_muon_warmup_fraction = 0.0 if args.muon_momentum_warmup_steps > 0 else 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1391,12 +1379,10 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum, muon_warmup_fraction = get_muon_momentum_schedule(step, args)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-        last_muon_schedule_step = step
-        last_muon_momentum = muon_momentum
-        last_muon_warmup_fraction = muon_warmup_fraction
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1428,15 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    measured_stop_step = stop_after_step if stop_after_step is not None else step
-    log0(
-        "muon_momentum_audit: "
-        f"measured_stop_step:{measured_stop_step} "
-        f"last_schedule_step:{last_muon_schedule_step if last_muon_schedule_step is not None else 'none'} "
-        f"last_applied_momentum:{last_muon_momentum:.8f} "
-        f"warmup_fraction_completed:{last_muon_warmup_fraction:.8f}"
-    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
