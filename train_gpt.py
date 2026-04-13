@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    mlp_scale_lr_scale = float(os.environ.get("MLP_SCALE_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1208,7 +1209,11 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    if args.mlp_scale_lr_scale < 0.0:
+        raise ValueError(f"MLP_SCALE_LR_SCALE must be non-negative, got {args.mlp_scale_lr_scale}")
     block_named_params = list(base_model.blocks.named_parameters())
+    mlp_scale_named_params = [(name, p) for name, p in block_named_params if "mlp_scale" in name]
+    mlp_scale_params = [p for _, p in mlp_scale_named_params]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1217,7 +1222,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and "mlp_scale" not in name
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1242,7 +1247,14 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    mlp_scale_lr = args.scalar_lr * args.mlp_scale_lr_scale
+    optimizer_mlp_scale = torch.optim.Adam(
+        [{"params": mlp_scale_params, "lr": mlp_scale_lr, "base_lr": mlp_scale_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_mlp_scale, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1274,17 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        "optimizer_scalar_groups: "
+        f"scalar_tensors:{len(scalar_params)} "
+        f"scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
+        f"mlp_scale_tensors:{len(mlp_scale_params)} "
+        f"mlp_scale_numel:{sum(int(p.numel()) for p in mlp_scale_params)} "
+        f"mlp_scale_lr_scale:{args.mlp_scale_lr_scale:.5f} "
+        f"mlp_scale_lr:{mlp_scale_lr:.8f}"
+    )
+    if mlp_scale_named_params:
+        log0("optimizer_mlp_scale_names: " + ",".join(name for name, _ in mlp_scale_named_params))
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1418,6 +1441,16 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_scalar_final: "
+        f"completed_updates:{step} "
+        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"mlp_scale_lr:{optimizer_mlp_scale.param_groups[0]['lr']:.8f} "
+        f"scalar_tensors:{len(scalar_params)} "
+        f"scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
+        f"mlp_scale_tensors:{len(mlp_scale_params)} "
+        f"mlp_scale_numel:{sum(int(p.numel()) for p in mlp_scale_params)}"
     )
 
     # -----------------------------
