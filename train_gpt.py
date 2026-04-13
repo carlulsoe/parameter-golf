@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -856,6 +857,11 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def validate_adam_beta(name: str, value: float) -> None:
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value}")
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1089,6 +1095,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    validate_adam_beta("BETA1", args.beta1)
+    validate_adam_beta("BETA2", args.beta2)
+    validate_adam_beta("TOKEN_BETA2", args.token_beta2)
+    token_beta2_override_active = args.token_beta2 != args.beta2
+    if token_beta2_override_active and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA2 override requires TIE_EMBEDDINGS=1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1224,7 +1236,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.token_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1243,6 +1255,7 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_head: torch.optim.Optimizer | None = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1251,6 +1264,49 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    named_params_by_id = {id(param): name for name, param in base_model.named_parameters()}
+
+    def optimizer_group_names(optimizer: torch.optim.Optimizer) -> list[str]:
+        names: list[str] = []
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                name = named_params_by_id.get(id(param))
+                if name is not None:
+                    names.append(name)
+        return names
+
+    def format_betas(optimizer: torch.optim.Optimizer | None) -> str:
+        if optimizer is None:
+            return "inactive"
+        beta1, beta2 = optimizer.param_groups[0]["betas"]
+        return f"({beta1:.5f},{beta2:.5f})"
+
+    def log_optimizer_tok_audit(stage: str) -> None:
+        tok_names = optimizer_group_names(optimizer_tok)
+        tok_numel = sum(
+            int(param.numel())
+            for group in optimizer_tok.param_groups
+            for param in group["params"]
+        )
+        beta1, beta2 = optimizer_tok.param_groups[0]["betas"]
+        log0(
+            "optimizer_tok audit: "
+            f"stage:{stage} optimizer:Adam tie_embeddings:{args.tie_embeddings} "
+            f"scope:{'tied_only' if args.tie_embeddings else 'untied'} "
+            f"beta1:{beta1:.5f} beta2:{beta2:.5f} "
+            f"tensor_count:{len(tok_names)} numel:{tok_numel} "
+            f"names:{','.join(tok_names) if tok_names else 'none'}"
+        )
+
+    def log_optimizer_betas(stage: str) -> None:
+        log0(
+            "optimizer_betas: "
+            f"stage:{stage} tok:{format_betas(optimizer_tok)} "
+            f"scalar:{format_betas(optimizer_scalar)} "
+            f"head:{format_betas(optimizer_head) if base_model.lm_head is not None else 'inactive'} "
+            "muon:none"
+        )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1263,12 +1319,18 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"optimizer_beta_config: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"token_beta2:{args.token_beta2:.5f} token_beta2_override_active:{token_beta2_override_active}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_tok_audit("startup")
+    log_optimizer_betas("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1382,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_tok_audit("post_restore_startup")
+        log_optimizer_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1483,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_tok_audit("final")
+    log_optimizer_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
