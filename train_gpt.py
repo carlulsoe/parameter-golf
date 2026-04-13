@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -786,10 +787,54 @@ class TokenStream:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
+        self.pass_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.reset_accounting()
+
+    def reset_accounting(self) -> None:
+        self.total_raw_tokens_taken = 0
+        self.wrap_count = 0
+        self.file_raw_token_counts = [0] * len(self.files)
+        self.file_visit_order: list[int] = []
+
+    def cursor_state(self) -> dict[str, int]:
+        return {"file_idx": self.file_idx, "pos": self.pos, "pass_idx": self.pass_idx}
+
+    def load_cursor_state(self, state: dict[str, int]) -> None:
+        file_idx = int(state["file_idx"])
+        pos = int(state["pos"])
+        pass_idx = int(state["pass_idx"])
+        if not 0 <= file_idx < len(self.files):
+            raise ValueError(f"Invalid file_idx {file_idx} for {len(self.files)} files")
+        self.file_idx = file_idx
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        if not 0 <= pos <= self.tokens.numel():
+            raise ValueError(f"Invalid pos {pos} for shard length {self.tokens.numel()}")
+        self.pos = pos
+        self.pass_idx = pass_idx
+
+    def format_cursor(self) -> str:
+        return (
+            f"file_idx:{self.file_idx} file:{self.files[self.file_idx].name} "
+            f"pos:{self.pos} pass_idx:{self.pass_idx}"
+        )
+
+    def shard_exposure_summary(self, max_files: int = 8) -> str:
+        if not self.file_visit_order:
+            return "none"
+        parts: list[str] = []
+        total_files = len(self.file_visit_order)
+        for file_idx in self.file_visit_order[:max_files]:
+            parts.append(f"{self.files[file_idx].name}:{self.file_raw_token_counts[file_idx]}")
+        if total_files > max_files:
+            parts.append(f"+{total_files - max_files}_more")
+        return ",".join(parts)
 
     def _advance_file(self) -> None:
+        if self.file_idx == len(self.files) - 1:
+            self.pass_idx += 1
+            self.wrap_count += 1
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
@@ -803,9 +848,13 @@ class TokenStream:
                 self._advance_file()
                 continue
             k = min(remaining, avail)
+            if self.file_raw_token_counts[self.file_idx] == 0:
+                self.file_visit_order.append(self.file_idx)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
             remaining -= k
+            self.total_raw_tokens_taken += k
+            self.file_raw_token_counts[self.file_idx] += k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
@@ -817,11 +866,40 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.reset_accounting()
+
+    def reset_accounting(self) -> None:
+        self.stream.reset_accounting()
+        self.total_supervised_tokens = 0
+        self.total_boundary_tokens = 0
+        self.next_batch_calls = 0
+
+    def cursor_state(self) -> dict[str, int]:
+        return self.stream.cursor_state()
+
+    def load_cursor_state(self, state: dict[str, int]) -> None:
+        self.stream.load_cursor_state(state)
+
+    def raw_stream_tokens_per_batch(self, global_tokens: int, grad_accum_steps: int) -> int:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        return per_rank_span * self.world_size
+
+    def state_summary(self, phase: str) -> str:
+        return (
+            f"phase:{phase} {self.stream.format_cursor()} raw_stream_tokens:{self.stream.total_raw_tokens_taken} "
+            f"supervised_tokens:{self.total_supervised_tokens} boundary_tokens:{self.total_boundary_tokens} "
+            f"next_batches:{self.next_batch_calls} wraps:{self.stream.wrap_count} "
+            f"shard_exposure:{self.stream.shard_exposure_summary()}"
+        )
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
+        self.total_supervised_tokens += global_tokens
+        self.total_boundary_tokens += self.world_size
+        self.next_batch_calls += 1
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
@@ -1268,6 +1346,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1275,6 +1354,15 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    raw_stream_tokens_per_micro_step = train_loader.raw_stream_tokens_per_batch(args.train_batch_tokens, grad_accum_steps)
+    boundary_tokens_per_micro_step = raw_stream_tokens_per_micro_step - (args.train_batch_tokens // grad_accum_steps)
+    log0(
+        "train_loader_batch_geometry: "
+        f"supervised_tokens_per_micro_step:{args.train_batch_tokens // grad_accum_steps} "
+        f"raw_stream_tokens_per_micro_step:{raw_stream_tokens_per_micro_step} "
+        f"boundary_tokens_per_micro_step:{boundary_tokens_per_micro_step}"
+    )
+    log0(f"train_loader_state {train_loader.state_summary('startup')}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,13 +1401,29 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        warmup_end_cursor = train_loader.cursor_state()
+        log0(f"warmup_loader_state {train_loader.state_summary('end')}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        measured_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        transition_action = "reset"
+        if not args.reset_train_loader_after_warmup:
+            measured_loader.load_cursor_state(warmup_end_cursor)
+            transition_action = "resume"
+        log0(
+            "post_warmup_loader_transition: "
+            f"action:{transition_action} "
+            f"warmup_end:{train_loader.stream.format_cursor()} "
+            f"measured_start:{measured_loader.stream.format_cursor()} "
+            f"cursor_match:{int(measured_loader.cursor_state() == warmup_end_cursor)}"
+        )
+        train_loader = measured_loader
+
+    log0(f"measured_loader_state {train_loader.state_summary('start')}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1523,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(f"measured_loader_state {train_loader.state_summary('end')}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
