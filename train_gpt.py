@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", "0.9")))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1176,12 +1175,6 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    if not 0.0 <= args.beta1 < 1.0:
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not 0.0 <= args.scalar_beta1 < 1.0:
-        raise ValueError(f"SCALAR_BETA1 must be in [0, 1), got {args.scalar_beta1}")
-    if not 0.0 <= args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1245,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.scalar_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1276,61 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
-
-    def format_adam_betas(opt: torch.optim.Optimizer | None) -> str:
-        if opt is None:
-            return "inactive"
-        beta1, beta2 = opt.param_groups[0]["betas"]
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def get_group_member_names(opt: torch.optim.Optimizer) -> list[str]:
-        names: list[str] = []
-        for group in opt.param_groups:
-            for param in group["params"]:
-                names.append(param_name_by_id.get(id(param), f"<unknown:{id(param)}>"))
-        return names
-
-    def log_scalar_optimizer_audit(stage: str, completed_updates: int | None = None) -> None:
-        scalar_names = get_group_member_names(optimizer_scalar)
-        scalar_numel = sum(int(param.numel()) for group in optimizer_scalar.param_groups for param in group["params"])
-        tok_names = get_group_member_names(optimizer_tok)
-        head_names = get_group_member_names(optimizer_head) if base_model.lm_head is not None else []
-        tok_scope = tok_names[0] if len(tok_names) == 1 else ",".join(tok_names)
-        head_scope = ",".join(head_names) if head_names else "inactive"
-        beta_line = (
-            f"optimizer_betas stage:{stage} scope:live_param_groups "
-            f"optimizer_tok:{format_adam_betas(optimizer_tok)} "
-            f"optimizer_scalar:{format_adam_betas(optimizer_scalar)} "
-            f"optimizer_head:{format_adam_betas(optimizer_head) if base_model.lm_head is not None else 'inactive'} "
-            f"optimizer_muon_betas:none optimizer_muon_momentum:{optimizer_muon.param_groups[0]['momentum']:.5f}"
-        )
-        if completed_updates is not None:
-            beta_line += f" completed_updates:{completed_updates}"
-        log0(beta_line)
-        group_line = (
-            f"optimizer_group_scope stage:{stage} "
-            f"optimizer_tok_scope:{tok_scope} "
-            f"optimizer_scalar_tensors:{len(scalar_names)} optimizer_scalar_numel:{scalar_numel} "
-            f"optimizer_head_scope:{head_scope}"
-        )
-        if completed_updates is not None:
-            group_line += f" completed_updates:{completed_updates}"
-        log0(group_line)
-        chunk_size = 16
-        total_chunks = max((len(scalar_names) + chunk_size - 1) // chunk_size, 1)
-        if not scalar_names:
-            empty_line = f"optimizer_scalar_group_members stage:{stage} chunk:1/1 names:none"
-            if completed_updates is not None:
-                empty_line += f" completed_updates:{completed_updates}"
-            log0(empty_line)
-            return
-        for chunk_idx, start in enumerate(range(0, len(scalar_names), chunk_size), start=1):
-            names_chunk = ",".join(scalar_names[start : start + chunk_size])
-            chunk_line = f"optimizer_scalar_group_members stage:{stage} chunk:{chunk_idx}/{total_chunks} names:{names_chunk}"
-            if completed_updates is not None:
-                chunk_line += f" completed_updates:{completed_updates}"
-            log0(chunk_line)
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1382,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_scalar_optimizer_audit(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1482,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_optimizer_audit(stage="final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
