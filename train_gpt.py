@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    resid_mix_lr_scale = float(os.environ.get("RESID_MIX_LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.resid_mix_lr_scale < 0.0:
+        raise ValueError(f"RESID_MIX_LR_SCALE must be non-negative, got {args.resid_mix_lr_scale}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1214,14 +1217,17 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith("resid_mix")]
+    resid_mix_params = [p for _, p in resid_mix_named_params]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and not name.endswith("resid_mix")
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    resid_mix_lr = args.scalar_lr * args.resid_mix_lr_scale
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1236,13 +1242,19 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    optimizer_resid_mix = torch.optim.Adam(
+        [{"params": resid_mix_params, "lr": resid_mix_lr, "base_lr": resid_mix_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_resid_mix, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1260,8 +1272,20 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"resid_mix_lr_scale:{args.resid_mix_lr_scale}"
     )
+    log0(
+        "optimizer_scalar_groups: "
+        f"scalar_tensors:{len(scalar_params)} scalar_numel:{sum(p.numel() for p in scalar_params)} "
+        f"resid_mix_tensors:{len(resid_mix_params)} resid_mix_numel:{sum(p.numel() for p in resid_mix_params)} "
+        f"resid_mix_lr_scale:{args.resid_mix_lr_scale:.5f} resid_mix_lr:{resid_mix_lr:.8f}"
+    )
+    if resid_mix_named_params:
+        log0(
+            "optimizer_resid_mix_names: "
+            + ",".join(name for name, _ in resid_mix_named_params)
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1418,6 +1442,14 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_scalar_final: "
+        f"completed_updates:{step} "
+        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"resid_mix_lr:{optimizer_resid_mix.param_groups[0]['lr']:.8f} "
+        f"scalar_tensors:{len(scalar_params)} scalar_numel:{sum(p.numel() for p in scalar_params)} "
+        f"resid_mix_tensors:{len(resid_mix_params)} resid_mix_numel:{sum(p.numel() for p in resid_mix_params)}"
     )
 
     # -----------------------------
