@@ -1263,6 +1263,11 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"optimizer_muon_schedule: warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"live_group_momentum:{float(optimizer_muon.param_groups[0]['momentum']):.5f}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1403,7 +1408,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"muon_applied_step:{step - 1} "
+                f"muon_momentum_live:{float(optimizer_muon.param_groups[0]['momentum']):.5f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1425,12 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"optimizer_muon_momentum_audit: warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"last_applied_step:{step - 1} "
+        f"live_group_momentum:{float(optimizer_muon.param_groups[0]['momentum']):.5f}"
     )
 
     # -----------------------------
