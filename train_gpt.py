@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    token_lr_warmup_steps = int(os.environ.get("TOKEN_LR_WARMUP_STEPS", 0))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.token_lr_warmup_steps < 0:
+        raise ValueError(f"TOKEN_LR_WARMUP_STEPS must be non-negative, got {args.token_lr_warmup_steps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1271,15 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        "token_lr_schedule:"
+        f"scope:optimizer_tok "
+        f"token_param_tensors:1 "
+        f"token_param_numel:{base_model.tok_emb.weight.numel()} "
+        f"base_lr:{token_lr:.5f} "
+        f"warmup_steps:{args.token_lr_warmup_steps} "
+        f"step1_mul:{(min(1.0 / args.token_lr_warmup_steps, 1.0) if args.token_lr_warmup_steps > 0 else 1.0):.5f}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1292,6 +1304,11 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def token_lr_warmup_mul(step: int) -> float:
+        if args.token_lr_warmup_steps <= 0:
+            return 1.0
+        return min((step + 1) / args.token_lr_warmup_steps, 1.0)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1384,9 +1401,28 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
-        for opt in optimizers:
+        token_lr_scale = scale * token_lr_warmup_mul(step)
+        for group in optimizer_tok.param_groups:
+            group["lr"] = group["base_lr"] * token_lr_scale
+        for opt in optimizers[1:]:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        if args.token_lr_warmup_steps > 0 and step < args.token_lr_warmup_steps:
+            next_step = step + 1
+            should_log_token_warmup = (
+                next_step <= 10
+                or next_step == args.token_lr_warmup_steps
+                or ((next_step & (next_step - 1)) == 0)
+            )
+            if should_log_token_warmup:
+                log0(
+                    "token_lr_warmup_trace:"
+                    f"step:{next_step} "
+                    f"scope:optimizer_tok "
+                    f"lr_mul:{token_lr_scale:.5f} "
+                    f"token_lr:{optimizer_tok.param_groups[0]['lr']:.5f} "
+                    f"global_lr_mul:{scale:.5f}"
+                )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1454,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "token_lr_warmup_audit:"
+        f"scope:optimizer_tok "
+        f"completed_updates:{step} "
+        f"warmup_fraction_completed:{min(step / args.token_lr_warmup_steps, 1.0) if args.token_lr_warmup_steps > 0 else 1.0:.5f} "
+        f"last_token_lr_mul:{token_lr_warmup_mul(max(step - 1, 0)) if step > 0 else 0.0:.5f}"
     )
 
     # -----------------------------
