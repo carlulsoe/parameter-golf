@@ -81,6 +81,10 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    _muon_nesterov = os.environ.get("MUON_NESTEROV", "1")
+    if _muon_nesterov not in ("0", "1"):
+        raise ValueError(f"MUON_NESTEROV must be 0 or 1, got {_muon_nesterov!r}")
+    muon_nesterov = bool(int(_muon_nesterov))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -151,11 +155,13 @@ class Muon(torch.optim.Optimizer):
                     buf = state["momentum_buffer"]
                     buf.mul_(momentum).add_(g)
                     if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                        update = g.add(buf, alpha=momentum)
+                    else:
+                        update = buf
+                    update = zeropower_via_newtonschulz5(update, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    update *= max(1, update.size(0) / update.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = update.reshape(-1)
                 curr += p.numel()
 
             if distributed:
@@ -168,6 +174,39 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
+
+
+def get_optimizer_scope_audit(
+    optimizer: torch.optim.Optimizer, param_name_by_id: dict[int, str], sample_limit: int = 8
+) -> dict[str, str | int]:
+    names: list[str] = []
+    tensor_count = 0
+    numel = 0
+    nesterov_flags: list[str] = []
+    update_sources: list[str] = []
+    for group in optimizer.param_groups:
+        group_params = [p for p in group["params"] if p is not None]
+        tensor_count += len(group_params)
+        numel += sum(int(p.numel()) for p in group_params)
+        nesterov = bool(group.get("nesterov", True))
+        flag = str(int(nesterov))
+        if flag not in nesterov_flags:
+            nesterov_flags.append(flag)
+        source = "grad_plus_momentum" if nesterov else "momentum_buffer"
+        if source not in update_sources:
+            update_sources.append(source)
+        for p in group_params:
+            names.append(param_name_by_id.get(id(p), "<unnamed>"))
+    sample_names = ",".join(names[:sample_limit]) if names else "none"
+    return {
+        "tensor_count": tensor_count,
+        "numel": numel,
+        "nesterov_flags": ",".join(nesterov_flags) if nesterov_flags else "none",
+        "update_sources": ",".join(update_sources) if update_sources else "none",
+        "sample_names": sample_names,
+        "sample_count": min(len(names), sample_limit),
+        "total_names": len(names),
+    }
 
 
 # -----------------------------
@@ -1209,6 +1248,7 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    param_name_by_id = {id(p): name for name, p in base_model.named_parameters()}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1233,6 +1273,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        nesterov=args.muon_nesterov,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1260,7 +1301,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"muon_nesterov:{args.muon_nesterov}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1269,6 +1311,17 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    muon_scope = get_optimizer_scope_audit(optimizer_muon, param_name_by_id)
+    log0(
+        "optimizer_muon_audit "
+        f"stage:startup tensor_count:{muon_scope['tensor_count']} numel:{muon_scope['numel']} "
+        f"nesterov_flags:{muon_scope['nesterov_flags']} update_sources:{muon_scope['update_sources']}"
+    )
+    log0(
+        "optimizer_muon_scope "
+        f"stage:startup sample_count:{muon_scope['sample_count']} total_names:{muon_scope['total_names']} "
+        f"sample:{muon_scope['sample_names']}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1373,17 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        muon_scope = get_optimizer_scope_audit(optimizer_muon, param_name_by_id)
+        log0(
+            "optimizer_muon_audit "
+            f"stage:post_warmup_restore tensor_count:{muon_scope['tensor_count']} numel:{muon_scope['numel']} "
+            f"nesterov_flags:{muon_scope['nesterov_flags']} update_sources:{muon_scope['update_sources']}"
+        )
+        log0(
+            "optimizer_muon_scope "
+            f"stage:post_warmup_restore sample_count:{muon_scope['sample_count']} total_names:{muon_scope['total_names']} "
+            f"sample:{muon_scope['sample_names']}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1482,17 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    muon_scope = get_optimizer_scope_audit(optimizer_muon, param_name_by_id)
+    log0(
+        "optimizer_muon_audit "
+        f"stage:shutdown tensor_count:{muon_scope['tensor_count']} numel:{muon_scope['numel']} "
+        f"nesterov_flags:{muon_scope['nesterov_flags']} update_sources:{muon_scope['update_sources']}"
+    )
+    log0(
+        "optimizer_muon_scope "
+        f"stage:shutdown sample_count:{muon_scope['sample_count']} total_names:{muon_scope['total_names']} "
+        f"sample:{muon_scope['sample_names']}"
     )
 
     # -----------------------------
