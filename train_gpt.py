@@ -60,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -789,9 +788,6 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_tokens_taken = 0
-        self.trace_consumption = False
-        self.consumed_spans: list[tuple[int, int, int]] = []
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -807,29 +803,10 @@ class TokenStream:
                 self._advance_file()
                 continue
             k = min(remaining, avail)
-            start_pos = self.pos
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.total_tokens_taken += k
-            if self.trace_consumption:
-                self.consumed_spans.append((self.file_idx, start_pos, self.pos))
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def snapshot(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "total_tokens_taken": self.total_tokens_taken,
-        }
-
-    def set_trace_consumption(self, enabled: bool) -> None:
-        self.trace_consumption = enabled
-        if enabled:
-            self.consumed_spans = []
-
-    def consumed_spans_summary(self) -> str:
-        return ",".join(f"f{file_idx}:{start}-{end}" for file_idx, start, end in self.consumed_spans)
 
 
 class DistributedTokenLoader:
@@ -850,15 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def snapshot(self) -> dict[str, int]:
-        return self.stream.snapshot()
-
-    def set_trace_consumption(self, enabled: bool) -> None:
-        self.stream.set_trace_consumption(enabled)
-
-    def consumed_spans_summary(self) -> str:
-        return self.stream.consumed_spans_summary()
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1300,7 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1332,7 +1299,6 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        train_loader.set_trace_consumption(True)
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1347,33 +1313,13 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        warmup_spans_summary = train_loader.consumed_spans_summary()
-        train_loader.set_trace_consumption(False)
-        post_warmup_snapshot = train_loader.snapshot()
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.reset_train_loader_after_warmup:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-            measured_snapshot = train_loader.snapshot()
-            loader_mode = "reset"
-        else:
-            measured_snapshot = post_warmup_snapshot
-            loader_mode = "continue"
-        log0(
-            "post_warmup_train_loader: "
-            f"mode:{loader_mode} "
-            f"warmup_file_idx:{post_warmup_snapshot['file_idx']} "
-            f"warmup_pos:{post_warmup_snapshot['pos']} "
-            f"warmup_total_tokens:{post_warmup_snapshot['total_tokens_taken']} "
-            f"measured_file_idx:{measured_snapshot['file_idx']} "
-            f"measured_pos:{measured_snapshot['pos']} "
-            f"measured_total_tokens:{measured_snapshot['total_tokens_taken']}"
-        )
-        log0(f"warmup_train_loader_spans:{warmup_spans_summary or 'none'}")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
