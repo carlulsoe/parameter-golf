@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    control_lr_scale = float(os.environ.get("CONTROL_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1208,58 +1207,21 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam, with an optional strict lower-LR split
-    #   for named control tensors inside that scalar path
+    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    control_name_set = set(CONTROL_TENSOR_NAME_PATTERNS)
-    if args.control_lr_scale <= 0.0:
-        raise ValueError(f"CONTROL_LR_SCALE must be positive, got {args.control_lr_scale}")
-
-    def is_control_param(name: str) -> bool:
-        return any(pattern in name for pattern in control_name_set)
-
-    def summarize_named_params(named_params: list[tuple[str, Tensor]]) -> tuple[int, int, str]:
-        names = [name for name, _ in named_params]
-        numel = sum(int(param.numel()) for _, param in named_params)
-        return len(names), numel, ",".join(names) if names else "none"
-
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not is_control_param(name)
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    control_scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if p.ndim < 2 and is_control_param(name)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    non_control_scalar_named_params = [
-        (name, p)
-        for name, p in block_named_params
-        if p.ndim < 2 and not is_control_param(name)
-    ]
-    if base_model.skip_weights.numel() > 0 and "skip_weights" not in {name for name, _ in control_scalar_named_params}:
-        control_scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    control_scalar_params = [param for _, param in control_scalar_named_params]
-    non_control_scalar_params = [param for _, param in non_control_scalar_named_params]
-    all_scalar_params = non_control_scalar_params + control_scalar_params
-    control_tensor_count, control_numel, control_names = summarize_named_params(control_scalar_named_params)
-    non_control_tensor_count, non_control_numel, non_control_names = summarize_named_params(
-        non_control_scalar_named_params
-    )
-    control_split_active = args.control_lr_scale != 1.0
-    if control_split_active:
-        if control_tensor_count == 0 or control_numel == 0:
-            raise ValueError(
-                "CONTROL_LR_SCALE requested a strict control split, but the control scalar subset is empty"
-            )
-        if non_control_tensor_count < 2 or non_control_numel < args.model_dim:
-            raise ValueError(
-                "CONTROL_LR_SCALE requested a strict control split, but the remaining non-control scalar subset "
-                f"is unexpectedly tiny (tensors={non_control_tensor_count}, numel={non_control_numel})"
-            )
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    control_lr = args.scalar_lr * args.control_lr_scale
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1274,13 +1236,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": all_scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
-    if control_split_active:
-        scalar_param_groups = [
-            {"params": non_control_scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "name": "non_control"},
-            {"params": control_scalar_params, "lr": control_lr, "base_lr": control_lr, "name": "control"},
-        ]
-    optimizer_scalar = torch.optim.Adam(scalar_param_groups, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1299,15 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} control_lr_scale:{args.control_lr_scale} "
-        f"control_lr:{control_lr}"
-    )
-    log0(
-        "optimizer_scalar_split_audit "
-        f"split_active:{control_split_active} control_lr_scale:{args.control_lr_scale:.5f} "
-        f"control_tensors:{control_tensor_count} control_numel:{control_numel} control_names:{control_names} "
-        f"non_control_tensors:{non_control_tensor_count} non_control_numel:{non_control_numel} "
-        f"non_control_names:{non_control_names}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1465,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "optimizer_scalar_split_final "
-        f"split_active:{control_split_active} completed_updates:{step} "
-        f"control_tensors:{control_tensor_count} control_numel:{control_numel} "
-        f"non_control_tensors:{non_control_tensor_count} non_control_numel:{non_control_numel}"
     )
 
     # -----------------------------
