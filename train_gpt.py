@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -758,16 +757,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-def count_param_groups(param_groups: list[dict[str, object]]) -> tuple[int, int]:
-    tensor_count = 0
-    numel_count = 0
-    for group in param_groups:
-        params = group.get("params", [])
-        tensor_count += len(params)
-        numel_count += sum(int(p.numel()) for p in params)
-    return tensor_count, numel_count
-
-
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1182,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not 0.0 < args.beta1 < 1.0:
-        raise ValueError(f"BETA1 must be in (0, 1), got {args.beta1}")
-    if not 0.0 < args.scalar_beta1 < 1.0:
-        raise ValueError(f"SCALAR_BETA1 must be in (0, 1), got {args.scalar_beta1}")
-    if not 0.0 < args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in (0, 1), got {args.beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1257,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.scalar_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1272,24 +1253,10 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    scalar_group_tensors, scalar_group_numel = count_param_groups(optimizer_scalar.param_groups)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"optimizer_betas:beta1:{args.beta1} scalar_beta1:{args.scalar_beta1} "
-        f"beta2:{args.beta2} adam_eps:{args.adam_eps}"
-    )
-    log0(
-        "scalar_group_audit:"
-        f"scalar_optimizer_mode:{'scalar_beta1_override' if args.scalar_beta1 != args.beta1 else 'shared_beta1'} "
-        f"param_groups:{len(optimizer_scalar.param_groups)} "
-        f"scalar_param_tensors:{scalar_group_tensors} "
-        f"scalar_param_numel:{scalar_group_numel} "
-        f"scalar_param_share:{scalar_group_numel / max(n_params, 1):.8f} "
-        "scope:block_named_params(ndim<2_or_control_name_match)+skip_weights"
-    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
