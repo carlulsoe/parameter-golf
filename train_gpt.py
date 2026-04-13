@@ -82,7 +82,7 @@ class Hyperparameters:
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 256))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1268,6 +1268,10 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"muon_schedule:warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1292,6 +1296,10 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def muon_momentum_for_step(step: int) -> float:
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1379,8 +1387,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_step(step)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1419,6 +1426,23 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if step > 0:
+        last_applied_step = step - 1
+        warmup_fraction_completed = (
+            min(last_applied_step / args.muon_momentum_warmup_steps, 1.0)
+            if args.muon_momentum_warmup_steps > 0
+            else 1.0
+        )
+        log0(
+            f"muon_warmup_audit:measured_stop_step:{step} last_applied_step:{last_applied_step} "
+            f"last_muon_momentum:{muon_momentum_for_step(last_applied_step):.5f} "
+            f"warmup_fraction_completed:{warmup_fraction_completed:.5f}"
+        )
+    else:
+        log0(
+            "muon_warmup_audit:measured_stop_step:0 last_applied_step:none "
+            "last_muon_momentum:none warmup_fraction_completed:none"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
