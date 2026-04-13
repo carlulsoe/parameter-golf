@@ -1269,35 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.muon_backend_steps <= 0:
-        raise ValueError(f"MUON_BACKEND_STEPS must be positive, got {args.muon_backend_steps}")
-    if not (0.0 <= args.muon_momentum_warmup_start < 1.0):
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_START must be in [0, 1), got {args.muon_momentum_warmup_start}"
-        )
-    if not (0.0 <= args.muon_momentum < 1.0):
-        raise ValueError(f"MUON_MOMENTUM must be in [0, 1), got {args.muon_momentum}")
-    if args.muon_momentum_warmup_steps < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}"
-        )
-    muon_tensor_count = len(matrix_params)
-    muon_numel = sum(int(p.numel()) for p in matrix_params)
-    warmup_end_step = max(args.muon_momentum_warmup_steps - 1, 0) if args.muon_momentum_warmup_steps > 0 else -1
-    log0(
-        "optimizer_muon: "
-        f"tensors:{muon_tensor_count} numel:{muon_numel} "
-        f"backend_steps:{args.muon_backend_steps} "
-        f"momentum_start:{args.muon_momentum_warmup_start:.5f} "
-        f"momentum_target:{args.muon_momentum:.5f}"
-    )
-    log0(
-        "muon_momentum_schedule: "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_end_step:{warmup_end_step} "
-        "optimizer_step_semantics:pre_update_step "
-        "checkpoint_log_semantics:last_completed_update"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1321,12 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def muon_momentum_for_step(pre_update_step: int) -> float:
-        if args.muon_momentum_warmup_steps <= 0:
-            return args.muon_momentum
-        frac = min(pre_update_step / args.muon_momentum_warmup_steps, 1.0)
-        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1385,11 +1350,9 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
-            muon_momentum_last = muon_momentum_for_step(step - 1) if step > 0 else 0.0
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"muon_momentum_last:{muon_momentum_last:.5f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1416,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_step(step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1437,11 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            muon_momentum_last = muon_momentum_for_step(step - 1)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"muon_momentum_last:{muon_momentum_last:.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1456,13 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    final_muon_momentum = muon_momentum_for_step(step - 1) if step > 0 else 0.0
-    log0(
-        "optimizer_muon_final: "
-        f"tensors:{muon_tensor_count} numel:{muon_numel} "
-        f"backend_steps:{args.muon_backend_steps} "
-        f"completed_updates:{step} last_muon_momentum:{final_muon_momentum:.5f}"
     )
 
     # -----------------------------
