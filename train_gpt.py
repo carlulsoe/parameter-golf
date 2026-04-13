@@ -1221,6 +1221,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_tensor_count = len(scalar_params)
+    scalar_param_count = sum(p.numel() for p in scalar_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1261,6 +1263,11 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "scalar_lr_audit_setup: "
+        f"tensor_count:{scalar_tensor_count} param_count:{scalar_param_count} "
+        f"base_lr:{args.scalar_lr:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1327,6 +1334,12 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    scalar_lr_trace_steps = (1, 2, 10, 200)
+    scalar_lr_trace_reached = {trace_step: 0 for trace_step in scalar_lr_trace_steps}
+    min_scalar_lr_mul = float("inf")
+    last_scalar_lr_mul = 1.0
+    min_scalar_effective_lr = float("inf")
+    last_scalar_effective_lr = args.scalar_lr
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1380,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        scalar_effective_lr = args.scalar_lr * scale
+        min_scalar_lr_mul = min(min_scalar_lr_mul, scale)
+        last_scalar_lr_mul = scale
+        min_scalar_effective_lr = min(min_scalar_effective_lr, scalar_effective_lr)
+        last_scalar_effective_lr = scalar_effective_lr
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1395,6 +1413,13 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if step in scalar_lr_trace_reached:
+            scalar_lr_trace_reached[step] = 1
+            log0(
+                "scalar_lr_trace: "
+                f"step:{step} lr_mul:{scale:.8f} effective_lr:{scalar_effective_lr:.8f} "
+                f"base_lr:{args.scalar_lr:.8f}"
+            )
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1415,6 +1440,19 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    if min_scalar_lr_mul == float("inf"):
+        min_scalar_lr_mul = 1.0
+    if min_scalar_effective_lr == float("inf"):
+        min_scalar_effective_lr = args.scalar_lr
+    log0(
+        "scalar_lr_audit: "
+        f"completed_updates:{step} measured_stop_step:{stop_after_step if stop_after_step is not None else step} "
+        f"base_lr:{args.scalar_lr:.8f} min_lr_mul:{min_scalar_lr_mul:.8f} "
+        f"last_lr_mul:{last_scalar_lr_mul:.8f} min_effective_lr:{min_scalar_effective_lr:.8f} "
+        f"last_effective_lr:{last_scalar_effective_lr:.8f} "
+        f"step1_reached:{scalar_lr_trace_reached[1]} step2_reached:{scalar_lr_trace_reached[2]} "
+        f"step10_reached:{scalar_lr_trace_reached[10]} step200_reached:{scalar_lr_trace_reached[200]}"
+    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
