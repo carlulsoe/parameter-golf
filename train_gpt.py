@@ -60,6 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    global_lr_audit_steps_raw = os.environ.get("GLOBAL_LR_AUDIT_STEPS", "")
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1091,6 +1092,29 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
+    def parse_positive_int_csv(raw_value: str, env_name: str) -> tuple[int, ...]:
+        if not raw_value.strip():
+            return ()
+        values: list[int] = []
+        seen: set[int] = set()
+        for entry in raw_value.split(","):
+            item = entry.strip()
+            if not item:
+                raise ValueError(f"{env_name} must be a comma-separated list of positive integers without empty entries")
+            try:
+                value = int(item)
+            except ValueError as exc:
+                raise ValueError(f"{env_name} entries must be positive integers, got {item!r}") from exc
+            if value <= 0:
+                raise ValueError(f"{env_name} entries must be positive integers, got {value}")
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+        return tuple(values)
+
+    global_lr_audit_steps = parse_positive_int_csv(args.global_lr_audit_steps_raw, "GLOBAL_LR_AUDIT_STEPS")
+    global_lr_audit_step_set = set(global_lr_audit_steps)
+
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
@@ -1268,6 +1292,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if global_lr_audit_steps:
+        log0(
+            f"global_lr_audit enabled:True steps:{','.join(str(step) for step in global_lr_audit_steps)} "
+            "step_semantics:applied_step_one_based scope:shared_unfloored"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1356,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    global_lr_audit_reached_steps: list[int] = []
+    last_unfloored_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1398,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        applied_step = step + 1
+        last_unfloored_mult = scale
+        if applied_step in global_lr_audit_step_set:
+            global_lr_audit_reached_steps.append(applied_step)
+            log0(
+                f"global_lr_audit_trace applied_step:{applied_step} "
+                f"elapsed_ms:{elapsed_ms:.0f} unfloored_mult:{scale:.8f}"
+            )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1414,6 +1453,14 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if global_lr_audit_steps:
+        reached_steps_text = ",".join(str(step) for step in global_lr_audit_reached_steps) if global_lr_audit_reached_steps else "none"
+        log0(
+            f"global_lr_audit_summary configured_steps:{','.join(str(step) for step in global_lr_audit_steps)} "
+            f"reached_steps:{reached_steps_text} completed_updates:{step} "
+            f"last_unfloored_mult:{last_unfloored_mult:.8f}"
+        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
