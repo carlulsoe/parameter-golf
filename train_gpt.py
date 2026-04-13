@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_optimizer_audit_steps = int(os.environ.get("TOKEN_OPTIMIZER_AUDIT_STEPS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1262,6 +1263,14 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if args.token_optimizer_audit_steps < 0:
+        raise ValueError(f"TOKEN_OPTIMIZER_AUDIT_STEPS must be non-negative, got {args.token_optimizer_audit_steps}")
+    if args.token_optimizer_audit_steps > 0:
+        log0(
+            f"token_optimizer_audit scope:optimizer_tok target:tok_emb.weight "
+            f"audit_steps:{args.token_optimizer_audit_steps} token_param_tensors:1 "
+            f"token_param_numel:{base_model.tok_emb.weight.numel()} grad_clip_norm:{args.grad_clip_norm:.5f}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1327,6 +1336,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    token_optimizer_audit_records: list[dict[str, float]] = []
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1390,8 +1400,51 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        audit_step = step + 1
+        audit_token_optimizer = 0 < args.token_optimizer_audit_steps and audit_step <= args.token_optimizer_audit_steps
+        tok_weight_before: Tensor | None = None
+        tok_param_rms = 0.0
+        tok_grad_rms = 0.0
+        tok_grad_norm = 0.0
+        tok_lr = 0.0
+        if audit_token_optimizer:
+            tok_grad = base_model.tok_emb.weight.grad
+            if tok_grad is None:
+                raise RuntimeError("token optimizer audit expected tok_emb.weight.grad to be populated before optimizer step")
+            tok_weight_before = base_model.tok_emb.weight.detach().clone()
+            tok_weight_before_f32 = tok_weight_before.float()
+            tok_grad_f32 = tok_grad.detach().float()
+            tok_param_rms = tok_weight_before_f32.square().mean().sqrt().item()
+            tok_grad_rms = tok_grad_f32.square().mean().sqrt().item()
+            tok_grad_norm = tok_grad_f32.norm().item()
+            tok_lr = float(optimizer_tok.param_groups[0]["lr"])
         for opt in optimizers:
             opt.step()
+        if audit_token_optimizer:
+            assert tok_weight_before is not None
+            tok_update = base_model.tok_emb.weight.detach().float() - tok_weight_before.float()
+            tok_update_rms = tok_update.square().mean().sqrt().item()
+            tok_update_norm = tok_update.norm().item()
+            tok_relative_update_rms = tok_update_rms / max(tok_param_rms, 1e-12)
+            token_optimizer_audit_records.append(
+                {
+                    "step": float(audit_step),
+                    "token_lr": tok_lr,
+                    "param_rms": tok_param_rms,
+                    "post_clip_grad_rms": tok_grad_rms,
+                    "post_clip_grad_norm": tok_grad_norm,
+                    "update_rms": tok_update_rms,
+                    "update_norm": tok_update_norm,
+                    "relative_update_rms": tok_relative_update_rms,
+                }
+            )
+            if audit_step <= 4 or audit_step == args.token_optimizer_audit_steps or audit_step & (audit_step - 1) == 0:
+                log0(
+                    f"token_optimizer_audit_trace step:{audit_step} token_lr:{tok_lr:.6f} "
+                    f"param_rms:{tok_param_rms:.8f} post_clip_grad_rms:{tok_grad_rms:.8f} "
+                    f"post_clip_grad_norm:{tok_grad_norm:.8f} update_rms:{tok_update_rms:.8f} "
+                    f"update_norm:{tok_update_norm:.8f} relative_update_rms:{tok_relative_update_rms:.8f}"
+                )
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1472,18 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if token_optimizer_audit_records:
+        mean_post_clip_grad_rms = sum(r["post_clip_grad_rms"] for r in token_optimizer_audit_records) / len(token_optimizer_audit_records)
+        mean_relative_update_rms = sum(r["relative_update_rms"] for r in token_optimizer_audit_records) / len(token_optimizer_audit_records)
+        peak_grad_record = max(token_optimizer_audit_records, key=lambda r: r["post_clip_grad_norm"])
+        peak_update_record = max(token_optimizer_audit_records, key=lambda r: r["relative_update_rms"])
+        log0(
+            f"token_optimizer_audit_summary scope:optimizer_tok audited_updates:{len(token_optimizer_audit_records)} "
+            f"configured_steps:{args.token_optimizer_audit_steps} mean_post_clip_grad_rms:{mean_post_clip_grad_rms:.8f} "
+            f"peak_post_clip_grad_step:{int(peak_grad_record['step'])} peak_post_clip_grad_norm:{peak_grad_record['post_clip_grad_norm']:.8f} "
+            f"mean_relative_update_rms:{mean_relative_update_rms:.8f} "
+            f"peak_relative_update_step:{int(peak_update_record['step'])} peak_relative_update_rms:{peak_update_record['relative_update_rms']:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
