@@ -88,9 +88,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-
-DEFAULT_TIED_EMBED_LR = 0.05
-
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1178,12 +1175,6 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    tied_embed_lr_override_active = args.tied_embed_lr != DEFAULT_TIED_EMBED_LR
-    if tied_embed_lr_override_active and not args.tie_embeddings:
-        raise ValueError(
-            "TIED_EMBED_LR override requires TIE_EMBEDDINGS=1; "
-            f"got TIE_EMBEDDINGS=0 TIED_EMBED_LR={args.tied_embed_lr}"
-        )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1270,17 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "optimizer_tok_scope_audit: "
-        f"tie_embeddings:{args.tie_embeddings} "
-        f"tied_embed_lr_override_active:{tied_embed_lr_override_active} "
-        f"token_lr_source:{'TIED_EMBED_LR' if args.tie_embeddings else 'EMBED_LR'} "
-        f"optimizer_tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-        f"optimizer_head:{'inactive' if base_model.lm_head is None else 'active'} "
-        f"optimizer_head_lr:{0.0 if base_model.lm_head is None else optimizer_head.param_groups[0]['lr']:.8f} "
-        f"tok_emb_shape:{tuple(base_model.tok_emb.weight.shape)} "
-        f"lm_head_shape:{'none' if base_model.lm_head is None else tuple(base_model.lm_head.weight.shape)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
