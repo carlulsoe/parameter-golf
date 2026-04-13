@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_export_decay = float(os.environ.get("EMA_EXPORT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -466,6 +467,81 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+def ema_enabled(args: Hyperparameters) -> bool:
+    return args.ema_export_decay > 0.0
+
+def init_ema_shadow(model: nn.Module) -> dict[str, Tensor]:
+    shadow: dict[str, Tensor] = {}
+    for name, param in model.named_parameters():
+        if param.is_floating_point():
+            shadow[name] = param.detach().float().clone()
+    return shadow
+
+@torch.no_grad()
+def update_ema_shadow(model: nn.Module, shadow: dict[str, Tensor], decay: float) -> None:
+    one_minus_decay = 1.0 - decay
+    for name, param in model.named_parameters():
+        if name not in shadow:
+            continue
+        shadow[name].mul_(decay).add_(param.detach().float(), alpha=one_minus_decay)
+
+def build_export_state_dict(model: nn.Module, ema_shadow: dict[str, Tensor] | None) -> dict[str, Tensor]:
+    export_state: dict[str, Tensor] = {}
+    for name, tensor in model.state_dict().items():
+        if ema_shadow is not None and name in ema_shadow:
+            export_state[name] = ema_shadow[name]
+        else:
+            export_state[name] = tensor
+    return export_state
+
+def summarize_ema_delta(
+    model: nn.Module,
+    ema_shadow: dict[str, Tensor] | None,
+) -> dict[str, float | int | str]:
+    if ema_shadow is None:
+        return {
+            "enabled": "0",
+            "tensor_count": 0,
+            "param_count": 0,
+            "mean_abs_delta": 0.0,
+            "rms_delta": 0.0,
+            "max_abs_delta": 0.0,
+            "live_checksum": 0.0,
+            "ema_checksum": 0.0,
+        }
+    tensor_count = 0
+    param_count = 0
+    abs_delta_sum = 0.0
+    sq_delta_sum = 0.0
+    max_abs_delta = 0.0
+    live_checksum = 0.0
+    ema_checksum = 0.0
+    for name, param in model.named_parameters():
+        if name not in ema_shadow:
+            continue
+        live = param.detach().float()
+        ema = ema_shadow[name]
+        delta = ema - live
+        tensor_count += 1
+        param_count += int(live.numel())
+        abs_delta_sum += float(delta.abs().sum().item())
+        sq_delta_sum += float(delta.square().sum().item())
+        max_abs_delta = max(max_abs_delta, float(delta.abs().max().item()))
+        live_checksum += float(live.double().sum().item())
+        ema_checksum += float(ema.double().sum().item())
+    mean_abs_delta = abs_delta_sum / max(param_count, 1)
+    rms_delta = math.sqrt(sq_delta_sum / max(param_count, 1))
+    return {
+        "enabled": "1",
+        "tensor_count": tensor_count,
+        "param_count": param_count,
+        "mean_abs_delta": mean_abs_delta,
+        "rms_delta": rms_delta,
+        "max_abs_delta": max_abs_delta,
+        "live_checksum": live_checksum,
+        "ema_checksum": ema_checksum,
+    }
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1089,6 +1165,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.ema_export_decay < 0.0 or args.ema_export_decay >= 1.0:
+        raise ValueError(f"EMA_EXPORT_DECAY must be in [0, 1), got {args.ema_export_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1268,6 +1346,12 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"ema_export_mode:{'enabled' if ema_enabled(args) else 'disabled'} "
+        f"ema_export_decay:{args.ema_export_decay:.6f} "
+        "ema_scope:final_export_only "
+        "raw_checkpoint:final_model.pt"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1411,14 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_shadow = init_ema_shadow(base_model) if ema_enabled(args) else None
+    if ema_shadow is not None:
+        ema_shadow_bytes = sum(tensor_nbytes(t) for t in ema_shadow.values())
+        ema_shadow_params = sum(int(t.numel()) for t in ema_shadow.values())
+        log0(
+            f"ema_shadow:tensors:{len(ema_shadow)} params:{ema_shadow_params} "
+            f"bytes:{ema_shadow_bytes} device:{device.type} update_timing:post_optimizer_step"
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1392,6 +1484,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_shadow is not None:
+            update_ema_shadow(base_model, ema_shadow, args.ema_export_decay)
         zero_grad_all()
 
         step += 1
@@ -1434,7 +1528,10 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    export_source = "ema" if ema_shadow is not None else "live"
+    export_state_dict = build_export_state_dict(base_model, ema_shadow)
+    ema_delta_summary = summarize_ema_delta(base_model, ema_shadow)
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1446,6 +1543,22 @@ def main() -> None:
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(
+            "Export source: "
+            f"mode:{export_source} "
+            f"ema_enabled:{ema_delta_summary['enabled']} "
+            f"measured_updates:{step}"
+        )
+        log0(
+            "EMA export audit: "
+            f"tensor_count:{ema_delta_summary['tensor_count']} "
+            f"param_count:{ema_delta_summary['param_count']} "
+            f"mean_abs_delta:{float(ema_delta_summary['mean_abs_delta']):.8e} "
+            f"rms_delta:{float(ema_delta_summary['rms_delta']):.8e} "
+            f"max_abs_delta:{float(ema_delta_summary['max_abs_delta']):.8e} "
+            f"live_checksum:{float(ema_delta_summary['live_checksum']):.8e} "
+            f"ema_checksum:{float(ema_delta_summary['ema_checksum']):.8e}"
+        )
         if INT8_AUTO_KEEP_FLOAT_NAME_PATTERNS:
             log0(
                 "Int8 auto-keep selector: "
