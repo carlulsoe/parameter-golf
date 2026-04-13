@@ -1293,19 +1293,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    lr_trace_steps = (0, 1, 9, 199)
-    lr_trace_steps_reached: list[int] = []
-    lr_first_decay_step: int | None = None
-    lr_min_scale = 1.0
-    last_applied_lr_scale = 1.0
-    log0(
-        "lr_schedule_audit_setup: "
-        "step_semantics:applied_step_zero_based "
-        f"mode:{'wallclock_aware' if max_wallclock_ms is not None else 'iteration_tail'} "
-        f"warmdown_iters:{args.warmdown_iters} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1380,9 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if lr_first_decay_step is None and scale < 1.0:
-            lr_first_decay_step = step
-        lr_min_scale = min(lr_min_scale, scale)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1403,22 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        last_applied_lr_scale = scale
-
-        if step in lr_trace_steps:
-            head_lr = 0.0
-            if base_model.lm_head is not None:
-                head_lr = float(optimizer_head.param_groups[0]["lr"])
-            lr_trace_steps_reached.append(step)
-            log0(
-                "lr_schedule_trace: "
-                f"applied_step:{step} "
-                f"scale:{scale:.8f} "
-                f"tok_lr:{float(optimizer_tok.param_groups[0]['lr']):.8f} "
-                f"matrix_lr:{float(optimizer_muon.param_groups[0]['lr']):.8f} "
-                f"scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
-                f"head_lr:{head_lr:.8f}"
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1450,15 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "lr_schedule_audit: "
-        f"first_decay_step:{lr_first_decay_step if lr_first_decay_step is not None else 'none'} "
-        f"last_applied_step:{max(step - 1, -1)} "
-        f"last_scale:{last_applied_lr_scale:.8f} "
-        f"min_scale:{lr_min_scale:.8f} "
-        "trace_steps_reached:"
-        + ",".join(str(trace_step) for trace_step in lr_trace_steps_reached)
     )
 
     # -----------------------------
