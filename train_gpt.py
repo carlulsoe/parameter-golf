@@ -83,7 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_norm_audit = bool(int(os.environ.get("MUON_NORM_AUDIT", "0")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -113,45 +112,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        nesterov: bool = True,
-        norm_audit: bool = False,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
-        self.norm_audit_enabled = norm_audit
-        self.norm_audit_active = False
-        self.norm_audit_floor_eps = 1e-7
-        self.norm_audit_proposed_eps = 1e-6
-        self.norm_audit_stats: dict[str, Tensor] | None = None
-
-    def set_norm_audit_active(self, active: bool) -> None:
-        self.norm_audit_active = self.norm_audit_enabled and active
-
-    def _ensure_norm_audit_stats(self, device: torch.device) -> dict[str, Tensor]:
-        if self.norm_audit_stats is None:
-            self.norm_audit_stats = {
-                "audited_steps": torch.zeros((), device=device, dtype=torch.int64),
-                "total_matrix_norms": torch.zeros((), device=device, dtype=torch.int64),
-                "total_hits_floor_eps": torch.zeros((), device=device, dtype=torch.int64),
-                "total_hits_proposed_eps": torch.zeros((), device=device, dtype=torch.int64),
-                "step_hits_floor_eps": torch.zeros((), device=device, dtype=torch.int64),
-                "step_hits_proposed_eps": torch.zeros((), device=device, dtype=torch.int64),
-                "min_norm": torch.full((), float("inf"), device=device, dtype=torch.float64),
-            }
-        return self.norm_audit_stats
-
-    def get_norm_audit_stats(self) -> dict[str, Tensor] | None:
-        if self.norm_audit_stats is None:
-            return None
-        return {name: value.detach().clone() for name, value in self.norm_audit_stats.items()}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -163,18 +128,11 @@ class Muon(torch.optim.Optimizer):
         distributed = dist.is_available() and dist.is_initialized()
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
-        norm_audit_stats = None
-        step_hits_floor_eps = None
-        step_hits_proposed_eps = None
 
         for group in self.param_groups:
             params = group["params"]
             if not params:
                 continue
-            if self.norm_audit_active and norm_audit_stats is None:
-                norm_audit_stats = self._ensure_norm_audit_stats(params[0].device)
-                step_hits_floor_eps = torch.zeros((), device=params[0].device, dtype=torch.int64)
-                step_hits_proposed_eps = torch.zeros((), device=params[0].device, dtype=torch.int64)
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
@@ -194,16 +152,6 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    if norm_audit_stats is not None:
-                        g_norm = g.bfloat16().norm().to(dtype=torch.float64)
-                        hit_floor_eps = (g_norm <= self.norm_audit_floor_eps).to(dtype=torch.int64)
-                        hit_proposed_eps = (g_norm <= self.norm_audit_proposed_eps).to(dtype=torch.int64)
-                        norm_audit_stats["total_matrix_norms"].add_(1)
-                        norm_audit_stats["total_hits_floor_eps"].add_(hit_floor_eps)
-                        norm_audit_stats["total_hits_proposed_eps"].add_(hit_proposed_eps)
-                        step_hits_floor_eps.add_(hit_floor_eps)
-                        step_hits_proposed_eps.add_(hit_proposed_eps)
-                        norm_audit_stats["min_norm"].copy_(torch.minimum(norm_audit_stats["min_norm"], g_norm))
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -218,11 +166,6 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
-
-        if norm_audit_stats is not None and step_hits_floor_eps is not None and step_hits_proposed_eps is not None:
-            norm_audit_stats["audited_steps"].add_(1)
-            norm_audit_stats["step_hits_floor_eps"].add_((step_hits_floor_eps > 0).to(dtype=torch.int64))
-            norm_audit_stats["step_hits_proposed_eps"].add_((step_hits_proposed_eps > 0).to(dtype=torch.int64))
 
         return loss
 
@@ -1158,8 +1101,6 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if args.muon_norm_audit and world_size != 1:
-        raise ValueError(f"MUON_NORM_AUDIT currently requires WORLD_SIZE=1, got WORLD_SIZE={world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
@@ -1292,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        norm_audit=args.muon_norm_audit,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1322,14 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if args.muon_norm_audit:
-        log0(
-            "muon_norm_audit: "
-            "enabled:True scope:pre_normalization_bfloat16_matrix_grad_norms "
-            "measured_training_only:True "
-            f"floor_eps:{optimizer_muon.norm_audit_floor_eps:.1e} "
-            f"proposed_eps:{optimizer_muon.norm_audit_proposed_eps:.1e}"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1388,8 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    if args.muon_norm_audit:
-        optimizer_muon.set_norm_audit_active(True)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1489,32 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.muon_norm_audit:
-        norm_audit_stats = optimizer_muon.get_norm_audit_stats()
-        if norm_audit_stats is None:
-            log0("muon_norm_audit_summary: audited_steps:0 total_matrix_norms:0")
-        else:
-            audited_steps = int(norm_audit_stats["audited_steps"].item())
-            total_matrix_norms = int(norm_audit_stats["total_matrix_norms"].item())
-            total_hits_floor_eps = int(norm_audit_stats["total_hits_floor_eps"].item())
-            total_hits_proposed_eps = int(norm_audit_stats["total_hits_proposed_eps"].item())
-            step_hits_floor_eps = int(norm_audit_stats["step_hits_floor_eps"].item())
-            step_hits_proposed_eps = int(norm_audit_stats["step_hits_proposed_eps"].item())
-            min_norm = float(norm_audit_stats["min_norm"].item()) if total_matrix_norms > 0 else float("nan")
-            log0(
-                "muon_norm_audit_summary: "
-                f"audited_steps:{audited_steps} "
-                f"total_matrix_norms:{total_matrix_norms} "
-                f"step_hits_floor_eps:{step_hits_floor_eps} "
-                f"step_hits_proposed_eps:{step_hits_proposed_eps} "
-                f"total_hits_floor_eps:{total_hits_floor_eps} "
-                f"total_hits_proposed_eps:{total_hits_proposed_eps} "
-                f"step_hit_frac_floor_eps:{step_hits_floor_eps / max(audited_steps, 1):.8f} "
-                f"step_hit_frac_proposed_eps:{step_hits_proposed_eps / max(audited_steps, 1):.8f} "
-                f"matrix_hit_frac_floor_eps:{total_hits_floor_eps / max(total_matrix_norms, 1):.8f} "
-                f"matrix_hit_frac_proposed_eps:{total_hits_proposed_eps / max(total_matrix_norms, 1):.8f} "
-                f"min_norm:{min_norm:.8e}"
-            )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
