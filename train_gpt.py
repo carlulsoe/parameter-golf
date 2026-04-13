@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,9 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    for name, value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("SCALAR_BETA2", args.scalar_beta2)):
-        if not (0.0 <= value < 1.0):
-            raise ValueError(f"{name} must satisfy 0 <= value < 1, got {value}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1218,15 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (f"blocks.{name}", p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    scalar_params = [param for _, param in scalar_named_params]
-    scalar_param_to_name = {id(param): name for name, param in scalar_named_params}
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1244,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.scalar_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1259,30 +1253,10 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    optimizer_head_beta2_str = "inactive"
-    if base_model.lm_head is not None:
-        optimizer_head_beta2_str = f"{optimizer_head.param_groups[0]['betas'][1]:.8f}"
-    scalar_group_names = [
-        scalar_param_to_name.get(id(param), "<unknown>")
-        for param in optimizer_scalar.param_groups[0]["params"]
-    ]
-    scalar_group_numel = sum(int(param.numel()) for param in optimizer_scalar.param_groups[0]["params"])
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        "optimizer_beta2_scope: "
-        f"optimizer_tok:{optimizer_tok.param_groups[0]['betas'][1]:.8f} "
-        f"optimizer_scalar:{optimizer_scalar.param_groups[0]['betas'][1]:.8f} "
-        f"optimizer_head:{optimizer_head_beta2_str}"
-    )
-    log0(
-        "optimizer_scalar_group: "
-        f"tensors:{len(scalar_group_names)} "
-        f"numel:{scalar_group_numel} "
-        f"names:{','.join(scalar_group_names)}"
-    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
