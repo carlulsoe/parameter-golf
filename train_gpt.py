@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    skip_lr_scale = float(os.environ.get("SKIP_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.skip_lr_scale < 0.0:
-        raise ValueError(f"SKIP_LR_SCALE must be non-negative, got {args.skip_lr_scale}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1222,10 +1219,9 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    skip_params = [base_model.skip_weights] if base_model.skip_weights.numel() > 0 else []
-    skip_param_names = ["skip_weights"] if skip_params else []
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    skip_lr = args.scalar_lr * args.skip_lr_scale
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1247,15 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_skip = None
-    if skip_params:
-        optimizer_skip = torch.optim.Adam(
-            [{"params": skip_params, "lr": skip_lr, "base_lr": skip_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_skip)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1273,20 +1260,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"skip_lr_scale:{args.skip_lr_scale} skip_lr:{skip_lr if skip_params else 0.0}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        "optimizer_scalar_groups: "
-        f"scalar_tensors:{len(scalar_params)} "
-        f"scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
-        f"skip_tensors:{len(skip_params)} "
-        f"skip_numel:{sum(int(p.numel()) for p in skip_params)} "
-        f"skip_lr_scale:{args.skip_lr_scale:.5f} "
-        f"skip_lr:{skip_lr:.8f}"
-    )
-    if skip_param_names:
-        log0(f"optimizer_skip_names: {','.join(skip_param_names)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1443,14 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    final_skip_lr = optimizer_skip.param_groups[0]["lr"] if optimizer_skip is not None else 0.0
-    log0(
-        "optimizer_scalar_final: "
-        f"completed_updates:{step} "
-        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-        f"skip_lr:{final_skip_lr:.8f} "
-        f"skip_lr_scale:{args.skip_lr_scale:.5f}"
     )
 
     # -----------------------------
