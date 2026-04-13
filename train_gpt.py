@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import glob
-import hashlib
 import inspect
 import io
 import math
@@ -61,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    preserve_warmup_stream_position = bool(int(os.environ.get("PRESERVE_WARMUP_STREAM_POSITION", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -783,8 +781,8 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str, files: list[Path] | None = None):
-        self.files = [Path(p) for p in files] if files is not None else [Path(p) for p in sorted(glob.glob(pattern))]
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
@@ -810,34 +808,15 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-    def get_state(self) -> tuple[int, int]:
-        return self.file_idx, self.pos
-
-    def set_state(self, file_idx: int, pos: int) -> None:
-        if not 0 <= file_idx < len(self.files):
-            raise ValueError(f"file_idx out of range: {file_idx}")
-        self.file_idx = file_idx
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        if not 0 <= pos <= self.tokens.numel():
-            raise ValueError(f"pos out of range for shard {self.files[self.file_idx]}: {pos}")
-        self.pos = pos
-
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(
-        self,
-        pattern: str,
-        rank: int,
-        world_size: int,
-        device: torch.device,
-        files: list[Path] | None = None,
-    ):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, files=files)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -848,27 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def get_state(self) -> tuple[int, int]:
-        return self.stream.get_state()
-
-    def set_state(self, state: tuple[int, int]) -> None:
-        self.stream.set_state(*state)
-
-    def describe_state(self) -> str:
-        file_idx, pos = self.get_state()
-        shard = self.stream.files[file_idx]
-        return (
-            f"file_idx:{file_idx} shard:{shard.name} pos:{pos} "
-            f"shard_tokens:{self.stream.tokens.numel()}"
-        )
-
-    def ordered_shards_digest(self) -> str:
-        joined = "\n".join(str(path) for path in self.stream.files)
-        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-    def ordered_shards_prefix(self, k: int = 4) -> str:
-        return ",".join(path.name for path in self.stream.files[: max(k, 0)])
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1317,13 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    if master_process:
-        log0(
-            "train_loader_order: "
-            f"digest:{train_loader.ordered_shards_digest()} "
-            f"count:{len(train_loader.stream.files)} "
-            f"prefix:{train_loader.ordered_shards_prefix()}"
-        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1344,13 +1295,9 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    measured_stream_start_state: tuple[int, int] | None = None
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        warmup_start_state = train_loader.get_state()
-        if master_process:
-            log0(f"warmup_stream:start {train_loader.describe_state()}")
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -1366,9 +1313,6 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        warmup_end_state = train_loader.get_state()
-        if master_process:
-            log0(f"warmup_stream:end {train_loader.describe_state()}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1376,26 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        if args.preserve_warmup_stream_position:
-            train_loader.set_state(warmup_end_state)
-            measured_stream_start_state = warmup_end_state
-            if master_process:
-                log0("warmup_stream:measured_resume:preserved")
-        else:
-            measured_stream_start_state = train_loader.get_state()
-            if master_process:
-                log0("warmup_stream:measured_resume:replayed")
-        if master_process:
-            log0(
-                "warmup_stream:resume_audit "
-                f"replays_warmup_prefix:{int(measured_stream_start_state == warmup_start_state)} "
-                f"same_as_warmup_end:{int(measured_stream_start_state == warmup_end_state)}"
-            )
-            log0(f"measured_stream:first_batch_start {train_loader.describe_state()}")
-    else:
-        measured_stream_start_state = train_loader.get_state()
-        if master_process:
-            log0(f"measured_stream:first_batch_start {train_loader.describe_state()}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
