@@ -1214,6 +1214,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_param_tensors = len(matrix_params)
+    matrix_param_numel = sum(p.numel() for p in matrix_params)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1261,6 +1263,14 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "muon_matrix_lr_schedule: "
+        f"base_lr:{args.matrix_lr:.5f} "
+        f"warmdown_iters:{args.warmdown_iters} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
+        f"matrix_param_tensors:{matrix_param_tensors} "
+        f"matrix_param_numel:{matrix_param_numel}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1327,6 +1337,12 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    muon_matrix_lr_sum = 0.0
+    muon_matrix_lr_peak = 0.0
+    muon_matrix_lr_last = 0.0
+    muon_global_lr_mul_last = 1.0
+    muon_matrix_lr_step200: float | None = None
+    muon_global_lr_mul_step200: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1383,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        matrix_lr = args.matrix_lr * scale
+        muon_matrix_lr_sum += matrix_lr
+        muon_matrix_lr_peak = max(muon_matrix_lr_peak, matrix_lr)
+        muon_matrix_lr_last = matrix_lr
+        muon_global_lr_mul_last = scale
+        if step + 1 == 200:
+            muon_matrix_lr_step200 = matrix_lr
+            muon_global_lr_mul_step200 = scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1415,6 +1439,18 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    mean_muon_matrix_lr = muon_matrix_lr_sum / max(step, 1)
+    log0(
+        "muon_matrix_lr_audit: "
+        f"completed_updates:{step} "
+        f"step200_reached:{int(muon_matrix_lr_step200 is not None)} "
+        f"step200_global_lr_mul:{(muon_global_lr_mul_step200 if muon_global_lr_mul_step200 is not None else 0.0):.8f} "
+        f"step200_matrix_lr:{(muon_matrix_lr_step200 if muon_matrix_lr_step200 is not None else 0.0):.8f} "
+        f"mean_matrix_lr:{mean_muon_matrix_lr:.8f} "
+        f"peak_matrix_lr:{muon_matrix_lr_peak:.8f} "
+        f"last_global_lr_mul:{muon_global_lr_mul_last:.8f} "
+        f"last_matrix_lr:{muon_matrix_lr_last:.8f}"
+    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
