@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -828,6 +829,14 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+def parameter_l2_norm(params: list[Tensor]) -> float:
+    total = 0.0
+    for param in params:
+        p32 = param.detach().float()
+        total += float(torch.sum(p32 * p32).item())
+    return total ** 0.5
+
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1171,6 +1180,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1221,6 +1232,10 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_group_tensor_count = len(scalar_params)
+    scalar_group_numel = sum(int(p.numel()) for p in scalar_params)
+    scalar_l2_norm_before = parameter_l2_norm(scalar_params)
+    scalar_optimizer_name = "AdamW" if args.scalar_weight_decay > 0.0 else "Adam"
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,10 +1251,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    scalar_optimizer_cls = torch.optim.AdamW if args.scalar_weight_decay > 0.0 else torch.optim.Adam
+    optimizer_scalar = scalar_optimizer_cls(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.scalar_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1260,7 +1277,14 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"scalar_weight_decay:{args.scalar_weight_decay}"
+    )
+    log0(
+        f"optimizer_scalar_group: optimizer:{scalar_optimizer_name} "
+        f"tensors:{scalar_group_tensor_count} numel:{scalar_group_numel} "
+        f"decoupled_weight_decay:{'enabled' if args.scalar_weight_decay > 0.0 else 'disabled'} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} scalar_l2_norm_before:{scalar_l2_norm_before:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1327,6 +1351,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    cumulative_scalar_lr_weight_decay = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1412,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        if args.scalar_weight_decay > 0.0:
+            cumulative_scalar_lr_weight_decay += optimizer_scalar.param_groups[0]["lr"] * args.scalar_weight_decay
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1445,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    scalar_l2_norm_after = parameter_l2_norm(scalar_params)
+    log0(
+        f"optimizer_scalar_decay_audit: optimizer:{scalar_optimizer_name} "
+        f"tensors:{scalar_group_tensor_count} numel:{scalar_group_numel} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} "
+        f"cumulative_lr_weight_decay:{cumulative_scalar_lr_weight_decay:.8f} "
+        f"scalar_l2_norm_before:{scalar_l2_norm_before:.8f} "
+        f"scalar_l2_norm_after:{scalar_l2_norm_after:.8f}"
     )
 
     # -----------------------------
