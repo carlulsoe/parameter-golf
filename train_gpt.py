@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    scalar_adam_eps = float(os.environ.get("SCALAR_ADAM_EPS", str(adam_eps)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1089,6 +1090,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if args.scalar_adam_eps <= 0.0:
+        raise ValueError(f"SCALAR_ADAM_EPS must be positive, got {args.scalar_adam_eps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1239,7 +1244,7 @@ def main() -> None:
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.scalar_adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1261,6 +1266,25 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    optimizer_head_eps = (
+        f"{optimizer_head.param_groups[0]['eps']:.8f}" if base_model.lm_head is not None else "inactive"
+    )
+    optimizer_name_by_param_id = {id(param): name for name, param in base_model.named_parameters()}
+    optimizer_scalar_param_names = [
+        optimizer_name_by_param_id.get(id(param), "<unnamed>")
+        for group in optimizer_scalar.param_groups
+        for param in group["params"]
+    ]
+    optimizer_scalar_numel = sum(int(param.numel()) for group in optimizer_scalar.param_groups for param in group["params"])
+    log0(
+        f"optimizer_eps_scope: optimizer_tok:{optimizer_tok.param_groups[0]['eps']:.8f} "
+        f"optimizer_scalar:{optimizer_scalar.param_groups[0]['eps']:.8f} "
+        f"optimizer_head:{optimizer_head_eps} optimizer_muon:none"
+    )
+    log0(
+        f"optimizer_scalar_scope_audit: tensors:{len(optimizer_scalar_param_names)} "
+        f"numel:{optimizer_scalar_numel} params:{','.join(optimizer_scalar_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
