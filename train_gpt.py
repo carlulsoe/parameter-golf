@@ -117,12 +117,6 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
-        self.last_applied_step: int | None = None
-        self.last_applied_lr = 0.0
-        self.last_applied_momentum = 0.0
-        self.last_applied_nesterov = bool(nesterov)
-        self.last_active_tensors = 0
-        self.last_active_numel = 0
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -143,18 +137,13 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-            applied_step = group.get("applied_step")
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-            active_tensors = 0
-            active_numel = 0
 
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    active_tensors += 1
-                    active_numel += int(p.numel())
                     g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
@@ -177,13 +166,6 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
-
-            self.last_applied_step = int(applied_step) if applied_step is not None else None
-            self.last_applied_lr = float(lr)
-            self.last_applied_momentum = float(momentum)
-            self.last_applied_nesterov = bool(nesterov)
-            self.last_active_tensors = active_tensors
-            self.last_active_numel = active_numel
 
         return loss
 
@@ -1270,9 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    muon_trace_steps = (0, 1, 9, 191, 192, 199)
-    muon_trace_steps_reached: list[int] = []
-    muon_trace_steps_logged: set[int] = set()
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1290,16 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        "muon_momentum_schedule: "
-        "step_semantics:applied_step_zero_based "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_last_interp_step:{max(args.muon_momentum_warmup_steps - 1, 0)} "
-        f"full_momentum_start_step:{args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0} "
-        f"step0_momentum:{args.muon_momentum_warmup_start:.5f} "
-        f"full_momentum:{args.muon_momentum:.5f} "
-        f"trace_steps:{','.join(str(step_id) for step_id in muon_trace_steps)}"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1414,7 +1383,6 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-            group["applied_step"] = step
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1424,23 +1392,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        applied_muon_step = optimizer_muon.last_applied_step
-        if (
-            applied_muon_step is not None
-            and applied_muon_step in muon_trace_steps
-            and applied_muon_step not in muon_trace_steps_logged
-        ):
-            muon_trace_steps_logged.add(applied_muon_step)
-            muon_trace_steps_reached.append(applied_muon_step)
-            log0(
-                "muon_momentum_trace: "
-                f"applied_step:{applied_muon_step} "
-                f"lr:{optimizer_muon.last_applied_lr:.8f} "
-                f"momentum:{optimizer_muon.last_applied_momentum:.5f} "
-                f"nesterov:{optimizer_muon.last_applied_nesterov} "
-                f"active_tensors:{optimizer_muon.last_active_tensors} "
-                f"active_numel:{optimizer_muon.last_active_numel}"
-            )
         zero_grad_all()
 
         step += 1
@@ -1467,27 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    last_muon_applied_step = optimizer_muon.last_applied_step
-    if args.muon_momentum_warmup_steps <= 0:
-        muon_warmup_fraction_completed = 1.0
-    elif last_muon_applied_step is None:
-        muon_warmup_fraction_completed = 0.0
-    else:
-        muon_warmup_fraction_completed = min(last_muon_applied_step / args.muon_momentum_warmup_steps, 1.0)
-    log0(
-        "muon_momentum_audit: "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_last_interp_step:{max(args.muon_momentum_warmup_steps - 1, 0)} "
-        f"full_momentum_start_step:{args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0} "
-        f"last_applied_step:{last_muon_applied_step if last_muon_applied_step is not None else 'none'} "
-        f"last_applied_lr:{optimizer_muon.last_applied_lr:.8f} "
-        f"last_applied_muon_momentum:{optimizer_muon.last_applied_momentum:.5f} "
-        f"warmup_fraction_completed:{muon_warmup_fraction_completed:.5f} "
-        f"nesterov:{optimizer_muon.last_applied_nesterov} "
-        f"active_tensors:{optimizer_muon.last_active_tensors} "
-        f"active_numel:{optimizer_muon.last_active_numel} "
-        f"trace_steps_reached:{','.join(str(step_id) for step_id in muon_trace_steps_reached) if muon_trace_steps_reached else 'none'}"
     )
 
     # -----------------------------
