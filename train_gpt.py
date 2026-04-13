@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    control_beta1 = float(os.environ.get("CONTROL_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1171,6 +1172,13 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    for beta_name, beta_value in (
+        ("BETA1", args.beta1),
+        ("BETA2", args.beta2),
+        ("CONTROL_BETA1", args.control_beta1),
+    ):
+        if not 0.0 <= beta_value < 1.0:
+            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1214,13 +1222,24 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
+    combined_scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    control_named_params = [
+        (name, p)
+        for name, p in block_named_params
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    control_param_names = [name for name, _ in control_named_params]
+    control_params = [p for _, p in control_named_params]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        combined_scalar_params.append(base_model.skip_weights)
+        control_param_names.append("skip_weights")
+        control_params.append(base_model.skip_weights)
+    control_param_ids = {id(p) for p in control_params}
+    other_scalar_params = [p for p in combined_scalar_params if id(p) not in control_param_ids]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1255,40 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_optimizer_mode = "shared_scalar_beta1"
+    scalar_param_groups = [
+        {
+            "params": combined_scalar_params,
+            "lr": args.scalar_lr,
+            "base_lr": args.scalar_lr,
+            "betas": (args.beta1, args.beta2),
+            "group_name": "scalar_all",
+        }
+    ]
+    if (
+        args.control_beta1 != args.beta1
+        and control_params
+        and other_scalar_params
+    ):
+        scalar_optimizer_mode = "split_control_beta1"
+        scalar_param_groups = [
+            {
+                "params": other_scalar_params,
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "betas": (args.beta1, args.beta2),
+                "group_name": "other_scalar",
+            },
+            {
+                "params": control_params,
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "betas": (args.control_beta1, args.beta2),
+                "group_name": "control",
+            },
+        ]
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1261,6 +1312,18 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_betas: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"control_beta1:{args.control_beta1:.5f}"
+    )
+    log0(
+        f"scalar_optimizer_mode:{scalar_optimizer_mode} "
+        f"other_scalar_tensors:{len(other_scalar_params)} other_scalar_numel:{sum(p.numel() for p in other_scalar_params)} "
+        f"control_tensors:{len(control_params)} control_numel:{sum(p.numel() for p in control_params)}"
+    )
+    log0(
+        "control_param_names:" + (",".join(control_param_names) if control_param_names else "none")
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
