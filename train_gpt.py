@@ -80,7 +80,6 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_momentum_mode = os.environ.get("MUON_MOMENTUM_MODE", "nesterov").strip().lower()
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -113,17 +112,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        momentum_mode: str = "nesterov",
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, momentum_mode=momentum_mode),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -144,7 +136,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
-            momentum_mode = group["momentum_mode"]
+            nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -153,16 +145,14 @@ class Muon(torch.optim.Optimizer):
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
-                    if momentum_mode == "none":
-                        update = g
-                    else:
-                        state = self.state[p]
-                        if "momentum_buffer" not in state:
-                            state["momentum_buffer"] = torch.zeros_like(g)
-                        buf = state["momentum_buffer"]
-                        buf.mul_(momentum).add_(g)
-                        update = buf if momentum_mode == "momentum" else g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(update, steps=backend_steps)
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -1175,10 +1165,6 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    if args.muon_momentum_mode not in {"none", "momentum", "nesterov"}:
-        raise ValueError(
-            f"MUON_MOMENTUM_MODE must be one of none, momentum, nesterov; got {args.muon_momentum_mode!r}"
-        )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     if args.train_seq_len <= 0:
@@ -1247,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        momentum_mode=args.muon_momentum_mode,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1276,37 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-
-    def muon_momentum_for_step(step: int) -> float:
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-    def summarize_muon_optimizer() -> tuple[int, int, str, str]:
-        tensor_count = 0
-        numel = 0
-        backend_steps = set()
-        momentum_modes = set()
-        for group in optimizer_muon.param_groups:
-            params = group["params"]
-            tensor_count += len(params)
-            numel += sum(int(p.numel()) for p in params)
-            backend_steps.add(int(group["backend_steps"]))
-            momentum_modes.add(str(group["momentum_mode"]))
-        backend_steps_summary = ",".join(str(value) for value in sorted(backend_steps))
-        momentum_mode_summary = ",".join(sorted(momentum_modes))
-        return tensor_count, numel, backend_steps_summary, momentum_mode_summary
-
-    muon_tensor_count, muon_numel, muon_backend_steps_summary, muon_momentum_mode_summary = summarize_muon_optimizer()
-    log0(
-        "optimizer_muon audit: "
-        f"scope:optimizer_muon.param_groups "
-        f"tensors:{muon_tensor_count} "
-        f"numel:{muon_numel} "
-        f"momentum_mode:{muon_momentum_mode_summary} "
-        f"backend_steps:{muon_backend_steps_summary} "
-        f"momentum_target:{args.muon_momentum:.5f} "
-        f"first_applied_momentum:{muon_momentum_for_step(0):.5f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1425,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_step(step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1463,18 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    muon_live_momentum_values = sorted({float(group["momentum"]) for group in optimizer_muon.param_groups})
-    muon_live_momentum_summary = ",".join(f"{value:.5f}" for value in muon_live_momentum_values)
-    log0(
-        "optimizer_muon_final: "
-        f"scope:optimizer_muon.param_groups "
-        f"tensors:{muon_tensor_count} "
-        f"numel:{muon_numel} "
-        f"momentum_mode:{muon_momentum_mode_summary} "
-        f"backend_steps:{muon_backend_steps_summary} "
-        f"completed_updates:{step} "
-        f"live_momentum:{muon_live_momentum_summary}"
     )
 
     # -----------------------------
