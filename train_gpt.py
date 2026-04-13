@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    global_lr_audit_steps = os.environ.get("GLOBAL_LR_AUDIT_STEPS", "")
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -88,24 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
-
-def parse_positive_step_list(raw_value: str, env_name: str) -> tuple[int, ...]:
-    if not raw_value.strip():
-        return ()
-    steps: list[int] = []
-    seen: set[int] = set()
-    for entry in raw_value.split(","):
-        value = entry.strip()
-        if not value:
-            raise ValueError(f"{env_name} entries must be non-empty positive integers")
-        step = int(value)
-        if step <= 0:
-            raise ValueError(f"{env_name} entries must be positive integers, got {step}")
-        if step not in seen:
-            seen.add(step)
-            steps.append(step)
-    return tuple(sorted(steps))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1300,9 +1281,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    global_lr_audit_steps = parse_positive_step_list(args.global_lr_audit_steps, "GLOBAL_LR_AUDIT_STEPS")
-    global_lr_audit_reached: list[int] = []
-    last_unfloored_lr_mult = 1.0
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1314,13 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    if global_lr_audit_steps:
-        log0(
-            "global_lr_audit "
-            f"enabled:True steps:{','.join(str(step) for step in global_lr_audit_steps)} "
-            "step_semantics:applied_step_one_based scope:shared_unfloored"
-        )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1396,15 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        applied_step = step + 1
-        last_unfloored_lr_mult = scale
-        if global_lr_audit_steps and applied_step in global_lr_audit_steps:
-            global_lr_audit_reached.append(applied_step)
-            log0(
-                "global_lr_audit_trace "
-                f"step:{applied_step} unfloored_mult:{scale:.8f} "
-                f"elapsed_ms:{elapsed_ms:.0f}"
-            )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1452,14 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    if global_lr_audit_steps:
-        log0(
-            "global_lr_audit_summary "
-            f"configured_steps:{','.join(str(step) for step in global_lr_audit_steps)} "
-            f"reached_steps:{','.join(str(step) for step in global_lr_audit_reached) or 'none'} "
-            f"completed_updates:{step} last_unfloored_mult:{last_unfloored_lr_mult:.8f}"
-        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
