@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1161,12 +1160,6 @@ def main() -> None:
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    if not (0.0 <= args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not (0.0 <= args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not (0.0 <= args.scalar_beta1 < 1.0):
-        raise ValueError(f"SCALAR_BETA1 must be in [0, 1), got {args.scalar_beta1}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
@@ -1245,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.scalar_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1268,13 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "optimizer_betas:"
-        f" tok=({args.beta1:.5f},{args.beta2:.5f})"
-        f" scalar=({args.scalar_beta1:.5f},{args.beta2:.5f})"
-        f" head={'inactive' if base_model.lm_head is None else f'({args.beta1:.5f},{args.beta2:.5f})'}"
-        f" scalar_tensors:{len(scalar_params)} scalar_numel:{sum(p.numel() for p in scalar_params)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1432,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "optimizer_scalar_final:"
-        f" scalar_beta1:{optimizer_scalar.param_groups[0]['betas'][0]:.5f}"
-        f" beta2:{optimizer_scalar.param_groups[0]['betas'][1]:.5f}"
-        f" completed_updates:{step}"
     )
 
     # -----------------------------
