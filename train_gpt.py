@@ -1281,8 +1281,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    lr_schedule_mode = "wallclock" if max_wallclock_ms is not None else "iteration"
-    lr_mul_trace_steps = (0, 1, 9, 199, 319, 335, 351)
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1294,12 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    trace_steps_str = ",".join(str(trace_step) for trace_step in lr_mul_trace_steps)
-    log0(
-        f"shared_lr_schedule mode:{lr_schedule_mode} warmdown_iters:{args.warmdown_iters} "
-        f"step_semantics:applied_step_zero_based trace_steps:{trace_steps_str}"
-    )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1339,10 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    reached_lr_mul_trace_steps: list[int] = []
-    reached_lr_mul_trace_step_set: set[int] = set()
-    last_realized_lr_mul = 1.0
-    min_realized_lr_mul = 1.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1379,12 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        last_realized_lr_mul = scale
-        min_realized_lr_mul = min(min_realized_lr_mul, scale)
-        if step in lr_mul_trace_steps and step not in reached_lr_mul_trace_step_set:
-            reached_lr_mul_trace_step_set.add(step)
-            reached_lr_mul_trace_steps.append(step)
-            log0(f"shared_lr_trace applied_step:{step} lr_mul:{scale:.8f} elapsed_ms:{elapsed_ms:.0f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1433,12 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    reached_trace_steps_str = ",".join(str(trace_step) for trace_step in reached_lr_mul_trace_steps) or "none"
-    log0(
-        f"shared_lr_audit mode:{lr_schedule_mode} warmdown_iters:{args.warmdown_iters} "
-        f"completed_updates:{step} last_realized_lr_mul:{last_realized_lr_mul:.8f} "
-        f"min_realized_lr_mul:{min_realized_lr_mul:.8f} trace_steps_reached:{reached_trace_steps_str}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
