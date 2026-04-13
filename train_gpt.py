@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -216,6 +217,40 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+def format_group_key_values(optimizer: torch.optim.Optimizer, key: str) -> str:
+    values = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        value = group.get(key)
+        if isinstance(value, float):
+            values.append(f"group{group_idx}:{value:.8f}")
+        else:
+            values.append(f"group{group_idx}:{value}")
+    return ",".join(values) if values else "inactive"
+
+
+def get_optimizer_param_names(
+    optimizer: torch.optim.Optimizer,
+    param_name_by_id: dict[int, str],
+) -> list[str]:
+    names: list[str] = []
+    missing: list[int] = []
+    seen: set[int] = set()
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            name = param_name_by_id.get(param_id)
+            if name is None:
+                missing.append(param_id)
+                continue
+            names.append(name)
+    if missing:
+        raise RuntimeError(f"Failed to map optimizer params back to model names for {len(missing)} tensors")
+    return names
 
 
 def eval_val(
@@ -1171,6 +1206,12 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.adam_eps <= 0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if args.token_adam_eps <= 0:
+        raise ValueError(f"TOKEN_ADAM_EPS must be positive, got {args.token_adam_eps}")
+    if not args.tie_embeddings and args.token_adam_eps != args.adam_eps:
+        raise ValueError("TOKEN_ADAM_EPS requires TIE_EMBEDDINGS=1 when it differs from ADAM_EPS")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1225,7 +1266,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.token_adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1251,6 +1292,12 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    else:
+        optimizer_head = None
+
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
+    optimizer_tok_param_names = get_optimizer_param_names(optimizer_tok, param_name_by_id)
+    optimizer_tok_scope = "tied_only" if args.tie_embeddings else "token_embedding_only"
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1261,6 +1308,20 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "optimizer_eps_audit: "
+        f"optimizer_tok:{format_group_key_values(optimizer_tok, 'eps')} "
+        f"optimizer_scalar:{format_group_key_values(optimizer_scalar, 'eps')} "
+        f"optimizer_head:{format_group_key_values(optimizer_head, 'eps') if optimizer_head is not None else 'inactive'} "
+        f"optimizer_muon:group0:none"
+    )
+    log0(
+        "optimizer_tok_scope_audit: "
+        f"tie_embeddings:{args.tie_embeddings} "
+        f"scope:{optimizer_tok_scope} "
+        f"param_count:{len(optimizer_tok_param_names)} "
+        f"params:{','.join(optimizer_tok_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
