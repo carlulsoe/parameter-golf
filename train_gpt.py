@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    matrix_grad_clip_norm = float(os.environ.get("MATRIX_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.grad_clip_norm < 0.0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.matrix_grad_clip_norm < 0.0:
+        raise ValueError(f"MATRIX_GRAD_CLIP_NORM must be non-negative, got {args.matrix_grad_clip_norm}")
+    if args.grad_clip_norm > 0.0 and args.matrix_grad_clip_norm > 0.0:
+        raise ValueError("GRAD_CLIP_NORM and MATRIX_GRAD_CLIP_NORM are mutually exclusive")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1221,6 +1228,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    matrix_param_count = len(matrix_params)
+    matrix_param_numel = sum(p.numel() for p in matrix_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1268,6 +1277,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"optimizer_clipping: grad_clip_norm:{args.grad_clip_norm:.5f} "
+        f"matrix_grad_clip_norm:{args.matrix_grad_clip_norm:.5f}"
+    )
+    log0(f"optimizer_muon_group: tensors:{matrix_param_count} numel:{matrix_param_numel}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1388,8 +1402,11 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        matrix_grad_norm = None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        elif args.matrix_grad_clip_norm > 0:
+            matrix_grad_norm = torch.nn.utils.clip_grad_norm_(matrix_params, args.matrix_grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1401,9 +1418,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            matrix_grad_norm_str = (
+                f" matrix_grad_norm:{float(matrix_grad_norm.item()):.4f}" if matrix_grad_norm is not None else ""
+            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{matrix_grad_norm_str}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1439,12 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_muon_clip_audit: "
+        f"tensors:{matrix_param_count} numel:{matrix_param_numel} "
+        f"matrix_grad_clip_norm:{args.matrix_grad_clip_norm:.5f} "
+        "norm_logging:existing_train_logs_only"
     )
 
     # -----------------------------
