@@ -87,9 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    scalar_lr_warmdown_start_step = int(os.environ.get("SCALAR_LR_WARMDOWN_START_STEP", 0))
-    scalar_lr_warmdown_steps = int(os.environ.get("SCALAR_LR_WARMDOWN_STEPS", 0))
-    scalar_lr_warmdown_target = float(os.environ.get("SCALAR_LR_WARMDOWN_TARGET", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1092,16 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.scalar_lr_warmdown_start_step < 0:
-        raise ValueError(
-            f"SCALAR_LR_WARMDOWN_START_STEP must be non-negative, got {args.scalar_lr_warmdown_start_step}"
-        )
-    if args.scalar_lr_warmdown_steps < 0:
-        raise ValueError(f"SCALAR_LR_WARMDOWN_STEPS must be non-negative, got {args.scalar_lr_warmdown_steps}")
-    if not (0.0 <= args.scalar_lr_warmdown_target <= 1.0):
-        raise ValueError(
-            f"SCALAR_LR_WARMDOWN_TARGET must be in [0, 1], got {args.scalar_lr_warmdown_target}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1227,16 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    scalar_params = [p for _, p in scalar_named_params]
-    scalar_param_numel = sum(int(p.numel()) for _, p in scalar_named_params)
-    scalar_member_summary = ",".join(f"{name}:{p.numel()}" for name, p in scalar_named_params)
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1278,24 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    scalar_lr_warmdown_enabled = args.scalar_lr_warmdown_steps > 0 and args.scalar_lr_warmdown_target < 1.0
-    scalar_lr_warmdown_end_update = (
-        args.scalar_lr_warmdown_start_step + args.scalar_lr_warmdown_steps - 1
-        if scalar_lr_warmdown_enabled
-        else 0
-    )
-    log0(
-        f"scalar_lr_schedule enabled:{scalar_lr_warmdown_enabled} "
-        f"applied_update_start:{args.scalar_lr_warmdown_start_step} "
-        f"warmdown_steps:{args.scalar_lr_warmdown_steps} "
-        f"target:{args.scalar_lr_warmdown_target:.5f} "
-        f"applied_update_end:{scalar_lr_warmdown_end_update} "
-        f"step_semantics:applied_update_one_based scope:optimizer_scalar"
-    )
-    log0(
-        f"optimizer_scalar_group tensors:{len(scalar_named_params)} numel:{scalar_param_numel} "
-        f"members:{scalar_member_summary}"
-    )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1326,14 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def scalar_lr_mult(applied_update: int) -> float:
-        if not scalar_lr_warmdown_enabled or applied_update < args.scalar_lr_warmdown_start_step:
-            return 1.0
-        if applied_update >= args.scalar_lr_warmdown_start_step + args.scalar_lr_warmdown_steps:
-            return args.scalar_lr_warmdown_target
-        progress = (applied_update - args.scalar_lr_warmdown_start_step + 1) / max(args.scalar_lr_warmdown_steps, 1)
-        return 1.0 + (args.scalar_lr_warmdown_target - 1.0) * progress
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1369,8 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    scalar_lr_first_activation_update: int | None = None
-    last_scalar_lr_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1411,11 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        applied_update = step + 1
-        scalar_scale = scalar_lr_mult(applied_update)
-        if scalar_lr_first_activation_update is None and scalar_scale < 1.0:
-            scalar_lr_first_activation_update = applied_update
-        last_scalar_lr_mult = scalar_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1436,8 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        for group in optimizer_scalar.param_groups:
-            group["lr"] = group["base_lr"] * scale * scalar_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1454,9 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"applied_update:{applied_update} scalar_lr_mult:{scalar_scale:.5f} "
-                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1467,16 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    log0(
-        f"scalar_lr_audit tensors:{len(scalar_named_params)} numel:{scalar_param_numel} "
-        f"configured_applied_update_start:{args.scalar_lr_warmdown_start_step} "
-        f"configured_warmdown_steps:{args.scalar_lr_warmdown_steps} "
-        f"configured_target:{args.scalar_lr_warmdown_target:.5f} "
-        f"first_activation_applied_update:{scalar_lr_first_activation_update if scalar_lr_first_activation_update is not None else 0} "
-        f"last_applied_update:{step} "
-        f"last_applied_scalar_lr_mult:{last_scalar_lr_mult:.5f}"
-    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
