@@ -60,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -779,13 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=3)
-    if header.size != 3 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -793,48 +785,14 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_token_counts = [load_data_shard_num_tokens(file) for file in self.files]
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.reset_accounting()
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.accounting_wraps += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
-
-    def reset_accounting(self) -> None:
-        self.accounting_start_file_idx = self.file_idx
-        self.accounting_start_pos = self.pos
-        self.accounting_tokens_taken = 0
-        self.accounting_wraps = 0
-        self.accounting_file_token_counts = [0] * len(self.files)
-
-    def accounting_state(self) -> dict[str, int | str]:
-        return {
-            "start_file_idx": self.accounting_start_file_idx,
-            "start_file": self.files[self.accounting_start_file_idx].name,
-            "start_pos": self.accounting_start_pos,
-            "end_file_idx": self.file_idx,
-            "end_file": self.files[self.file_idx].name,
-            "end_pos": self.pos,
-            "tokens_taken": self.accounting_tokens_taken,
-            "wraps": self.accounting_wraps,
-            "touched_shards": sum(1 for count in self.accounting_file_token_counts if count > 0),
-        }
-
-    def accounting_shard_sequence_summary(self) -> str:
-        ordered_indices = list(range(self.accounting_start_file_idx, len(self.files))) + list(range(self.accounting_start_file_idx))
-        parts = []
-        for idx in ordered_indices:
-            count = self.accounting_file_token_counts[idx]
-            if count <= 0:
-                continue
-            parts.append(f"{self.files[idx].name}:{count}/{self.file_token_counts[idx]}")
-        return ",".join(parts) if parts else "none"
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -846,8 +804,6 @@ class TokenStream:
                 continue
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
-            self.accounting_file_token_counts[self.file_idx] += k
-            self.accounting_tokens_taken += k
             self.pos += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
@@ -861,15 +817,6 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
-
-    def reset_accounting(self) -> None:
-        self.stream.reset_accounting()
-
-    def accounting_state(self) -> dict[str, int | str]:
-        return self.stream.accounting_state()
-
-    def accounting_shard_sequence_summary(self) -> str:
-        return self.stream.accounting_shard_sequence_summary()
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1329,23 +1276,6 @@ def main() -> None:
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    def log_loader_accounting(stage: str, loader: DistributedTokenLoader) -> None:
-        state = loader.accounting_state()
-        log0(
-            f"{stage}:start_file_idx:{state['start_file_idx']} start_file:{state['start_file']} "
-            f"start_pos:{state['start_pos']} end_file_idx:{state['end_file_idx']} "
-            f"end_file:{state['end_file']} end_pos:{state['end_pos']} "
-            f"tokens:{state['tokens_taken']} wraps:{state['wraps']} touched_shards:{state['touched_shards']}"
-        )
-        log0(f"{stage}_shards:{loader.accounting_shard_sequence_summary()}")
-
-    log0(
-        "train_loader_reset_policy:"
-        f" reset_after_warmup:{args.reset_train_loader_after_warmup} "
-        f"train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{grad_accum_steps}"
-    )
-    log_loader_accounting("train_loader_initial_state", train_loader)
-
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -1389,16 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        log_loader_accounting("warmup_loader_accounting", train_loader)
-        if args.reset_train_loader_after_warmup:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-            log_loader_accounting("measured_loader_reset_state", train_loader)
-        else:
-            train_loader.reset_accounting()
-            log_loader_accounting("measured_loader_resume_state", train_loader)
-    else:
-        train_loader.reset_accounting()
-        log_loader_accounting("measured_loader_resume_state", train_loader)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1498,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_loader_accounting("measured_loader_accounting", train_loader)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
