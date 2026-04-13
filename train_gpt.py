@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    token_grad_clip_norm = float(os.environ.get("TOKEN_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.grad_clip_norm < 0.0:
-        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
-    if args.token_grad_clip_norm < 0.0:
-        raise ValueError(f"TOKEN_GRAD_CLIP_NORM must be non-negative, got {args.token_grad_clip_norm}")
-    if args.grad_clip_norm > 0.0 and args.token_grad_clip_norm > 0.0:
-        raise ValueError("GRAD_CLIP_NORM and TOKEN_GRAD_CLIP_NORM are mutually exclusive")
-    if args.token_grad_clip_norm > 0.0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1261,14 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    optimizer_tok_params = [param for group in optimizer_tok.param_groups for param in group["params"]]
-    optimizer_tok_named_params = [
-        (name, param) for name, param in base_model.named_parameters() if any(param is tok_param for tok_param in optimizer_tok_params)
-    ]
-    optimizer_tok_param_names = ",".join(name for name, _ in optimizer_tok_named_params)
-    optimizer_tok_numel = sum(param.numel() for _, param in optimizer_tok_named_params)
-    token_grad_clip_scope = "tied_only" if args.token_grad_clip_norm > 0.0 else "inactive"
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1278,13 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "optimizer_tok audit: "
-        f"stage:startup optimizer:Adam tie_embeddings:{args.tie_embeddings} "
-        f"scope:{token_grad_clip_scope} token_grad_clip_norm:{args.token_grad_clip_norm:.5f} "
-        f"grad_clip_norm:{args.grad_clip_norm:.5f} tensor_count:{len(optimizer_tok_named_params)} "
-        f"numel:{optimizer_tok_numel} names:{optimizer_tok_param_names}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1355,7 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    token_grad_norm: Tensor | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1415,8 +1390,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        if args.token_grad_clip_norm > 0:
-            token_grad_norm = torch.nn.utils.clip_grad_norm_(optimizer_tok_params, args.token_grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1428,16 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            token_clip_log = ""
-            if token_grad_norm is not None:
-                token_clip_log = (
-                    f" token_grad_norm:{token_grad_norm.item():.5f}"
-                    f" token_grad_clip_norm:{args.token_grad_clip_norm:.5f}"
-                )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{token_clip_log}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1452,15 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    final_token_grad_norm = f"{token_grad_norm.item():.5f}" if token_grad_norm is not None else "inactive"
-    log0(
-        "optimizer_tok audit: "
-        f"stage:final optimizer:Adam tie_embeddings:{args.tie_embeddings} "
-        f"scope:{token_grad_clip_scope} token_grad_clip_norm:{args.token_grad_clip_norm:.5f} "
-        f"grad_clip_norm:{args.grad_clip_norm:.5f} tensor_count:{len(optimizer_tok_named_params)} "
-        f"numel:{optimizer_tok_numel} names:{optimizer_tok_param_names} "
-        f"last_token_grad_norm:{final_token_grad_norm}"
     )
 
     # -----------------------------
