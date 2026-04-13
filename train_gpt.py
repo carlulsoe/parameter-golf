@@ -170,24 +170,6 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def muon_momentum_for_step(args: Hyperparameters, step: int) -> float:
-    if args.muon_backend_steps <= 0:
-        raise ValueError(f"MUON_BACKEND_STEPS must be positive, got {args.muon_backend_steps}")
-    if not 0.0 <= args.muon_momentum_warmup_start < 1.0:
-        raise ValueError(
-            "MUON_MOMENTUM_WARMUP_START must be in [0, 1), "
-            f"got {args.muon_momentum_warmup_start}"
-        )
-    if not 0.0 <= args.muon_momentum < 1.0:
-        raise ValueError(f"MUON_MOMENTUM must be in [0, 1), got {args.muon_momentum}")
-    if args.muon_momentum_warmup_steps < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}"
-        )
-    frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
@@ -1232,7 +1214,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_param_numel = sum(p.numel() for p in matrix_params)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1288,19 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    muon_step0_momentum = muon_momentum_for_step(args, 0)
-    muon_target_reached_step = args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0
-    log0(
-        f"optimizer_muon: tensors:{len(matrix_params)} numel:{matrix_param_numel} "
-        f"backend_steps:{args.muon_backend_steps} momentum_start:{args.muon_momentum_warmup_start:.5f} "
-        f"momentum_target:{args.muon_momentum:.5f}"
-    )
-    log0(
-        f"muon_momentum_schedule: warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"step0_momentum:{muon_step0_momentum:.5f} "
-        f"target_reached_pre_update_step:{muon_target_reached_step} "
-        "optimizer_step_semantics:pre_update_step"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1411,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_step(args, step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1449,14 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    last_muon_pre_update_step = step - 1
-    last_muon_momentum = muon_momentum_for_step(args, last_muon_pre_update_step) if last_muon_pre_update_step >= 0 else muon_step0_momentum
-    log0(
-        f"optimizer_muon_final: tensors:{len(matrix_params)} numel:{matrix_param_numel} "
-        f"backend_steps:{args.muon_backend_steps} completed_updates:{step} "
-        f"last_applied_pre_update_step:{last_muon_pre_update_step if last_muon_pre_update_step >= 0 else 'none'} "
-        f"last_muon_momentum:{last_muon_momentum:.5f}"
     )
 
     # -----------------------------
