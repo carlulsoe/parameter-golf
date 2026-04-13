@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    resid_mix_beta2 = float(os.environ.get("RESID_MIX_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1215,23 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    if not 0.0 <= args.resid_mix_beta2 < 1.0:
-        raise ValueError(f"RESID_MIX_BETA2 must be in [0, 1), got {args.resid_mix_beta2}")
-    resid_mix_split_active = args.resid_mix_beta2 != args.beta2
-    resid_mix_named_params = [(name, p) for name, p in scalar_named_params if name.endswith("resid_mix")]
-    if resid_mix_split_active:
-        scalar_params = [p for name, p in scalar_named_params if not name.endswith("resid_mix")]
-        resid_mix_params = [p for _, p in resid_mix_named_params]
-    else:
-        scalar_params = [p for _, p in scalar_named_params]
-        resid_mix_params = []
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1254,15 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_resid_mix = None
-    if resid_mix_split_active:
-        optimizer_resid_mix = torch.optim.Adam(
-            [{"params": resid_mix_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.resid_mix_beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_resid_mix)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1282,21 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_betas:beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"resid_mix_beta2:{args.resid_mix_beta2:.5f}"
-    )
-    log0(
-        f"optimizer_scalar_groups: resid_mix_split_active:{resid_mix_split_active} "
-        f"scalar_tensors:{len(scalar_params)} scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
-        f"resid_mix_tensors:{len(resid_mix_params)} resid_mix_numel:{sum(int(p.numel()) for p in resid_mix_params)} "
-        f"scalar_lr:{args.scalar_lr:.8f} resid_mix_lr:{args.scalar_lr:.8f}"
-    )
-    if resid_mix_split_active:
-        log0(
-            "optimizer_resid_mix_names: "
-            + ",".join(name for name, _ in resid_mix_named_params)
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1453,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    resid_mix_live_lr = optimizer_resid_mix.param_groups[0]["lr"] if optimizer_resid_mix is not None else args.scalar_lr
-    log0(
-        f"optimizer_scalar_final: resid_mix_split_active:{resid_mix_split_active} "
-        f"completed_updates:{step} scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-        f"resid_mix_lr:{resid_mix_live_lr:.8f} resid_mix_beta2:{args.resid_mix_beta2:.5f}"
     )
 
     # -----------------------------
