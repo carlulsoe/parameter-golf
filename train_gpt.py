@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    embed_grad_clip_norm = float(os.environ.get("EMBED_GRAD_CLIP_NORM", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.embed_grad_clip_norm < 0:
-        raise ValueError(f"EMBED_GRAD_CLIP_NORM must be non-negative, got {args.embed_grad_clip_norm}")
-    if args.embed_grad_clip_norm > 0 and not args.tie_embeddings:
-        raise ValueError("EMBED_GRAD_CLIP_NORM > 0 requires TIE_EMBEDDINGS=1 because the target scope is tied tok_emb.weight")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1268,12 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"embed_grad_clip_scope:{'tied_tok_emb_only' if args.embed_grad_clip_norm > 0 else 'disabled'} "
-        f"embed_grad_clip_norm:{args.embed_grad_clip_norm:.5f} "
-        f"global_grad_clip_norm:{args.grad_clip_norm:.5f} "
-        f"embed_param_tensors:1 embed_param_numel:{base_model.tok_emb.weight.numel()}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1286,28 +1275,10 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    embed_grad_clip_triggered_steps = 0
-    embed_grad_clip_max_preclip_norm = 0.0
-    embed_grad_clip_last_preclip_norm = 0.0
 
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-    def maybe_clip_embed_grad(count_stats: bool) -> None:
-        nonlocal embed_grad_clip_triggered_steps, embed_grad_clip_max_preclip_norm, embed_grad_clip_last_preclip_norm
-        if args.embed_grad_clip_norm <= 0:
-            return
-        grad = base_model.tok_emb.weight.grad
-        if grad is None:
-            return
-        preclip_norm = float(torch.nn.utils.clip_grad_norm_([base_model.tok_emb.weight], args.embed_grad_clip_norm).item())
-        if not count_stats:
-            return
-        embed_grad_clip_last_preclip_norm = preclip_norm
-        embed_grad_clip_max_preclip_norm = max(embed_grad_clip_max_preclip_norm, preclip_norm)
-        if preclip_norm > args.embed_grad_clip_norm:
-            embed_grad_clip_triggered_steps += 1
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1337,7 +1308,6 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-            maybe_clip_embed_grad(count_stats=False)
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1418,7 +1388,6 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        maybe_clip_embed_grad(count_stats=True)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1450,14 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.embed_grad_clip_norm > 0:
-        log0(
-            "embed_grad_clip_summary: "
-            f"triggered_steps:{embed_grad_clip_triggered_steps} "
-            f"max_preclip_norm:{embed_grad_clip_max_preclip_norm:.8f} "
-            f"last_preclip_norm:{embed_grad_clip_last_preclip_norm:.8f} "
-            f"clip_norm:{args.embed_grad_clip_norm:.8f}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
