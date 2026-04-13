@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1178,6 +1179,11 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    for beta_name, beta_value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("TOKEN_BETA2", args.token_beta2)):
+        if not 0.0 <= beta_value < 1.0:
+            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
+    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA2 override requires TIE_EMBEDDINGS=1")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1202,6 +1208,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1224,7 +1231,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.token_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1261,6 +1268,32 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    tok_betas = optimizer_tok.param_groups[0]["betas"]
+    scalar_betas = optimizer_scalar.param_groups[0]["betas"]
+    head_betas = optimizer_head.param_groups[0]["betas"] if base_model.lm_head is not None else None
+    log0(
+        "optimizer_beta2_scope: "
+        f"optimizer_tok_beta1:{tok_betas[0]:.5f} "
+        f"optimizer_tok_beta2:{tok_betas[1]:.5f} "
+        f"optimizer_scalar_beta1:{scalar_betas[0]:.5f} "
+        f"optimizer_scalar_beta2:{scalar_betas[1]:.5f} "
+        f"optimizer_head_beta1:{f'{head_betas[0]:.5f}' if head_betas is not None else 'inactive'} "
+        f"optimizer_head_beta2:{f'{head_betas[1]:.5f}' if head_betas is not None else 'inactive'} "
+        "muon_beta1:none muon_beta2:none"
+    )
+    tok_scope_names = [
+        param_name_by_id[id(param)]
+        for group in optimizer_tok.param_groups
+        for param in group["params"]
+        if id(param) in param_name_by_id
+    ]
+    log0(
+        "optimizer_tok_scope_audit: "
+        f"tie_embeddings:{args.tie_embeddings} "
+        f"scope:{'tied_only' if args.tie_embeddings else 'untied_embed_only'} "
+        f"param_count:{len(tok_scope_names)} "
+        f"params:{','.join(tok_scope_names) if tok_scope_names else 'none'}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
