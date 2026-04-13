@@ -78,7 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_weight_decay = float(os.environ.get("MATRIX_WEIGHT_DECAY", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -113,24 +112,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        nesterov: bool = True,
-        weight_decay: float = 0.0,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                nesterov=nesterov,
-                weight_decay=weight_decay,
-            ),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -152,7 +137,6 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-            weight_decay = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -180,8 +164,6 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                if weight_decay > 0.0:
-                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -796,25 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def optimizer_group_named_membership(
-    optimizer: torch.optim.Optimizer,
-    param_name_by_id: dict[int, str],
-) -> list[tuple[str, int]]:
-    members: list[tuple[str, int]] = []
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            members.append((param_name_by_id.get(id(p), "<unnamed>"), int(p.numel())))
-    return members
-
-
-def optimizer_group_l2_norm(optimizer: torch.optim.Optimizer) -> float:
-    total = 0.0
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            total += float(p.detach().float().square().sum().item())
-    return total ** 0.5
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -1126,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.matrix_weight_decay < 0.0:
-        raise ValueError(f"MATRIX_WEIGHT_DECAY must be non-negative, got {args.matrix_weight_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1272,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=args.matrix_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1292,14 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
-    muon_membership = optimizer_group_named_membership(optimizer_muon, param_name_by_id)
-    muon_tensor_count = len(muon_membership)
-    muon_numel = sum(numel for _, numel in muon_membership)
-    muon_membership_summary = ",".join(f"{name}:{numel}" for name, numel in muon_membership)
-    muon_matrix_l2_norm_before = optimizer_group_l2_norm(optimizer_muon)
-    muon_decay_cumulative = 0.0
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1308,17 +1260,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} matrix_weight_decay:{args.matrix_weight_decay} "
-        f"scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        "optimizer_muon_group: "
-        f"optimizer:Muon tensors:{muon_tensor_count} numel:{muon_numel} "
-        f"decoupled_weight_decay:{'enabled' if args.matrix_weight_decay > 0.0 else 'disabled'} "
-        f"weight_decay:{args.matrix_weight_decay:.8f} "
-        f"matrix_l2_norm_before:{muon_matrix_l2_norm_before:.8f}"
-    )
-    log0(f"optimizer_muon_membership: {muon_membership_summary}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1444,10 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        if args.matrix_weight_decay > 0.0:
-            muon_decay_cumulative += sum(
-                float(group["lr"]) * float(group["weight_decay"]) for group in optimizer_muon.param_groups
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1479,14 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "optimizer_muon_decay_audit: "
-        f"tensors:{muon_tensor_count} numel:{muon_numel} "
-        f"weight_decay:{args.matrix_weight_decay:.8f} "
-        f"cumulative_lr_weight_decay:{muon_decay_cumulative:.8f} "
-        f"matrix_l2_norm_before:{muon_matrix_l2_norm_before:.8f} "
-        f"matrix_l2_norm_after:{optimizer_group_l2_norm(optimizer_muon):.8f}"
     )
 
     # -----------------------------
