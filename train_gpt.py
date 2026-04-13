@@ -80,7 +80,6 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_use_nesterov = bool(int(os.environ.get("MUON_USE_NESTEROV", "1")))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -1215,7 +1214,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_param_numel = sum(p.numel() for p in matrix_params)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1235,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        nesterov=args.muon_use_nesterov,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1270,12 +1267,6 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    muon_group = optimizer_muon.param_groups[0]
-    log0(
-        f"optimizer_muon_group:tensors:{len(matrix_params)} numel:{matrix_param_numel} "
-        f"lr:{muon_group['lr']:.8f} momentum:{muon_group['momentum']:.5f} "
-        f"backend_steps:{muon_group['backend_steps']} nesterov:{muon_group['nesterov']}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1427,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    final_muon_group = optimizer_muon.param_groups[0]
-    log0(
-        f"optimizer_muon_final:completed_updates:{step} tensors:{len(matrix_params)} numel:{matrix_param_numel} "
-        f"lr:{final_muon_group['lr']:.8f} momentum:{final_muon_group['momentum']:.5f} "
-        f"backend_steps:{final_muon_group['backend_steps']} nesterov:{final_muon_group['nesterov']}"
     )
 
     # -----------------------------
