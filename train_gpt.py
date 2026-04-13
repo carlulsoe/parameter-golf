@@ -1263,10 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"optimizer_clipping grad_clip_norm:{args.grad_clip_norm:.8f} "
-        "norm_logging:existing_train_logs_only"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1392,9 +1388,8 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        global_grad_norm: Tensor | None = None
         if args.grad_clip_norm > 0:
-            global_grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1406,17 +1401,10 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            train_log = (
+            log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if global_grad_norm is not None:
-                global_grad_norm_value = float(global_grad_norm.item())
-                train_log += (
-                    f" global_grad_norm:{global_grad_norm_value:.8f}"
-                    f" global_grad_clipped:{int(global_grad_norm_value > args.grad_clip_norm)}"
-                )
-            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1430,10 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"global_grad_clip_audit enabled:{args.grad_clip_norm > 0} "
-        f"max_norm:{args.grad_clip_norm:.8f} norm_logging:existing_train_logs_only"
     )
 
     # -----------------------------
