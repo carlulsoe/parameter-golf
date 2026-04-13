@@ -80,7 +80,6 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_nesterov = int(os.environ.get("MUON_NESTEROV", 1))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -1158,8 +1157,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    if args.muon_nesterov not in (0, 1):
-        raise ValueError(f"MUON_NESTEROV must be 0 or 1, got {args.muon_nesterov}")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1236,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        nesterov=bool(args.muon_nesterov),
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1257,7 +1253,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1265,17 +1260,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_nesterov:{bool(args.muon_nesterov)}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    for group_idx, group in enumerate(optimizer_muon.param_groups):
-        group_names = [param_name_by_id.get(id(param), f"<unnamed:{id(param)}>") for param in group["params"]]
-        group_numel = sum(int(param.numel()) for param in group["params"])
-        members = ",".join(group_names) if group_names else "<empty>"
-        log0(
-            f"optimizer_muon_scope group:{group_idx} tensors:{len(group_names)} "
-            f"numel:{group_numel} nesterov:{group['nesterov']} members:{members}"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
