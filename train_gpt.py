@@ -87,8 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    export_ema_decay = float(os.environ.get("EXPORT_EMA_DECAY", 0.0))
-    export_ema_start_step = int(os.environ.get("EXPORT_EMA_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -830,35 +828,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-def init_export_ema_state(module: nn.Module) -> dict[str, Tensor]:
-    return {
-        name: tensor.detach().float().clone()
-        for name, tensor in module.state_dict().items()
-    }
-
-
-@torch.no_grad()
-def update_export_ema_state(ema_state: dict[str, Tensor], module: nn.Module, decay: float) -> None:
-    for name, tensor in module.state_dict().items():
-        ema_state[name].lerp_(tensor.detach().float(), 1.0 - decay)
-
-
-def materialize_export_state_dict(module: nn.Module, ema_state: dict[str, Tensor] | None) -> tuple[dict[str, Tensor], str]:
-    reference_state = module.state_dict()
-    if ema_state is None:
-        return (
-            {name: tensor.detach().cpu().clone() for name, tensor in reference_state.items()},
-            "raw",
-        )
-    return (
-        {
-            name: ema_state[name].to(dtype=tensor.dtype, device="cpu").contiguous()
-            for name, tensor in reference_state.items()
-        },
-        "ema",
-    )
-
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1202,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.export_ema_decay < 0.0 or args.export_ema_decay >= 1.0:
-        raise ValueError(f"EXPORT_EMA_DECAY must be in [0, 1), got {args.export_ema_decay}")
-    if args.export_ema_start_step < 0:
-        raise ValueError(f"EXPORT_EMA_START_STEP must be non-negative, got {args.export_ema_start_step}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1303,10 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"export_ema:enabled:{int(args.export_ema_decay > 0.0)} "
-        f"decay:{args.export_ema_decay:.5f} start_step:{args.export_ema_start_step}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1366,9 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    export_ema_state: dict[str, Tensor] | None = None
-    export_ema_updates = 0
-    export_ema_first_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1437,13 +1395,6 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        if args.export_ema_decay > 0.0 and step >= args.export_ema_start_step:
-            if export_ema_state is None:
-                export_ema_state = init_export_ema_state(base_model)
-                export_ema_first_step = step
-            else:
-                update_export_ema_state(export_ema_state, base_model, args.export_ema_decay)
-            export_ema_updates += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1475,25 +1426,15 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    export_state_dict, export_checkpoint_source = materialize_export_state_dict(base_model, export_ema_state)
-    log0(
-        "Export EMA summary: "
-        f"enabled:{int(args.export_ema_decay > 0.0)} "
-        f"source:{export_checkpoint_source} "
-        f"start_step:{args.export_ema_start_step} "
-        f"first_step:{export_ema_first_step if export_ema_first_step is not None else 'none'} "
-        f"updates:{export_ema_updates}"
-    )
-
     if master_process:
-        torch.save(export_state_dict, "final_model.pt")
+        torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
