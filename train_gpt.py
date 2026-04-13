@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,11 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    for beta_name, beta_value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("TOKEN_BETA2", args.token_beta2)):
-        if not 0.0 <= beta_value < 1.0:
-            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 overrides require TIE_EMBEDDINGS=1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1215,8 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    named_params = list(base_model.named_parameters())
-    param_name_by_id = {id(param): name for name, param in named_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1232,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1259,12 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-    tok_group = optimizer_tok.param_groups[0]
-    tok_group_param_names = [param_name_by_id.get(id(param), "<unknown>") for param in tok_group["params"]]
-    tok_scope = "tied_only" if args.tie_embeddings else "input_only"
-    tok_betas = tok_group["betas"]
-    scalar_betas = optimizer_scalar.param_groups[0]["betas"]
-    head_betas = optimizer_head.param_groups[0]["betas"] if base_model.lm_head is not None else None
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1275,21 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "optimizer_beta_scope "
-        f"optimizer_tok_beta1:{tok_betas[0]:.5f} optimizer_tok_beta2:{tok_betas[1]:.5f} "
-        f"optimizer_scalar_beta1:{scalar_betas[0]:.5f} optimizer_scalar_beta2:{scalar_betas[1]:.5f} "
-        f"optimizer_head_beta1:{head_betas[0]:.5f} optimizer_head_beta2:{head_betas[1]:.5f}"
-        if head_betas is not None
-        else "optimizer_beta_scope "
-        f"optimizer_tok_beta1:{tok_betas[0]:.5f} optimizer_tok_beta2:{tok_betas[1]:.5f} "
-        f"optimizer_scalar_beta1:{scalar_betas[0]:.5f} optimizer_scalar_beta2:{scalar_betas[1]:.5f} "
-        "optimizer_head_beta1:inactive optimizer_head_beta2:inactive"
-    )
-    log0(
-        f"optimizer_tok_scope_audit tie_embeddings:{args.tie_embeddings} scope:{tok_scope} "
-        f"param_count:{len(tok_group_param_names)} params:{','.join(tok_group_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
