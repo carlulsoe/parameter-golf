@@ -76,8 +76,6 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    tied_embed_lr_warmup_steps = int(os.environ.get("TIED_EMBED_LR_WARMUP_STEPS", 0))
-    tied_embed_lr_warmup_start_mult = float(os.environ.get("TIED_EMBED_LR_WARMUP_START_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1173,13 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.tied_embed_lr_warmup_steps < 0:
-        raise ValueError(f"TIED_EMBED_LR_WARMUP_STEPS must be non-negative, got {args.tied_embed_lr_warmup_steps}")
-    if not 0.0 <= args.tied_embed_lr_warmup_start_mult <= 1.0:
-        raise ValueError(
-            "TIED_EMBED_LR_WARMUP_START_MULT must lie in [0, 1], "
-            f"got {args.tied_embed_lr_warmup_start_mult}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1269,9 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"tied_embed_lr_warmup_steps:{args.tied_embed_lr_warmup_steps} "
-        f"tied_embed_lr_warmup_start_mult:{args.tied_embed_lr_warmup_start_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1303,12 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def tied_embed_lr_mul(step: int) -> float:
-        if args.tied_embed_lr_warmup_steps <= 0:
-            return 1.0
-        frac = min(step / args.tied_embed_lr_warmup_steps, 1.0)
-        return (1.0 - frac) * args.tied_embed_lr_warmup_start_mult + frac
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1404,17 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        token_scale = tied_embed_lr_mul(step)
-        for group in optimizer_tok.param_groups:
-            group["lr"] = group["base_lr"] * scale * token_scale
-        if args.tied_embed_lr_warmup_steps > 0 and (
-            step in {0, 1, max(args.tied_embed_lr_warmup_steps - 1, 0), args.tied_embed_lr_warmup_steps}
-        ):
-            log0(
-                f"tied_embed_lr_trace:applied_step:{step} warmup_frac:{min(step / args.tied_embed_lr_warmup_steps, 1.0):.5f} "
-                f"warmup_mult:{token_scale:.5f} base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
-                f"live_lr:{optimizer_tok.param_groups[0]['lr']:.8f} shared_lr_mul:{scale:.8f}"
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
