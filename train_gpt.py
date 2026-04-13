@@ -1260,13 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} "
-        f"muon_momentum_warmup_start:{args.muon_momentum_warmup_start} "
-        f"muon_momentum_warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"muon_schedule_step_semantics:pre_update "
-        f"muon_checkpoint_semantics:completed_updates "
-        f"muon_first_full_momentum_completed_updates:{args.muon_momentum_warmup_steps + 1 if args.muon_momentum_warmup_steps > 0 else 1}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1298,24 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def muon_momentum_for_step(pre_update_step: int) -> float:
-        frac = min(pre_update_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-    def muon_checkpoint_fields(completed_updates: int) -> str:
-        if completed_updates <= 0:
-            return (
-                "muon_momentum:none "
-                "muon_completed_updates:0 "
-                "muon_last_applied_pre_update_step:none"
-            )
-        last_applied_pre_update_step = completed_updates - 1
-        return (
-            f"muon_momentum:{muon_momentum_for_step(last_applied_pre_update_step):.5f} "
-            f"muon_completed_updates:{completed_updates} "
-            f"muon_last_applied_pre_update_step:{last_applied_pre_update_step}"
-        )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1376,8 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"{muon_checkpoint_fields(step)}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1404,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_step(step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1427,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"{muon_checkpoint_fields(step)}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1444,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log0(f"muon_final_audit {muon_checkpoint_fields(step)}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
