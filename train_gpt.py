@@ -83,6 +83,7 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_use_nesterov = bool(int(os.environ.get("MUON_USE_NESTEROV", "1")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1214,6 +1215,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_param_numel = sum(p.numel() for p in matrix_params)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1233,6 +1235,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        nesterov=args.muon_use_nesterov,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1257,6 +1260,13 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        "optimizer_muon_group: "
+        f"tensors:{len(matrix_params)} "
+        f"numel:{matrix_param_numel} "
+        f"backend_steps:{args.muon_backend_steps} "
+        f"nesterov:{optimizer_muon.param_groups[0]['nesterov']}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1418,6 +1428,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_muon_final: "
+        f"tensors:{len(matrix_params)} "
+        f"numel:{matrix_param_numel} "
+        f"backend_steps:{args.muon_backend_steps} "
+        f"nesterov:{optimizer_muon.param_groups[0]['nesterov']}"
     )
 
     # -----------------------------
