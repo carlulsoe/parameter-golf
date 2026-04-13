@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    export_ema_decay = float(os.environ.get("EXPORT_EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1270,23 +1269,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if not (0.0 <= args.export_ema_decay < 1.0):
-        raise ValueError(f"EXPORT_EMA_DECAY must be in [0, 1), got {args.export_ema_decay}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    ema_named_params = [(name, param) for name, param in base_model.named_parameters() if param.is_floating_point()]
-    ema_state: dict[str, Tensor] | None = None
-    ema_updates = 0
-    ema_tracked_numel = sum(int(param.numel()) for _, param in ema_named_params)
-    if args.export_ema_decay > 0:
-        log0(
-            f"export_ema:enabled decay:{args.export_ema_decay:.6f} "
-            f"init:first_measured_post_step tracked_tensors:{len(ema_named_params)} tracked_numel:{ema_tracked_numel}"
-        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1404,14 +1392,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if args.export_ema_decay > 0:
-            if ema_state is None:
-                ema_state = {name: param.detach().float().clone() for name, param in ema_named_params}
-            else:
-                one_minus_decay = 1.0 - args.export_ema_decay
-                for name, param in ema_named_params:
-                    ema_state[name].lerp_(param.detach().float(), one_minus_decay)
-            ema_updates += 1
         zero_grad_all()
 
         step += 1
@@ -1445,28 +1425,16 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-    export_state_dict = {name: tensor.detach().cpu().contiguous() for name, tensor in base_model.state_dict().items()}
-    export_state_source = "raw"
-    if ema_state is not None:
-        for name, ema_tensor in ema_state.items():
-            export_state_dict[name] = ema_tensor.detach().cpu().contiguous()
-        export_state_source = "ema"
-    if args.export_ema_decay > 0:
-        log0(
-            f"export_ema_audit: enabled:{ema_state is not None} decay:{args.export_ema_decay:.6f} "
-            f"tracked_tensors:{len(ema_named_params)} tracked_numel:{ema_tracked_numel} updates:{ema_updates}"
-        )
-    log0(f"export_state_source:{export_state_source}")
 
     if master_process:
-        torch.save(export_state_dict, "final_model.pt")
+        torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
