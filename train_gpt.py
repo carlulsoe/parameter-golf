@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1140,25 +1139,6 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    def validate_adam_beta(name: str, value: float) -> None:
-        if not (0.0 <= value < 1.0):
-            raise ValueError(f"{name} must be in [0, 1), got {value}")
-
-    def adam_group_betas(optimizer: torch.optim.Optimizer | None) -> str:
-        if optimizer is None or not optimizer.param_groups:
-            return "inactive"
-        beta1, beta2 = optimizer.param_groups[0]["betas"]
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def log_optimizer_betas(stage: str, optimizer_head: torch.optim.Optimizer | None = None) -> None:
-        log0(
-            f"optimizer_betas stage:{stage} "
-            f"optimizer_tok:{adam_group_betas(optimizer_tok)} "
-            f"optimizer_scalar:{adam_group_betas(optimizer_scalar)} "
-            f"optimizer_head:{adam_group_betas(optimizer_head)} "
-            "optimizer_muon_betas:none"
-        )
-
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1177,9 +1157,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    validate_adam_beta("BETA1", args.beta1)
-    validate_adam_beta("SCALAR_BETA1", args.scalar_beta1)
-    validate_adam_beta("BETA2", args.beta2)
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1261,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.scalar_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1285,15 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_beta_config beta1:{args.beta1:.5f} scalar_beta1:{args.scalar_beta1:.5f} "
-        f"beta2:{args.beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log0(
-        f"optimizer_group_scope scalar_tensors:{len(scalar_params)} "
-        f"scalar_numel:{sum(p.numel() for p in scalar_params)}"
-    )
-    log_optimizer_betas(stage="startup", optimizer_head=optimizer_head if base_model.lm_head is not None else None)
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1352,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_optimizer_betas(stage="post_restore_startup", optimizer_head=optimizer_head if base_model.lm_head is not None else None)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1452,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_betas(stage="final", optimizer_head=optimizer_head if base_model.lm_head is not None else None)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
