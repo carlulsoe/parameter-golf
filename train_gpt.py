@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    resume_train_loader_after_warmup = bool(int(os.environ.get("RESUME_TRAIN_LOADER_AFTER_WARMUP", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -809,20 +808,6 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-    def state_dict(self) -> dict[str, int]:
-        return {"file_idx": self.file_idx, "pos": self.pos}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        file_idx = int(state["file_idx"])
-        pos = int(state["pos"])
-        if not 0 <= file_idx < len(self.files):
-            raise ValueError(f"TokenStream file_idx out of range: {file_idx}")
-        self.file_idx = file_idx
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        if not 0 <= pos <= self.tokens.numel():
-            raise ValueError(f"TokenStream pos out of range: {pos}")
-        self.pos = pos
-
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
@@ -842,12 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def state_dict(self) -> dict[str, int]:
-        return self.stream.state_dict()
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self.stream.load_state_dict(state)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1287,7 +1266,6 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"resume_train_loader_after_warmup:{args.resume_train_loader_after_warmup} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1335,22 +1313,13 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        warmup_loader_state = train_loader.state_dict()
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.resume_train_loader_after_warmup:
-            train_loader.load_state_dict(warmup_loader_state)
-            log0(
-                "warmup_loader_resume: "
-                f"enabled:1 file_idx:{warmup_loader_state['file_idx']} pos:{warmup_loader_state['pos']}"
-            )
-        else:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-            log0("warmup_loader_resume: enabled:0 file_idx:0 pos:0")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
