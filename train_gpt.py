@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1221,6 +1224,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_tensor_count = len(scalar_params)
+    scalar_numel = sum(int(p.numel()) for p in scalar_params)
+    scalar_l2_norm_before = math.sqrt(
+        sum(float(p.detach().float().square().sum().item()) for p in scalar_params)
+    )
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,12 +1244,16 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+    scalar_optimizer_kwargs = dict(
+        params=[{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
+    if args.scalar_weight_decay > 0.0:
+        optimizer_scalar = torch.optim.AdamW(weight_decay=args.scalar_weight_decay, **scalar_optimizer_kwargs)
+    else:
+        optimizer_scalar = torch.optim.Adam(**scalar_optimizer_kwargs)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1261,6 +1273,12 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_scalar_group: optimizer:{type(optimizer_scalar).__name__} "
+        f"tensors:{scalar_tensor_count} numel:{scalar_numel} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} "
+        f"scalar_l2_norm_before:{scalar_l2_norm_before:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1418,6 +1436,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    scalar_l2_norm_after = math.sqrt(
+        sum(float(p.detach().float().square().sum().item()) for p in scalar_params)
+    )
+    log0(
+        f"optimizer_scalar_decay_audit: optimizer:{type(optimizer_scalar).__name__} "
+        f"tensors:{scalar_tensor_count} numel:{scalar_numel} "
+        f"weight_decay:{args.scalar_weight_decay:.8f} completed_updates:{step} "
+        f"scalar_l2_norm_after:{scalar_l2_norm_after:.8f}"
     )
 
     # -----------------------------
