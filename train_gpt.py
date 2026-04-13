@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_family_audit = bool(int(os.environ.get("SCALAR_FAMILY_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -466,6 +467,93 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+
+SCALAR_FAMILY_AUDIT_NAMES = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weights")
+
+
+def build_scalar_family_param_groups(module: nn.Module) -> dict[str, list[tuple[str, Tensor]]]:
+    groups = {family: [] for family in SCALAR_FAMILY_AUDIT_NAMES}
+    for name, param in module.named_parameters():
+        if name == "skip_weights":
+            groups["skip_weights"].append((name, param))
+        elif name.endswith("attn_scale"):
+            groups["attn_scale"].append((name, param))
+        elif name.endswith("mlp_scale"):
+            groups["mlp_scale"].append((name, param))
+        elif name.endswith("resid_mix"):
+            groups["resid_mix"].append((name, param))
+        elif name.endswith("q_gain"):
+            groups["q_gain"].append((name, param))
+    return groups
+
+
+def tensor_group_l2_norm(tensors: list[Tensor], device: torch.device) -> Tensor:
+    total = torch.zeros((), device=device, dtype=torch.float32)
+    for tensor in tensors:
+        total += tensor.detach().float().square().sum()
+    return total.sqrt()
+
+
+def scalar_family_param_norms(
+    family_groups: dict[str, list[tuple[str, Tensor]]],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    return {
+        family: tensor_group_l2_norm([param for _, param in params], device)
+        for family, params in family_groups.items()
+    }
+
+
+def scalar_family_grad_norms(
+    family_groups: dict[str, list[tuple[str, Tensor]]],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    grad_norms: dict[str, Tensor] = {}
+    for family, params in family_groups.items():
+        grads = [param.grad for _, param in params if param.grad is not None]
+        grad_norms[family] = tensor_group_l2_norm(grads, device) if grads else torch.zeros((), device=device, dtype=torch.float32)
+    return grad_norms
+
+
+def snapshot_scalar_family_params(family_groups: dict[str, list[tuple[str, Tensor]]]) -> dict[str, list[Tensor]]:
+    return {
+        family: [param.detach().float().clone() for _, param in params]
+        for family, params in family_groups.items()
+    }
+
+
+def scalar_family_update_norms(
+    family_groups: dict[str, list[tuple[str, Tensor]]],
+    pre_step_snapshots: dict[str, list[Tensor]],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    update_norms: dict[str, Tensor] = {}
+    for family, params in family_groups.items():
+        total = torch.zeros((), device=device, dtype=torch.float32)
+        for before, (_, param) in zip(pre_step_snapshots[family], params, strict=True):
+            total += (param.detach().float() - before).square().sum()
+        update_norms[family] = total.sqrt()
+    return update_norms
+
+
+def format_scalar_family_counts(family_groups: dict[str, list[tuple[str, Tensor]]]) -> str:
+    return " ".join(
+        f"{family}_tensors:{len(params)} {family}_numel:{sum(int(param.numel()) for _, param in params)}"
+        for family, params in family_groups.items()
+    )
+
+
+def format_scalar_family_ratios(
+    family_names: tuple[str, ...],
+    numerators: dict[str, Tensor],
+    denominators: dict[str, Tensor],
+) -> str:
+    pieces: list[str] = []
+    for family in family_names:
+        denom = max(float(denominators[family].item()), 1e-12)
+        pieces.append(f"{family}:{float(numerators[family].item()) / denom:.8f}")
+    return " ".join(pieces)
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1321,6 +1409,24 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    scalar_family_groups = build_scalar_family_param_groups(base_model) if args.scalar_family_audit else {}
+    scalar_family_init_snapshot = snapshot_scalar_family_params(scalar_family_groups) if args.scalar_family_audit else {}
+    scalar_family_init_norms = scalar_family_param_norms(scalar_family_groups, device) if args.scalar_family_audit else {}
+    if args.scalar_family_audit:
+        log0(
+            "scalar_family_audit_startup: "
+            f"grad_clip_norm:{args.grad_clip_norm:.5f} "
+            "ratio_denominators:step=pre_step_param_norm final=init_param_norm "
+            f"{format_scalar_family_counts(scalar_family_groups)}"
+        )
+        log0(
+            "scalar_family_audit_init_norms: "
+            + " ".join(
+                f"{family}:{float(scalar_family_init_norms[family].item()):.8f}"
+                for family in SCALAR_FAMILY_AUDIT_NAMES
+            )
+        )
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1369,6 +1475,11 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        log_step = step + 1
+        should_log_train = (
+            args.train_log_every > 0
+            and (log_step <= 10 or log_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1388,6 +1499,14 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        scalar_family_pre_step_norms: dict[str, Tensor] = {}
+        scalar_family_grad_norms_step: dict[str, Tensor] = {}
+        scalar_family_pre_step_snapshots: dict[str, list[Tensor]] = {}
+        if args.scalar_family_audit and should_log_train:
+            scalar_family_pre_step_norms = scalar_family_param_norms(scalar_family_groups, device)
+            scalar_family_grad_norms_step = scalar_family_grad_norms(scalar_family_groups, device)
+            scalar_family_pre_step_snapshots = snapshot_scalar_family_params(scalar_family_groups)
+
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1396,15 +1515,25 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.scalar_family_audit:
+                scalar_family_update_norms_step = scalar_family_update_norms(
+                    scalar_family_groups,
+                    scalar_family_pre_step_snapshots,
+                    device,
+                )
+                log0(
+                    "scalar_family_audit_step: "
+                    f"step:{step} "
+                    "grad_to_param "
+                    f"{format_scalar_family_ratios(SCALAR_FAMILY_AUDIT_NAMES, scalar_family_grad_norms_step, scalar_family_pre_step_norms)} "
+                    "update_to_param "
+                    f"{format_scalar_family_ratios(SCALAR_FAMILY_AUDIT_NAMES, scalar_family_update_norms_step, scalar_family_pre_step_norms)}"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1548,30 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.scalar_family_audit:
+        scalar_family_final_norms = scalar_family_param_norms(scalar_family_groups, device)
+        scalar_family_drift_norms = {
+            family: tensor_group_l2_norm(
+                [
+                    param.detach().float() - init_tensor
+                    for init_tensor, (_, param) in zip(scalar_family_init_snapshot[family], scalar_family_groups[family], strict=True)
+                ],
+                device,
+            )
+            for family in SCALAR_FAMILY_AUDIT_NAMES
+        }
+        log0(
+            "scalar_family_audit_final: "
+            f"completed_updates:{step} "
+            "final_param_norm "
+            + " ".join(
+                f"{family}:{float(scalar_family_final_norms[family].item()):.8f}"
+                for family in SCALAR_FAMILY_AUDIT_NAMES
+            )
+            + " "
+            "drift_to_init "
+            f"{format_scalar_family_ratios(SCALAR_FAMILY_AUDIT_NAMES, scalar_family_drift_norms, scalar_family_init_norms)}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
