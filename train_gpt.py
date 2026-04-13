@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,6 +1091,12 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.embed_weight_decay < 0:
+        raise ValueError(f"EMBED_WEIGHT_DECAY must be non-negative, got {args.embed_weight_decay}")
+    if args.embed_weight_decay > 0 and not args.tie_embeddings:
+        raise ValueError(
+            "EMBED_WEIGHT_DECAY > 0 requires TIE_EMBEDDINGS=1 because optimizer_tok is scoped to the tied tok_emb.weight path"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1222,8 +1229,15 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+    optimizer_tok = torch.optim.AdamW(
+        [
+            {
+                "params": [base_model.tok_emb.weight],
+                "lr": token_lr,
+                "base_lr": token_lr,
+                "weight_decay": args.embed_weight_decay,
+            }
+        ],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1261,6 +1275,13 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "optimizer_tok audit: "
+        f"optimizer:AdamW tie_embeddings:{args.tie_embeddings} "
+        f"scope:{'tied_only' if args.tie_embeddings else 'untied_tok_emb_only'} "
+        f"decoupled_weight_decay:{'enabled' if args.embed_weight_decay > 0 else 'disabled'} "
+        f"weight_decay:{args.embed_weight_decay:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
