@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", "1e-8")))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -467,10 +466,6 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
-
-def validate_finite_positive(name: str, value: float) -> None:
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{name} must be finite and strictly positive, got {value}")
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1095,10 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    validate_finite_positive("ADAM_EPS", args.adam_eps)
-    validate_finite_positive("TOKEN_ADAM_EPS", args.token_adam_eps)
-    if args.token_adam_eps != args.adam_eps and not args.tie_embeddings:
-        raise ValueError("TOKEN_ADAM_EPS may differ from ADAM_EPS only when TIE_EMBEDDINGS=1")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1230,12 +1221,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.token_adam_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1271,26 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    head_exists = base_model.lm_head is not None
-    head_eps_audit = f"{optimizer_head.defaults['eps']:.8f}" if head_exists else "inactive"
-    optimizer_tok_param_names = [
-        param_name_by_id.get(id(param), "<unknown>")
-        for group in optimizer_tok.param_groups
-        for param in group["params"]
-    ]
-    log0(
-        f"optimizer_eps_audit: optimizer_tok:{optimizer_tok.defaults['eps']:.8f} "
-        f"optimizer_scalar:{optimizer_scalar.defaults['eps']:.8f} "
-        f"optimizer_head:{head_eps_audit} "
-        "optimizer_muon:none"
-    )
-    log0(
-        f"optimizer_tok_scope_audit: tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_only' if args.tie_embeddings else 'untied_embed_only'} "
-        f"optimizer_head_exists:{head_exists} "
-        f"param_count:{len(optimizer_tok_param_names)} "
-        f"params:{','.join(optimizer_tok_param_names)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
