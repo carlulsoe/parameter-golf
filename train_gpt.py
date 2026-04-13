@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", "0.95")))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1089,6 +1090,13 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+
+    for name, value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("SCALAR_BETA2", args.scalar_beta2)):
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be in [0, 1), got {value}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1138,6 +1146,18 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+    def format_live_adam_betas(opt: torch.optim.Optimizer | None) -> str:
+        if opt is None or not opt.param_groups:
+            return "inactive"
+        beta1, beta2 = opt.param_groups[0]["betas"]
+        return f"({beta1:.5f},{beta2:.5f})"
+
+    def optimizer_group_scope(opt: torch.optim.Optimizer | None) -> tuple[int, int]:
+        if opt is None:
+            return 0, 0
+        params = [p for group in opt.param_groups for p in group["params"]]
+        return len(params), sum(int(p.numel()) for p in params)
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -1238,11 +1258,12 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.scalar_beta2),
         eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_head: torch.optim.Optimizer | None = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1283,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"optimizer_betas stage:config adam_beta1:{args.beta1:.5f} adam_beta2:{args.beta2:.5f} scalar_beta2:{args.scalar_beta2:.5f}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1342,21 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    scalar_group_tensors, scalar_group_numel = optimizer_group_scope(optimizer_scalar)
+    log0(
+        "optimizer_betas "
+        f"stage:post_restore_startup scope:live_param_groups "
+        f"optimizer_tok:{format_live_adam_betas(optimizer_tok)} "
+        f"optimizer_scalar:{format_live_adam_betas(optimizer_scalar)} "
+        f"optimizer_head:{format_live_adam_betas(optimizer_head)} "
+        "optimizer_muon_betas:none"
+    )
+    log0(
+        "optimizer_group_scope "
+        f"optimizer_scalar_tensors:{scalar_group_tensors} "
+        f"optimizer_scalar_numel:{scalar_group_numel}"
+    )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1455,14 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_betas "
+        f"stage:final scope:live_param_groups "
+        f"optimizer_tok:{format_live_adam_betas(optimizer_tok)} "
+        f"optimizer_scalar:{format_live_adam_betas(optimizer_scalar)} "
+        f"optimizer_head:{format_live_adam_betas(optimizer_head)} "
+        f"optimizer_muon_betas:none completed_updates:{step}"
     )
 
     # -----------------------------
