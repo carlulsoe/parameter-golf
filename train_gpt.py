@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    q_gain_beta1 = float(os.environ.get("Q_GAIN_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1209,6 +1210,10 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    if not 0.0 <= args.q_gain_beta1 < 1.0:
+        raise ValueError(f"Q_GAIN_BETA1 must be in [0, 1), got {args.q_gain_beta1}")
+    q_gain_split_active = args.q_gain_beta1 != args.beta1
+    q_gain_named_params = [(name, p) for name, p in block_named_params if name.endswith("attn.q_gain")]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1217,7 +1222,8 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and not (q_gain_split_active and name.endswith("attn.q_gain"))
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1243,6 +1249,16 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_q_gain: torch.optim.Optimizer | None = None
+    if q_gain_split_active:
+        q_gain_params = [p for _, p in q_gain_named_params]
+        optimizer_q_gain = torch.optim.Adam(
+            [{"params": q_gain_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.q_gain_beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_q_gain)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1262,6 +1278,22 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_betas:beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"q_gain_beta1:{args.q_gain_beta1:.5f}"
+    )
+    log0(
+        f"optimizer_scalar_groups: q_gain_split_active:{q_gain_split_active} "
+        f"scalar_tensors:{len(scalar_params)} scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
+        f"q_gain_tensors:{len(q_gain_named_params) if q_gain_split_active else 0} "
+        f"q_gain_numel:{sum(int(p.numel()) for _, p in q_gain_named_params) if q_gain_split_active else 0} "
+        f"scalar_lr:{args.scalar_lr:.8f} "
+        f"q_gain_lr:{args.scalar_lr if q_gain_split_active else 0.0:.8f} "
+        f"scalar_beta1:{args.beta1:.5f} "
+        f"q_gain_beta1:{args.q_gain_beta1:.5f}"
+    )
+    if q_gain_split_active:
+        log0(f"optimizer_q_gain_names:{','.join(name for name, _ in q_gain_named_params)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1418,6 +1450,12 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"optimizer_scalar_final: q_gain_split_active:{q_gain_split_active} "
+        f"completed_updates:{step} scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"q_gain_lr:{optimizer_q_gain.param_groups[0]['lr'] if optimizer_q_gain is not None else 0.0:.8f} "
+        f"scalar_beta1:{args.beta1:.5f} q_gain_beta1:{args.q_gain_beta1:.5f}"
     )
 
     # -----------------------------
