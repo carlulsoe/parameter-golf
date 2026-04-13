@@ -37,8 +37,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
-DEFAULT_TIED_EMBED_INIT_STD = 0.005
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -78,7 +76,7 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", DEFAULT_TIED_EMBED_INIT_STD))
+    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -1092,19 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    tied_embed_init_std_override_active = not math.isclose(
-        args.tied_embed_init_std,
-        DEFAULT_TIED_EMBED_INIT_STD,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    )
-    if args.tied_embed_init_std <= 0.0:
-        raise ValueError(f"TIED_EMBED_INIT_STD must be positive, got {args.tied_embed_init_std}")
-    if tied_embed_init_std_override_active and not args.tie_embeddings:
-        raise ValueError(
-            "Non-default TIED_EMBED_INIT_STD requires TIE_EMBEDDINGS=1 so the run cannot silently "
-            "become an untied-embedding experiment"
-        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1268,7 +1253,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    tok_emb_weight_std_after_init = float(base_model.tok_emb.weight.detach().float().std(unbiased=False).item())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1277,14 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        "tied_embed_init_audit: "
-        f"tie_embeddings:{args.tie_embeddings} "
-        f"tied_embed_init_std:{args.tied_embed_init_std:.8f} "
-        f"override_active:{tied_embed_init_std_override_active} "
-        f"tok_emb_weight_std_after_init:{tok_emb_weight_std_after_init:.8f} "
-        f"optimizer_head:{'inactive' if base_model.lm_head is None else 'active'}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
