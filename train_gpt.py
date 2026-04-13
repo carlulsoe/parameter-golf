@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1171,6 +1172,12 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.scalar_beta1 < 1.0:
+        raise ValueError(f"SCALAR_BETA1 must be in [0, 1), got {args.scalar_beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1238,7 +1245,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.scalar_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1261,6 +1268,19 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_beta1s:adam_beta1:{args.beta1} scalar_beta1:{args.scalar_beta1} "
+        f"adam_beta2:{args.beta2} muon_momentum:{args.muon_momentum}"
+    )
+    log0(
+        f"optimizer_beta1_scope:optimizer_tok:{args.beta1} "
+        f"optimizer_head:{args.beta1 if base_model.lm_head is not None else 'tied_to_tok_emb'} "
+        f"optimizer_scalar:{args.scalar_beta1} optimizer_muon_momentum:{args.muon_momentum}"
+    )
+    log0(
+        f"optimizer_scalar_group:tensors:{len(scalar_params)} "
+        f"numel:{sum(p.numel() for p in scalar_params)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
