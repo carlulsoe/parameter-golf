@@ -83,7 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_momentum_warmup_power = float(os.environ.get("MUON_MOMENTUM_WARMUP_POWER", 1.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not math.isfinite(args.muon_momentum_warmup_power) or args.muon_momentum_warmup_power <= 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_POWER must be finite and positive, got {args.muon_momentum_warmup_power}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1273,11 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"muon_momentum_schedule:start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"power:{args.muon_momentum_warmup_power:.5f}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1341,7 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    last_muon_momentum = args.muon_momentum_warmup_start if args.muon_momentum_warmup_steps > 0 else args.muon_momentum
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1391,9 +1380,7 @@ def main() -> None:
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        frac = frac ** args.muon_momentum_warmup_power
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        last_muon_momentum = muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1431,12 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"muon_momentum_audit:completed_updates:{step} "
-        f"last_momentum:{last_muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"power:{args.muon_momentum_warmup_power:.5f}"
     )
 
     # -----------------------------
