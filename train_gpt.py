@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1089,6 +1090,15 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if not 0.0 <= args.token_beta2 < 1.0:
+        raise ValueError(f"TOKEN_BETA2 must be in [0, 1), got {args.token_beta2}")
+    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
+        raise ValueError(
+            "TOKEN_BETA2 can differ from BETA2 only when TIE_EMBEDDINGS=1, "
+            f"got TIE_EMBEDDINGS={int(args.tie_embeddings)} TOKEN_BETA2={args.token_beta2} BETA2={args.beta2}"
+        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1224,7 +1234,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.token_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1261,6 +1271,15 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    head_beta2_scope = f"{args.beta2:.5f}" if base_model.lm_head is not None else "inactive"
+    log0(
+        "optimizer_beta2_scope: "
+        f"optimizer_tok:{args.token_beta2:.5f} "
+        f"optimizer_head:{head_beta2_scope} "
+        f"optimizer_scalar:{args.beta2:.5f} "
+        f"muon_beta2:none "
+        f"tie_embeddings:{args.tie_embeddings}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
