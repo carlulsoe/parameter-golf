@@ -78,7 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_lr_mult = float(os.environ.get("MATRIX_LR_MULT", 1.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.matrix_lr_mult <= 0:
-        raise ValueError(f"MATRIX_LR_MULT must be positive, got {args.matrix_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1224,9 +1221,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    matrix_numel = sum(p.numel() for p in matrix_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    matrix_base_lr = args.matrix_lr * args.matrix_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1235,12 +1230,12 @@ def main() -> None:
     )
     optimizer_muon = Muon(
         matrix_params,
-        lr=matrix_base_lr,
+        lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups:
-        group["base_lr"] = matrix_base_lr
+        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1265,12 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{matrix_base_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"optimizer_muon audit: tensors:{len(matrix_params)} numel:{matrix_numel} "
-        f"configured_matrix_lr:{args.matrix_lr:.8f} matrix_lr_mult:{args.matrix_lr_mult:.8f} "
-        f"base_lr:{matrix_base_lr:.8f}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1413,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1425,12 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    log0(
-        f"optimizer_muon final_audit: completed_updates:{step} "
-        f"matrix_lr_mult:{args.matrix_lr_mult:.8f} "
-        f"last_matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f}"
-    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
