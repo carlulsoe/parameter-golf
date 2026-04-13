@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    train_loader_audit = bool(int(os.environ.get("TRAIN_LOADER_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -788,9 +789,13 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.wrap_count = 0
+        self.total_tokens_taken = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
+        if self.file_idx == 0:
+            self.wrap_count += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -806,7 +811,17 @@ class TokenStream:
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
             remaining -= k
+        self.total_tokens_taken += n
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+    def cursor_state(self) -> dict[str, object]:
+        return {
+            "file_idx": self.file_idx,
+            "file_name": self.files[self.file_idx].name,
+            "file_pos": self.pos,
+            "wrap_count": self.wrap_count,
+            "total_tokens_taken": self.total_tokens_taken,
+        }
 
 
 class DistributedTokenLoader:
@@ -827,6 +842,17 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def cursor_state(self) -> dict[str, object]:
+        return self.stream.cursor_state()
+
+
+def format_loader_cursor(state: dict[str, object]) -> str:
+    return (
+        f"file_idx:{int(state['file_idx'])} file:{state['file_name']} "
+        f"file_pos:{int(state['file_pos'])} wraps:{int(state['wrap_count'])} "
+        f"total_tokens_taken:{int(state['total_tokens_taken'])}"
+    )
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1275,6 +1301,17 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    local_tokens_per_micro_step = args.train_batch_tokens // (world_size * grad_accum_steps)
+    effective_global_tokens_per_step = local_tokens_per_micro_step * world_size * grad_accum_steps
+    stream_tokens_per_micro_step = (local_tokens_per_micro_step + 1) * world_size
+    if args.train_loader_audit:
+        log0(
+            "train_loader_audit "
+            f"enabled:True requested_global_tokens_per_step:{args.train_batch_tokens} "
+            f"effective_global_tokens_per_step:{effective_global_tokens_per_step} "
+            f"stream_tokens_per_micro_step:{stream_tokens_per_micro_step} "
+            f"initial_cursor:{format_loader_cursor(train_loader.cursor_state())}"
+        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1296,6 +1333,7 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        warmup_start_cursor = train_loader.cursor_state() if args.train_loader_audit else None
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1319,7 +1357,38 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
+        if args.train_loader_audit and warmup_start_cursor is not None:
+            warmup_exit_cursor = train_loader.cursor_state()
+            warmup_consumed_stream_tokens = int(warmup_exit_cursor["total_tokens_taken"]) - int(
+                warmup_start_cursor["total_tokens_taken"]
+            )
+            warmup_micro_steps = args.warmup_steps * grad_accum_steps
+            warmup_supervised_tokens = warmup_micro_steps * local_tokens_per_micro_step * world_size
+            warmup_boundary_tokens = warmup_consumed_stream_tokens - warmup_supervised_tokens
+            log0(
+                "warmup_loader_audit "
+                f"warmup_steps:{args.warmup_steps} warmup_micro_steps:{warmup_micro_steps} "
+                f"warmup_supervised_tokens:{warmup_supervised_tokens} "
+                f"warmup_stream_tokens:{warmup_consumed_stream_tokens} "
+                f"warmup_boundary_tokens:{warmup_boundary_tokens} "
+                f"warmup_exit_cursor:{format_loader_cursor(warmup_exit_cursor)}"
+            )
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.train_loader_audit and warmup_start_cursor is not None:
+            measured_start_cursor = train_loader.cursor_state()
+            log0(
+                "measured_loader_start "
+                f"rewound_after_warmup:True "
+                f"continued_cursor:{format_loader_cursor(warmup_exit_cursor)} "
+                f"measured_start_cursor:{format_loader_cursor(measured_start_cursor)} "
+                f"replayed_stream_tokens:{warmup_consumed_stream_tokens}"
+            )
+    elif args.train_loader_audit:
+        log0(
+            "measured_loader_start "
+            f"rewound_after_warmup:False "
+            f"measured_start_cursor:{format_loader_cursor(train_loader.cursor_state())}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
