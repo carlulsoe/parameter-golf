@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    skip_beta2 = float(os.environ.get("SKIP_BETA2", os.environ.get("BETA2", 0.95)))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1204,12 +1203,6 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    for beta_name, beta_value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("SKIP_BETA2", args.skip_beta2)):
-        if not (0.0 <= beta_value < 1.0):
-            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
@@ -1226,12 +1219,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    skip_param_tensors = 1 if base_model.skip_weights.numel() > 0 else 0
-    skip_param_numel = int(base_model.skip_weights.numel())
-    skip_group_mode = "shared_scalar_beta2"
-    if skip_param_numel > 0 and args.skip_beta2 != args.beta2:
-        skip_group_mode = "split_skip_beta2"
-    elif skip_param_numel > 0:
+    if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1248,18 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
-    if skip_group_mode == "split_skip_beta2":
-        scalar_param_groups.append(
-            {
-                "params": [base_model.skip_weights],
-                "lr": args.scalar_lr,
-                "base_lr": args.scalar_lr,
-                "betas": (args.beta1, args.skip_beta2),
-            }
-        )
     optimizer_scalar = torch.optim.Adam(
-        scalar_param_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1283,17 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"optimizer_betas:beta1:{args.beta1} beta2:{args.beta2} "
-        f"skip_beta2:{args.skip_beta2} adam_eps:{args.adam_eps}"
-    )
-    log0(
-        "skip_group_audit:"
-        f"mode:{skip_group_mode} "
-        f"skip_param_tensors:{skip_param_tensors} "
-        f"skip_param_numel:{skip_param_numel} "
-        "scope:decoder_skip_weights_only"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
