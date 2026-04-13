@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -808,6 +809,12 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
+    def describe_state(self) -> str:
+        return (
+            f"file_idx:{self.file_idx} file:{self.files[self.file_idx].name} "
+            f"pos:{self.pos} file_tokens:{self.tokens.numel()} num_files:{len(self.files)}"
+        )
+
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
@@ -818,10 +825,23 @@ class DistributedTokenLoader:
         self.device = device
         self.stream = TokenStream(pattern)
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def batch_geometry(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[int, int, int]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        raw_tokens = per_rank_span * self.world_size
+        if local_tokens % seq_len != 0:
+            raise ValueError(f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}")
+        return local_tokens, per_rank_span, raw_tokens
+
+    def describe_state(self) -> str:
+        return (
+            f"rank:{self.rank} world_size:{self.world_size} "
+            f"{self.stream.describe_state()}"
+        )
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens, per_rank_span, raw_tokens = self.batch_geometry(global_tokens, seq_len, grad_accum_steps)
+        chunk = self.stream.take(raw_tokens)
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
@@ -1266,6 +1286,7 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1275,6 +1296,25 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    local_tokens_per_micro_batch, per_rank_span, raw_tokens_per_micro_batch = train_loader.batch_geometry(
+        args.train_batch_tokens, args.train_seq_len, grad_accum_steps
+    )
+    warmup_total_micro_batches = args.warmup_steps * grad_accum_steps
+    warmup_total_raw_tokens = warmup_total_micro_batches * raw_tokens_per_micro_batch
+    warmup_total_shift_overhead = warmup_total_micro_batches * world_size
+    log0(
+        f"train_loader_batch_geometry local_tokens_per_micro_batch:{local_tokens_per_micro_batch} "
+        f"per_rank_span:{per_rank_span} raw_tokens_per_micro_batch:{raw_tokens_per_micro_batch} "
+        f"shift_overhead_tokens_per_micro_batch:{world_size}"
+    )
+    log0(
+        f"warmup_loader_plan warmup_steps:{args.warmup_steps} grad_accum_steps:{grad_accum_steps} "
+        f"total_micro_batches:{warmup_total_micro_batches} "
+        f"exact_raw_stream_advance_tokens:{warmup_total_raw_tokens} "
+        f"exact_shift_overhead_tokens:{warmup_total_shift_overhead} "
+        f"exact_payload_tokens:{warmup_total_micro_batches * local_tokens_per_micro_batch * world_size}"
+    )
+    log0(f"train_loader_state phase:startup {train_loader.describe_state()}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,13 +1353,19 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        log0(f"train_loader_state phase:post_warmup_consumed {train_loader.describe_state()}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.reset_train_loader_after_warmup:
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+            log0("train_loader_warmup_transition action:reset reason:rewind_measured_training_to_stream_start")
+        else:
+            log0("train_loader_warmup_transition action:resume reason:continue_measured_training_from_warmup_consumed_stream_state")
+        log0(f"train_loader_state phase:active_after_warmup_branch {train_loader.describe_state()}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
