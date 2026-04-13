@@ -79,6 +79,8 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    token_lr_floor_mult = float(os.environ.get("TOKEN_LR_FLOOR_MULT", 0.0))
+    token_lr_floor_start_step = int(os.environ.get("TOKEN_LR_FLOOR_START_STEP", 1))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1107,6 +1109,18 @@ def main() -> None:
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if not 0.0 <= args.token_lr_floor_mult <= 1.0:
+        raise ValueError(f"TOKEN_LR_FLOOR_MULT must be in [0, 1], got {args.token_lr_floor_mult}")
+    if args.token_lr_floor_start_step < 1:
+        raise ValueError(f"TOKEN_LR_FLOOR_START_STEP must be >= 1, got {args.token_lr_floor_start_step}")
+    if args.token_lr_floor_mult > 0.0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_LR_FLOOR_MULT > 0 requires TIE_EMBEDDINGS=1")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -1268,6 +1282,12 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"token_lr_floor enabled:{args.token_lr_floor_mult > 0.0} "
+        f"start_step:{args.token_lr_floor_start_step} "
+        f"floor_mult:{args.token_lr_floor_mult:.5f} "
+        "step_semantics:applied_step_one_based scope:optimizer_tok"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1347,9 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    token_lr_floor_first_activation_step: int | None = None
+    token_lr_floor_active_steps = 0
+    last_token_lr_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1384,7 +1407,24 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
-        for opt in optimizers:
+        applied_step = step + 1
+        token_lr_mult = scale
+        token_lr_floor_active = False
+        if args.token_lr_floor_mult > 0.0 and applied_step >= args.token_lr_floor_start_step:
+            token_lr_mult = max(scale, args.token_lr_floor_mult)
+            token_lr_floor_active = token_lr_mult > scale
+        if token_lr_floor_active:
+            token_lr_floor_active_steps += 1
+            if token_lr_floor_first_activation_step is None:
+                token_lr_floor_first_activation_step = applied_step
+                log0(
+                    f"token_lr_floor_activation first_step:{applied_step} "
+                    f"global_lr_mult:{scale:.5f} token_lr_mult:{token_lr_mult:.5f}"
+                )
+        last_token_lr_mult = token_lr_mult
+        for group in optimizer_tok.param_groups:
+            group["lr"] = group["base_lr"] * token_lr_mult
+        for opt in optimizers[1:]:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
@@ -1401,9 +1441,11 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            token_lr = float(optimizer_tok.param_groups[0]["lr"])
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"global_lr_mul:{scale:.5f} token_lr_mult:{last_token_lr_mult:.5f} token_lr:{token_lr:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1460,14 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"token_lr_floor_audit configured_start_step:{args.token_lr_floor_start_step} "
+        f"floor_mult:{args.token_lr_floor_mult:.5f} "
+        f"first_activation_step:{token_lr_floor_first_activation_step or 0} "
+        f"active_steps:{token_lr_floor_active_steps} "
+        f"last_token_lr_mult:{last_token_lr_mult:.5f} "
+        f"completed_updates:{step}"
     )
 
     # -----------------------------
