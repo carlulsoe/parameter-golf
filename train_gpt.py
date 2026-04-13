@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    scalar_adam_eps = float(os.environ.get("SCALAR_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1091,10 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not math.isfinite(args.adam_eps) or args.adam_eps <= 0:
-        raise ValueError(f"ADAM_EPS must be finite and strictly positive, got {args.adam_eps}")
-    if not math.isfinite(args.scalar_adam_eps) or args.scalar_adam_eps <= 0:
-        raise ValueError(f"SCALAR_ADAM_EPS must be finite and strictly positive, got {args.scalar_adam_eps}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1244,7 +1239,7 @@ def main() -> None:
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.scalar_adam_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1266,15 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"optimizer_eps_scope:adam_eps:{args.adam_eps:.8g} scalar_adam_eps:{args.scalar_adam_eps:.8g} "
-        f"optimizer_tok_eps:{optimizer_tok.defaults['eps']:.8g} "
-        f"optimizer_scalar_eps:{optimizer_scalar.defaults['eps']:.8g} "
-        f"optimizer_head_eps:{optimizer_head.defaults['eps']:.8g}" if base_model.lm_head is not None
-        else f"optimizer_eps_scope:adam_eps:{args.adam_eps:.8g} scalar_adam_eps:{args.scalar_adam_eps:.8g} "
-        f"optimizer_tok_eps:{optimizer_tok.defaults['eps']:.8g} "
-        f"optimizer_scalar_eps:{optimizer_scalar.defaults['eps']:.8g} optimizer_head_eps:inactive"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
