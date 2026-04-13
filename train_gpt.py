@@ -170,21 +170,6 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_muon_momentum(applied_step: int, warmup_steps: int, warmup_start: float, base_momentum: float) -> float:
-    if warmup_steps <= 0:
-        return base_momentum
-    frac = min(applied_step / warmup_steps, 1.0)
-    return (1 - frac) * warmup_start + frac * base_momentum
-
-
-def get_muon_momentum_trace_steps(warmup_steps: int) -> tuple[int, ...]:
-    trace_steps = {0, 1, 9, 199}
-    if warmup_steps > 0:
-        trace_steps.add(warmup_steps - 1)
-        trace_steps.add(warmup_steps)
-    return tuple(sorted(step for step in trace_steps if step >= 0))
-
-
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
@@ -1186,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.muon_momentum_warmup_steps < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1281,19 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    muon_momentum_trace_steps = get_muon_momentum_trace_steps(args.muon_momentum_warmup_steps)
-    muon_warmup_end_applied_step = args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0
-    log0(
-        "muon_momentum_schedule:"
-        f" step_semantics:applied_step_zero_based"
-        f" warmup_start:{args.muon_momentum_warmup_start:.5f}"
-        f" base_momentum:{args.muon_momentum:.5f}"
-        f" warmup_steps:{args.muon_momentum_warmup_steps}"
-        f" warmup_end_applied_step:{muon_warmup_end_applied_step}"
-        f" step0_momentum:{get_muon_momentum(0, args.muon_momentum_warmup_steps, args.muon_momentum_warmup_start, args.muon_momentum):.5f}"
-        f" warmup_end_momentum:{get_muon_momentum(muon_warmup_end_applied_step, args.muon_momentum_warmup_steps, args.muon_momentum_warmup_start, args.muon_momentum):.5f}"
-        f" trace_steps:{','.join(str(trace_step) for trace_step in muon_momentum_trace_steps)}"
-    )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1363,7 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    last_applied_muon_momentum: float | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1412,22 +1379,10 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = get_muon_momentum(
-            step,
-            args.muon_momentum_warmup_steps,
-            args.muon_momentum_warmup_start,
-            args.muon_momentum,
-        )
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-        last_applied_muon_momentum = muon_momentum
-        if step in muon_momentum_trace_steps:
-            log0(
-                f"muon_momentum_trace: applied_step:{step}"
-                f" momentum:{muon_momentum:.5f}"
-                f" warmup_steps:{args.muon_momentum_warmup_steps}"
-                f" reaches_base:{int(muon_momentum >= args.muon_momentum)}"
-            )
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1459,16 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    if last_applied_muon_momentum is not None:
-        log0(
-            "muon_momentum_audit:"
-            f" warmup_steps:{args.muon_momentum_warmup_steps}"
-            f" warmup_end_applied_step:{muon_warmup_end_applied_step}"
-            f" last_applied_step:{step - 1}"
-            f" last_applied_momentum:{last_applied_muon_momentum:.5f}"
-            f" trace_steps_reached:{','.join(str(trace_step) for trace_step in muon_momentum_trace_steps if trace_step < step)}"
-        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
