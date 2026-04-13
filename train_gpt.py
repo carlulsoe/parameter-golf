@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    resume_train_loader_after_warmup = bool(int(os.environ.get("RESUME_TRAIN_LOADER_AFTER_WARMUP", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -788,6 +789,7 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.total_tokens_taken = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -805,6 +807,7 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
+            self.total_tokens_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
@@ -827,6 +830,12 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def total_tokens_taken(self) -> int:
+        return int(self.stream.total_tokens_taken)
+
+    def cursor_state(self) -> tuple[int, int]:
+        return int(self.stream.file_idx), int(self.stream.pos)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1268,6 +1277,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"resume_train_loader_after_warmup:{args.resume_train_loader_after_warmup}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1319,7 +1329,30 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        warmup_batches = args.warmup_steps * grad_accum_steps
+        expected_tokens_taken = warmup_batches * ((args.train_batch_tokens // grad_accum_steps) + world_size)
+        actual_tokens_taken = train_loader.total_tokens_taken()
+        file_idx, file_pos = train_loader.cursor_state()
+        if args.resume_train_loader_after_warmup:
+            log0(
+                "train_loader_post_warmup: "
+                f"mode:resume expected_tokens_taken:{expected_tokens_taken} "
+                f"actual_tokens_taken:{actual_tokens_taken} "
+                f"file_idx:{file_idx} file_pos:{file_pos}"
+            )
+        else:
+            log0(
+                "train_loader_post_warmup: "
+                f"mode:reset expected_tokens_taken:{expected_tokens_taken} "
+                f"actual_tokens_taken:{actual_tokens_taken} "
+                f"file_idx:{file_idx} file_pos:{file_pos}"
+            )
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+            reset_file_idx, reset_file_pos = train_loader.cursor_state()
+            log0(
+                "train_loader_reset_cursor: "
+                f"file_idx:{reset_file_idx} file_pos:{reset_file_pos}"
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
