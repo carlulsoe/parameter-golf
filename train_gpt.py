@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -788,9 +789,13 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.tokens_taken = 0
+        self.wraps = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
+        if self.file_idx == 0:
+            self.wraps += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -805,8 +810,24 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
+            self.tokens_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "file_idx": self.file_idx,
+            "pos": self.pos,
+            "tokens_taken": self.tokens_taken,
+            "wraps": self.wraps,
+        }
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.file_idx = int(state["file_idx"])
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = int(state["pos"])
+        self.tokens_taken = int(state["tokens_taken"])
+        self.wraps = int(state["wraps"])
 
 
 class DistributedTokenLoader:
@@ -827,6 +848,12 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def state_dict(self) -> dict[str, int]:
+        return self.stream.state_dict()
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.stream.load_state_dict(state)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1275,6 +1302,12 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    initial_train_loader_state = train_loader.state_dict()
+    log0(
+        f"train_loader_initial: reset_after_warmup:{args.reset_train_loader_after_warmup} "
+        f"file_idx:{initial_train_loader_state['file_idx']} pos:{initial_train_loader_state['pos']} "
+        f"tokens_taken:{initial_train_loader_state['tokens_taken']} wraps:{initial_train_loader_state['wraps']}"
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1298,6 +1331,7 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        warmup_start_loader_state = train_loader.state_dict()
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -1319,7 +1353,29 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        warmup_end_loader_state = train_loader.state_dict()
+        if args.reset_train_loader_after_warmup:
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        else:
+            train_loader.load_state_dict(warmup_end_loader_state)
+        measured_start_loader_state = train_loader.state_dict()
+        replayed_prefix_tokens = max(
+            warmup_end_loader_state["tokens_taken"] - measured_start_loader_state["tokens_taken"],
+            0,
+        )
+        log0(
+            f"warmup_loader_audit: warmup_start_file_idx:{warmup_start_loader_state['file_idx']} "
+            f"warmup_start_pos:{warmup_start_loader_state['pos']} "
+            f"warmup_stream_tokens:{warmup_end_loader_state['tokens_taken'] - warmup_start_loader_state['tokens_taken']} "
+            f"warmup_end_file_idx:{warmup_end_loader_state['file_idx']} "
+            f"warmup_end_pos:{warmup_end_loader_state['pos']} "
+            f"warmup_wraps:{warmup_end_loader_state['wraps'] - warmup_start_loader_state['wraps']} "
+            f"measured_start_file_idx:{measured_start_loader_state['file_idx']} "
+            f"measured_start_pos:{measured_start_loader_state['pos']} "
+            f"measured_start_tokens_taken:{measured_start_loader_state['tokens_taken']} "
+            f"measured_start_wraps:{measured_start_loader_state['wraps']} "
+            f"replayed_prefix_tokens:{replayed_prefix_tokens}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
