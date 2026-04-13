@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_lr_floor_mult = float(os.environ.get("TOKEN_LR_FLOOR_MULT", 0.0))
+    token_lr_floor_start_step = int(os.environ.get("TOKEN_LR_FLOOR_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1173,14 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not (0.0 <= args.token_lr_floor_mult <= 1.0):
+        raise ValueError(
+            f"TOKEN_LR_FLOOR_MULT must be in [0, 1], got {args.token_lr_floor_mult}"
+        )
+    if args.token_lr_floor_start_step < 0:
+        raise ValueError(
+            f"TOKEN_LR_FLOOR_START_STEP must be non-negative, got {args.token_lr_floor_start_step}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1278,14 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        "token_lr_floor: "
+        f"enabled:{args.token_lr_floor_mult > 0.0} "
+        f"start_step:{args.token_lr_floor_start_step} "
+        f"floor_mult:{args.token_lr_floor_mult:.5f} "
+        "step_semantics:applied_step_one_based "
+        "scope:optimizer_tok"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1345,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    token_lr_floor_first_step: int | None = None
+    token_lr_floor_active_steps = 0
+    token_lr_floor_last_shared_mult = 1.0
+    token_lr_floor_last_effective_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1409,28 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        token_lr_floor_last_shared_mult = scale
+        token_lr_floor_last_effective_mult = scale
+        applied_step = step + 1
+        if (
+            args.token_lr_floor_mult > 0.0
+            and applied_step >= args.token_lr_floor_start_step
+            and optimizer_tok.param_groups
+        ):
+            token_effective_scale = max(scale, args.token_lr_floor_mult)
+            token_lr_floor_last_effective_mult = token_effective_scale
+            if token_effective_scale > scale:
+                token_lr_floor_active_steps += 1
+                if token_lr_floor_first_step is None:
+                    token_lr_floor_first_step = applied_step
+                    log0(
+                        "token_lr_floor_activation: "
+                        f"first_step:{applied_step} "
+                        f"shared_mult:{scale:.8f} "
+                        f"effective_mult:{token_effective_scale:.8f}"
+                    )
+                for group in optimizer_tok.param_groups:
+                    group["lr"] = group["base_lr"] * token_effective_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1462,16 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "token_lr_floor_audit: "
+        f"start_step:{args.token_lr_floor_start_step} "
+        f"floor_mult:{args.token_lr_floor_mult:.5f} "
+        f"first_activation_step:{token_lr_floor_first_step if token_lr_floor_first_step is not None else 'none'} "
+        f"active_steps:{token_lr_floor_active_steps} "
+        f"completed_updates:{step} "
+        f"last_shared_mult:{token_lr_floor_last_shared_mult:.8f} "
+        f"last_effective_mult:{token_lr_floor_last_effective_mult:.8f}"
     )
 
     # -----------------------------
