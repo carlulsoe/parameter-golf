@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    optimizer_tok_scope_audit = bool(int(os.environ.get("OPTIMIZER_TOK_SCOPE_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -856,6 +857,32 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def summarize_optimizer_param_group_scope(
+    optimizer: torch.optim.Optimizer,
+    named_params: list[tuple[str, nn.Parameter]],
+) -> dict[str, object]:
+    name_by_param_id = {id(param): name for name, param in named_params}
+    names: list[str] = []
+    tensor_count = 0
+    numel = 0
+    unmapped_tensor_count = 0
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            tensor_count += 1
+            numel += int(param.numel())
+            mapped_name = name_by_param_id.get(id(param))
+            if mapped_name is None:
+                unmapped_tensor_count += 1
+            else:
+                names.append(mapped_name)
+    return {
+        "tensor_count": tensor_count,
+        "numel": numel,
+        "unmapped_tensor_count": unmapped_tensor_count,
+        "names": names,
+    }
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1252,6 +1279,23 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_optimizer_tok_scope(tag: str) -> None:
+        if not args.optimizer_tok_scope_audit:
+            return
+        scope = summarize_optimizer_param_group_scope(optimizer_tok, list(base_model.named_parameters()))
+        live_group = optimizer_tok.param_groups[0]
+        names = ",".join(scope["names"]) if scope["names"] else "none"
+        log0(
+            f"{tag}: scope:optimizer_tok.param_groups "
+            f"tie_embeddings:{args.tie_embeddings} "
+            f"tensor_count:{scope['tensor_count']} "
+            f"numel:{scope['numel']} "
+            f"unmapped_tensors:{scope['unmapped_tensor_count']} "
+            f"live_lr:{float(live_group['lr']):.8f} "
+            f"live_base_lr:{float(live_group['base_lr']):.8f} "
+            f"names:{names}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1320,6 +1364,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    log_optimizer_tok_scope("optimizer_tok audit")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1465,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_tok_scope("optimizer_tok_final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
