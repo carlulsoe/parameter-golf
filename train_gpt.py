@@ -76,6 +76,8 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    token_lr_warmup_steps = int(os.environ.get("TOKEN_LR_WARMUP_STEPS", 0))
+    token_lr_warmup_start_mult = float(os.environ.get("TOKEN_LR_WARMUP_START_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1171,6 +1173,12 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.token_lr_warmup_steps < 0:
+        raise ValueError(f"TOKEN_LR_WARMUP_STEPS must be non-negative, got {args.token_lr_warmup_steps}")
+    if not (0.0 < args.token_lr_warmup_start_mult <= 1.0):
+        raise ValueError(
+            f"TOKEN_LR_WARMUP_START_MULT must be in (0, 1], got {args.token_lr_warmup_start_mult}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1263,6 +1271,15 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        "token_lr_warmup_schedule: "
+        f"step_semantics:applied_step_zero_based "
+        f"scope:optimizer_tok "
+        f"warmup_steps:{args.token_lr_warmup_steps} "
+        f"warmup_start_mult:{args.token_lr_warmup_start_mult:.5f} "
+        f"warmup_end_applied_step:{max(args.token_lr_warmup_steps - 1, 0)} "
+        f"step0_mult:{(args.token_lr_warmup_start_mult if args.token_lr_warmup_steps > 1 else 1.0):.5f}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1292,6 +1309,23 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def token_lr_warmup_mult(applied_step: int) -> float:
+        if args.token_lr_warmup_steps <= 0:
+            return 1.0
+        if args.token_lr_warmup_steps == 1:
+            return 1.0
+        warmup_frac = min(applied_step / max(args.token_lr_warmup_steps - 1, 1), 1.0)
+        return (1.0 - warmup_frac) * args.token_lr_warmup_start_mult + warmup_frac * 1.0
+
+    def token_lr_warmup_fraction(applied_step: int) -> float:
+        if args.token_lr_warmup_steps <= 0:
+            return 1.0
+        if applied_step < 0:
+            return 0.0
+        if args.token_lr_warmup_steps == 1:
+            return 1.0
+        return min(applied_step / max(args.token_lr_warmup_steps - 1, 1), 1.0)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1327,6 +1361,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    token_lr_trace_steps = {0, 1, 9, 63, 199}
+    token_lr_trace_reached: set[int] = set()
+    token_lr_last_applied_step = -1
+    token_lr_last_applied_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1384,9 +1422,26 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
+        token_warmup_mult = token_lr_warmup_mult(step)
+        for group in optimizer_tok.param_groups:
+            group["lr"] = group["base_lr"] * scale * token_warmup_mult
         for opt in optimizers:
+            if opt is optimizer_tok:
+                continue
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        if step in token_lr_trace_steps:
+            token_lr_trace_reached.add(step)
+            live_token_lrs = [float(group["lr"]) for group in optimizer_tok.param_groups]
+            log0(
+                "token_lr_trace: "
+                f"applied_step:{step} "
+                f"warmup_mult:{token_warmup_mult:.5f} "
+                f"live_lr_min:{min(live_token_lrs):.8f} "
+                f"live_lr_max:{max(live_token_lrs):.8f}"
+            )
+        token_lr_last_applied_step = step
+        token_lr_last_applied_mult = token_warmup_mult
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1473,19 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "token_lr_audit: "
+        f"configured_token_lr:{token_lr:.8f} "
+        f"warmup_steps:{args.token_lr_warmup_steps} "
+        f"warmup_start_mult:{args.token_lr_warmup_start_mult:.5f} "
+        f"warmup_end_applied_step:{max(args.token_lr_warmup_steps - 1, 0)} "
+        f"completed_updates:{step} "
+        f"measured_stop_step:{step} "
+        f"last_applied_step:{token_lr_last_applied_step} "
+        f"last_applied_warmup_mult:{token_lr_last_applied_mult:.5f} "
+        f"warmup_fraction_completed:{token_lr_warmup_fraction(token_lr_last_applied_step):.5f} "
+        f"trace_steps_reached:{','.join(str(s) for s in sorted(token_lr_trace_reached))}"
     )
 
     # -----------------------------
