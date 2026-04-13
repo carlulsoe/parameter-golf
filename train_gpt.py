@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    token_grad_clip_norm = float(os.environ.get("TOKEN_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,14 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.grad_clip_norm < 0.0:
-        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
-    if args.token_grad_clip_norm < 0.0:
-        raise ValueError(f"TOKEN_GRAD_CLIP_NORM must be non-negative, got {args.token_grad_clip_norm}")
-    if args.grad_clip_norm > 0.0 and args.token_grad_clip_norm > 0.0:
-        raise ValueError("GRAD_CLIP_NORM and TOKEN_GRAD_CLIP_NORM are mutually exclusive")
-    if args.token_grad_clip_norm > 0.0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1272,16 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        "optimizer_clipping: "
-        f"grad_clip_norm:{args.grad_clip_norm:.5f} "
-        f"token_grad_clip_norm:{args.token_grad_clip_norm:.5f}"
-    )
-    log0(
-        "optimizer_tok_group: "
-        f"scope:{'tied_only' if args.tie_embeddings else 'input_only'} "
-        f"param_count:1 param_numel:{base_model.tok_emb.weight.numel()}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1350,7 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    last_token_grad_norm: Tensor | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1410,10 +1390,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        if args.token_grad_clip_norm > 0:
-            last_token_grad_norm = torch.nn.utils.clip_grad_norm_(
-                [base_model.tok_emb.weight], args.token_grad_clip_norm
-            )
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1425,13 +1401,10 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            train_log = (
+            log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if args.token_grad_clip_norm > 0 and last_token_grad_norm is not None:
-                train_log += f" token_grad_norm:{float(last_token_grad_norm.item()):.4f}"
-            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1446,14 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.token_grad_clip_norm > 0:
-        log0(
-            "token_grad_clip_audit: "
-            f"scope:tied_only param_count:1 param_numel:{base_model.tok_emb.weight.numel()} "
-            f"token_grad_clip_norm:{args.token_grad_clip_norm:.5f} "
-            f"last_token_grad_norm:{0.0 if last_token_grad_norm is None else float(last_token_grad_norm.item()):.4f} "
-            "norm_logging:existing_train_logs_only"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
