@@ -83,8 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_late_lr_scale_threshold = float(os.environ.get("MUON_LATE_LR_SCALE_THRESHOLD", 0.0))
-    muon_late_lr_mult = float(os.environ.get("MUON_LATE_LR_MULT", 1.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1091,13 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not 0.0 <= args.muon_late_lr_scale_threshold <= 1.0:
-        raise ValueError(
-            "MUON_LATE_LR_SCALE_THRESHOLD must be in [0, 1], "
-            f"got {args.muon_late_lr_scale_threshold}"
-        )
-    if not 0.0 < args.muon_late_lr_mult <= 1.0:
-        raise ValueError(f"MUON_LATE_LR_MULT must be in (0, 1], got {args.muon_late_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1218,12 +1209,11 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_param_name_by_id = {}
-    matrix_params = []
-    for name, param in block_named_params:
-        if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-            matrix_params.append(param)
-            matrix_param_name_by_id[id(param)] = f"blocks.{name}"
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1263,12 +1253,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    optimizer_muon_names = [
-        matrix_param_name_by_id[id(param)]
-        for group in optimizer_muon.param_groups
-        for param in group["params"]
-    ]
-    optimizer_muon_numel = sum(int(param.numel()) for group in optimizer_muon.param_groups for param in group["params"])
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1285,16 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        "optimizer_muon_scope_audit "
-        f"tensors:{len(optimizer_muon_names)} numel:{optimizer_muon_numel} "
-        f"params:{','.join(optimizer_muon_names)}"
-    )
-    log0(
-        "optimizer_muon_late_lr_schedule "
-        f"threshold:{args.muon_late_lr_scale_threshold:.5f} "
-        f"mult:{args.muon_late_lr_mult:.5f}"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1353,10 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    muon_late_active_steps = 0
-    last_shared_lr_scale = 1.0
-    last_muon_lr_mult = 1.0
-    last_muon_lr = args.matrix_lr
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1397,11 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        muon_lr_mult = args.muon_late_lr_mult if scale <= args.muon_late_lr_scale_threshold else 1.0
-        if muon_lr_mult != 1.0:
-            muon_late_active_steps += 1
-        last_shared_lr_scale = scale
-        last_muon_lr_mult = muon_lr_mult
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1420,10 +1385,8 @@ def main() -> None:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
-            opt_scale = scale * muon_lr_mult if opt is optimizer_muon else scale
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * opt_scale
-        last_muon_lr = optimizer_muon.param_groups[0]["lr"] if optimizer_muon.param_groups else 0.0
+                group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1440,9 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"shared_lr_scale:{last_shared_lr_scale:.5f} muon_lr_mult:{last_muon_lr_mult:.5f} "
-                f"muon_lr:{last_muon_lr:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1453,16 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    log0(
-        "optimizer_muon_late_lr_audit "
-        f"threshold:{args.muon_late_lr_scale_threshold:.5f} "
-        f"mult:{args.muon_late_lr_mult:.5f} "
-        f"active_steps:{muon_late_active_steps} "
-        f"last_shared_lr_scale:{last_shared_lr_scale:.5f} "
-        f"last_muon_lr_mult:{last_muon_lr_mult:.5f} "
-        f"last_muon_lr:{last_muon_lr:.8f}"
-    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
