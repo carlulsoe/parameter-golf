@@ -88,6 +88,19 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+
+def muon_momentum_for_step(args: Hyperparameters, applied_step: int) -> float:
+    frac = min(applied_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+
+
+def muon_momentum_trace_steps(warmup_steps: int) -> tuple[int, ...]:
+    trace_steps = {0, 1, 9, 199}
+    if warmup_steps > 0:
+        trace_steps.add(warmup_steps - 1)
+        trace_steps.add(warmup_steps)
+    return tuple(sorted(step for step in trace_steps if step >= 0))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1268,6 +1281,15 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    muon_trace_steps = muon_momentum_trace_steps(args.muon_momentum_warmup_steps)
+    warmup_end_applied_step = args.muon_momentum_warmup_steps - 1 if args.muon_momentum_warmup_steps > 0 else -1
+    log0(
+        f"muon_momentum_schedule step_semantics:applied_step_zero_based "
+        f"warmup_start:{args.muon_momentum_warmup_start:.5f} warmup_target:{args.muon_momentum:.5f} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} warmup_end_applied_step:{warmup_end_applied_step} "
+        f"full_momentum_start_step:{max(args.muon_momentum_warmup_steps, 0)} "
+        f"trace_steps:{','.join(str(step) for step in muon_trace_steps)}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1349,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    muon_trace_steps_reached: list[int] = []
+    last_applied_muon_momentum: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1379,10 +1403,21 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_step(args, step)
+        last_applied_muon_momentum = muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        if step in muon_trace_steps:
+            muon_trace_steps_reached.append(step)
+            warmup_progress = (
+                min((step + 1) / args.muon_momentum_warmup_steps, 1.0)
+                if args.muon_momentum_warmup_steps > 0
+                else 1.0
+            )
+            log0(
+                f"muon_momentum_trace applied_step:{step} momentum:{muon_momentum:.5f} "
+                f"warmup_fraction_completed:{warmup_progress:.5f}"
+            )
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1414,6 +1449,22 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    measured_stop_step = step
+    last_applied_step = measured_stop_step - 1
+    warmup_fraction_completed = (
+        min(measured_stop_step / args.muon_momentum_warmup_steps, 1.0)
+        if args.muon_momentum_warmup_steps > 0
+        else 1.0
+    )
+    log0(
+        f"muon_momentum_audit measured_stop_step:{measured_stop_step} "
+        f"last_applied_step:{last_applied_step} "
+        f"last_applied_muon_momentum:{(last_applied_muon_momentum if last_applied_muon_momentum is not None else args.muon_momentum):.5f} "
+        f"warmup_fraction_completed:{warmup_fraction_completed:.5f} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"trace_steps_reached:{','.join(str(trace_step) for trace_step in muon_trace_steps_reached)}"
+    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
