@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    scalar_family_audit = bool(int(os.environ.get("SCALAR_FAMILY_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -467,93 +466,6 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
-
-def scalar_family_name(name: str) -> str | None:
-    if name == "skip_weights":
-        return "skip_weights"
-    if name.endswith(".attn_scale"):
-        return "attn_scale"
-    if name.endswith(".mlp_scale"):
-        return "mlp_scale"
-    if name.endswith(".resid_mix"):
-        return "resid_mix"
-    if name.endswith(".attn.q_gain"):
-        return "q_gain"
-    return None
-
-def build_scalar_family_param_groups(module: nn.Module) -> dict[str, list[tuple[str, nn.Parameter]]]:
-    groups = {
-        "attn_scale": [],
-        "mlp_scale": [],
-        "resid_mix": [],
-        "q_gain": [],
-        "skip_weights": [],
-    }
-    for name, param in module.named_parameters():
-        family = scalar_family_name(name)
-        if family is not None:
-            groups[family].append((name, param))
-    return groups
-
-def scalar_family_audit_stats(
-    family_groups: dict[str, list[tuple[str, nn.Parameter]]],
-    before: dict[str, list[Tensor]] | None = None,
-    init: dict[str, list[Tensor]] | None = None,
-) -> dict[str, dict[str, float | int]]:
-    stats: dict[str, dict[str, float | int]] = {}
-    for family_name, params in family_groups.items():
-        family_device = params[0][1].device if params else torch.device("cpu")
-        param_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        before_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        init_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        grad_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        update_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        drift_sq_sum = torch.zeros((), device=family_device, dtype=torch.float64)
-        numel = 0
-        tensor_count = len(params)
-        for idx, (_, param) in enumerate(params):
-            data = param.detach()
-            data64 = data.to(dtype=torch.float64)
-            param_sq_sum += (data64 * data64).sum()
-            numel += int(data.numel())
-            if before is not None:
-                before_data64 = before[family_name][idx].to(device=data.device, dtype=torch.float64)
-                before_sq_sum += (before_data64 * before_data64).sum()
-                update_sq_sum += ((data64 - before_data64) ** 2).sum()
-            if init is not None:
-                init_data64 = init[family_name][idx].to(device=data.device, dtype=torch.float64)
-                init_sq_sum += (init_data64 * init_data64).sum()
-                drift_sq_sum += ((data64 - init_data64) ** 2).sum()
-            if param.grad is not None:
-                grad64 = param.grad.detach().to(dtype=torch.float64)
-                grad_sq_sum += (grad64 * grad64).sum()
-        param_l2 = float(param_sq_sum.sqrt().item()) if tensor_count > 0 else 0.0
-        before_l2 = float(before_sq_sum.sqrt().item()) if before is not None and tensor_count > 0 else 0.0
-        init_l2 = float(init_sq_sum.sqrt().item()) if init is not None and tensor_count > 0 else 0.0
-        grad_l2 = float(grad_sq_sum.sqrt().item()) if tensor_count > 0 else 0.0
-        update_l2 = float(update_sq_sum.sqrt().item()) if before is not None and tensor_count > 0 else 0.0
-        drift_l2 = float(drift_sq_sum.sqrt().item()) if init is not None and tensor_count > 0 else 0.0
-        denom_l2 = before_l2 if before is not None else param_l2
-        stats[family_name] = {
-            "tensor_count": tensor_count,
-            "numel": numel,
-            "param_l2": param_l2,
-            "param_rms": param_l2 / math.sqrt(max(numel, 1)),
-            "grad_l2": grad_l2,
-            "grad_rms": grad_l2 / math.sqrt(max(numel, 1)),
-            "grad_to_param": grad_l2 / max(denom_l2, 1e-12),
-            "update_l2": update_l2,
-            "update_rms": update_l2 / math.sqrt(max(numel, 1)),
-            "update_to_param": update_l2 / max(denom_l2, 1e-12),
-            "drift_l2": drift_l2,
-            "drift_rms": drift_l2 / math.sqrt(max(numel, 1)),
-            "drift_to_init": drift_l2 / max(init_l2, 1e-12),
-        }
-    return stats
-
-def format_scalar_family_metric(stats: dict[str, dict[str, float | int]], key: str) -> str:
-    ordered = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weights")
-    return ",".join(f"{family}:{float(stats[family][key]):.6e}" for family in ordered)
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1290,13 +1202,6 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-    scalar_family_groups = build_scalar_family_param_groups(base_model)
-    scalar_family_init: dict[str, list[Tensor]] | None = None
-    if args.scalar_family_audit:
-        scalar_family_init = {
-            family_name: [param.detach().clone() for _, param in params]
-            for family_name, params in scalar_family_groups.items()
-        }
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1358,30 +1263,12 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"optimizer_betas:beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"scalar_family_audit:{args.scalar_family_audit}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.scalar_family_audit:
-        scalar_family_start_stats = scalar_family_audit_stats(scalar_family_groups)
-        ordered = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weights")
-        log0(
-            "scalar_family_audit_startup: "
-            + " ".join(
-                (
-                    f"{family}_tensors:{int(scalar_family_start_stats[family]['tensor_count'])} "
-                    f"{family}_numel:{int(scalar_family_start_stats[family]['numel'])} "
-                    f"{family}_param_rms:{float(scalar_family_start_stats[family]['param_rms']):.6e}"
-                )
-                for family in ordered
-            )
-        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1480,10 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0 or stop_after_step is not None)
-        )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1495,12 +1378,6 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        scalar_family_before: dict[str, list[Tensor]] | None = None
-        if args.scalar_family_audit and should_log_train:
-            scalar_family_before = {
-                family_name: [param.detach().clone() for _, param in params]
-                for family_name, params in scalar_family_groups.items()
-            }
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1515,25 +1392,19 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        scalar_family_step_stats = None
-        if args.scalar_family_audit and scalar_family_before is not None:
-            scalar_family_step_stats = scalar_family_audit_stats(scalar_family_groups, before=scalar_family_before)
         zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        should_log_train = (
+            args.train_log_every > 0
+            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if scalar_family_step_stats is not None:
-                log0(
-                    "scalar_family_audit_step: "
-                    f"step:{step} "
-                    f"grad_to_param:{format_scalar_family_metric(scalar_family_step_stats, 'grad_to_param')} "
-                    f"update_to_param:{format_scalar_family_metric(scalar_family_step_stats, 'update_to_param')}"
-                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1548,13 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.scalar_family_audit and scalar_family_init is not None:
-        scalar_family_final_stats = scalar_family_audit_stats(scalar_family_groups, init=scalar_family_init)
-        log0(
-            "scalar_family_audit_final: "
-            f"drift_to_init:{format_scalar_family_metric(scalar_family_final_stats, 'drift_to_init')} "
-            f"param_rms:{format_scalar_family_metric(scalar_family_final_stats, 'param_rms')}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
