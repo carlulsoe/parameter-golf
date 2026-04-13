@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1084,11 +1085,35 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+def validate_beta2(name: str, value: float) -> None:
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value}")
+
+
+def summarize_optimizer_group(
+    group: dict[str, object], param_name_by_id: dict[int, str]
+) -> tuple[int, int, int, int, list[str]]:
+    params = list(group["params"])
+    names = []
+    for p in params:
+        name = param_name_by_id.get(id(p))
+        if name is None:
+            raise KeyError("optimizer group contains a parameter without a stable name for audit logging")
+        names.append(name)
+    tensors = len(params)
+    numel = sum(int(p.numel()) for p in params)
+    nonzero_tensors = sum(int(p.numel() > 0) for p in params)
+    nonzero_numel = sum(int(p.numel()) for p in params if p.numel() > 0)
+    return tensors, numel, nonzero_tensors, nonzero_numel, names
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    validate_beta2("BETA2", args.beta2)
+    validate_beta2("SCALAR_BETA2", args.scalar_beta2)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1200,6 +1225,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1238,7 +1264,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.scalar_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1262,6 +1288,26 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    head_beta2_scope = f"{args.beta2:.5f}" if base_model.lm_head is not None else "inactive"
+    log0(
+        f"optimizer_beta2_scope optimizer_tok:{args.beta2:.5f} "
+        f"optimizer_scalar:{args.scalar_beta2:.5f} "
+        f"optimizer_head:{head_beta2_scope} "
+        f"muon_beta2:none"
+    )
+    for group_idx, group in enumerate(optimizer_scalar.param_groups):
+        tensors, numel, nonzero_tensors, nonzero_numel, names = summarize_optimizer_group(group, param_name_by_id)
+        log0(
+            f"optimizer_scalar_group group:{group_idx} beta2:{args.scalar_beta2:.5f} "
+            f"tensors:{tensors} numel:{numel} nonzero_tensors:{nonzero_tensors} nonzero_numel:{nonzero_numel}"
+        )
+        chunk_size = 12
+        for chunk_idx in range(0, len(names), chunk_size):
+            chunk = names[chunk_idx : chunk_idx + chunk_size]
+            log0(
+                f"optimizer_scalar_group_members group:{group_idx} "
+                f"chunk:{chunk_idx // chunk_size} names:{','.join(chunk)}"
+            )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
