@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    preserve_warmup_stream_position = bool(int(os.environ.get("PRESERVE_WARMUP_STREAM_POSITION", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -789,6 +790,30 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
+    def get_state(self) -> tuple[int, int]:
+        return self.file_idx, self.pos
+
+    def set_state(self, file_idx: int, pos: int) -> None:
+        if not 0 <= file_idx < len(self.files):
+            raise ValueError(f"file_idx out of range: {file_idx}")
+        if file_idx != self.file_idx:
+            self.file_idx = file_idx
+            self.tokens = load_data_shard(self.files[self.file_idx])
+        if not 0 <= pos <= self.tokens.numel():
+            raise ValueError(f"pos out of range for {self.files[self.file_idx]}: {pos}")
+        self.pos = pos
+
+    def describe_state(self) -> str:
+        file = self.files[self.file_idx]
+        return f"file_idx:{self.file_idx} shard:{file.name} offset:{self.pos}"
+
+    def order_digest(self) -> int:
+        payload = "\n".join(file.name for file in self.files).encode("utf-8")
+        return zlib.adler32(payload) & 0xFFFFFFFF
+
+    def order_prefix(self, n: int = 3) -> str:
+        return ",".join(file.name for file in self.files[: max(n, 0)])
+
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
@@ -817,6 +842,22 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+
+    def get_state(self) -> tuple[int, int]:
+        return self.stream.get_state()
+
+    def set_state(self, state: tuple[int, int]) -> None:
+        file_idx, pos = state
+        self.stream.set_state(file_idx, pos)
+
+    def describe_state(self) -> str:
+        return self.stream.describe_state()
+
+    def order_digest(self) -> int:
+        return self.stream.order_digest()
+
+    def order_prefix(self, n: int = 3) -> str:
+        return self.stream.order_prefix(n)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1275,6 +1316,10 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    log0(
+        f"train_loader_order:digest:{train_loader.order_digest():08x} "
+        f"prefix:{train_loader.order_prefix(3)}"
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1298,6 +1343,12 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        warmup_start_state = train_loader.get_state()
+        log0(
+            "warmup_stream:"
+            f"preserve_after_reset:{int(args.preserve_warmup_stream_position)} "
+            f"start_{train_loader.describe_state()}"
+        )
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -1313,6 +1364,8 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        warmup_end_state = train_loader.get_state()
+        log0(f"warmup_stream:end_{train_loader.describe_state()}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1320,6 +1373,16 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.preserve_warmup_stream_position:
+            train_loader.set_state(warmup_end_state)
+            log0(f"warmup_stream:measured_resume:preserved {train_loader.describe_state()}")
+        else:
+            log0(f"warmup_stream:measured_resume:reset {train_loader.describe_state()}")
+        log0(
+            "warmup_stream:resume_audit "
+            f"replays_warmup_prefix:{int(train_loader.get_state() == warmup_start_state)} "
+            f"same_as_warmup_end:{int(train_loader.get_state() == warmup_end_state)}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1331,6 +1394,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    logged_first_measured_stream = False
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1372,6 +1436,9 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            if not logged_first_measured_stream:
+                log0(f"measured_stream:first_batch_start {train_loader.describe_state()}")
+                logged_first_measured_stream = True
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
