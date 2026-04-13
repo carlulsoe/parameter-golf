@@ -19,6 +19,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import sentencepiece as spm
@@ -78,6 +79,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    muon_matrix_lr_floor = float(os.environ.get("MUON_MATRIX_LR_FLOOR", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1222,6 +1224,12 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    if args.muon_matrix_lr_floor < 0.0:
+        raise ValueError(f"MUON_MATRIX_LR_FLOOR must be non-negative, got {args.muon_matrix_lr_floor}")
+    if args.muon_matrix_lr_floor > args.matrix_lr:
+        raise ValueError(
+            f"MUON_MATRIX_LR_FLOOR must not exceed MATRIX_LR, got floor={args.muon_matrix_lr_floor} base={args.matrix_lr}"
+        )
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1260,7 +1268,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} matrix_lr_floor:{args.muon_matrix_lr_floor} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1281,6 +1289,31 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    matrix_lr_trace_steps = {0, 1, 9, 199}
+    matrix_param_count = sum(int(p.numel()) for p in matrix_params)
+    matrix_tensor_count = len(matrix_params)
+    matrix_lr_audit = {
+        "last_applied_step": None,
+        "last_global_lr_mul": None,
+        "last_nominal_lr_min": None,
+        "last_nominal_lr_max": None,
+        "last_effective_lr_min": None,
+        "last_effective_lr_max": None,
+        "min_nominal_lr": None,
+        "max_nominal_lr": 0.0,
+        "min_effective_lr": None,
+        "max_effective_lr": 0.0,
+        "floor_active_steps": 0,
+        "first_floor_active_step": None,
+        "trace_steps_reached": [],
+        "step200_reached": 0,
+        "step200_nominal_lr_min": None,
+        "step200_effective_lr_min": None,
+    }
+    log0(
+        f"muon_matrix_lr_schedule base_lr:{args.matrix_lr:.8f} floor:{args.muon_matrix_lr_floor:.8f} "
+        f"warmdown_iters:{args.warmdown_iters} matrix_tensors:{matrix_tensor_count} matrix_params:{matrix_param_count}"
+    )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1387,6 +1420,57 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        nominal_matrix_lrs: list[float] = []
+        effective_matrix_lrs: list[float] = []
+        floor_active = False
+        for group in optimizer_muon.param_groups:
+            nominal_lr = float(group["lr"])
+            effective_lr = nominal_lr
+            if args.muon_matrix_lr_floor > 0.0 and effective_lr < args.muon_matrix_lr_floor:
+                effective_lr = args.muon_matrix_lr_floor
+                group["lr"] = effective_lr
+                floor_active = True
+            nominal_matrix_lrs.append(nominal_lr)
+            effective_matrix_lrs.append(float(effective_lr))
+        if nominal_matrix_lrs:
+            nominal_lr_min = min(nominal_matrix_lrs)
+            nominal_lr_max = max(nominal_matrix_lrs)
+            effective_lr_min = min(effective_matrix_lrs)
+            effective_lr_max = max(effective_matrix_lrs)
+            matrix_lr_audit["last_applied_step"] = step
+            matrix_lr_audit["last_global_lr_mul"] = scale
+            matrix_lr_audit["last_nominal_lr_min"] = nominal_lr_min
+            matrix_lr_audit["last_nominal_lr_max"] = nominal_lr_max
+            matrix_lr_audit["last_effective_lr_min"] = effective_lr_min
+            matrix_lr_audit["last_effective_lr_max"] = effective_lr_max
+            matrix_lr_audit["min_nominal_lr"] = (
+                nominal_lr_min
+                if matrix_lr_audit["min_nominal_lr"] is None
+                else min(float(matrix_lr_audit["min_nominal_lr"]), nominal_lr_min)
+            )
+            matrix_lr_audit["max_nominal_lr"] = max(float(matrix_lr_audit["max_nominal_lr"]), nominal_lr_max)
+            matrix_lr_audit["min_effective_lr"] = (
+                effective_lr_min
+                if matrix_lr_audit["min_effective_lr"] is None
+                else min(float(matrix_lr_audit["min_effective_lr"]), effective_lr_min)
+            )
+            matrix_lr_audit["max_effective_lr"] = max(float(matrix_lr_audit["max_effective_lr"]), effective_lr_max)
+            if floor_active:
+                matrix_lr_audit["floor_active_steps"] = int(matrix_lr_audit["floor_active_steps"]) + 1
+                if matrix_lr_audit["first_floor_active_step"] is None:
+                    matrix_lr_audit["first_floor_active_step"] = step
+            if step in matrix_lr_trace_steps:
+                cast(list[int], matrix_lr_audit["trace_steps_reached"]).append(step)
+                log0(
+                    f"muon_matrix_lr_trace applied_step:{step} global_lr_mul:{scale:.8f} "
+                    f"nominal_lr_min:{nominal_lr_min:.8f} nominal_lr_max:{nominal_lr_max:.8f} "
+                    f"effective_lr_min:{effective_lr_min:.8f} effective_lr_max:{effective_lr_max:.8f} "
+                    f"floor_active:{int(floor_active)} muon_momentum:{muon_momentum:.8f}"
+                )
+            if step == 199:
+                matrix_lr_audit["step200_reached"] = 1
+                matrix_lr_audit["step200_nominal_lr_min"] = nominal_lr_min
+                matrix_lr_audit["step200_effective_lr_min"] = effective_lr_min
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1502,22 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    trace_steps_reached = ",".join(str(step_i) for step_i in cast(list[int], matrix_lr_audit["trace_steps_reached"]))
+    log0(
+        f"muon_matrix_lr_audit completed_updates:{step} "
+        f"last_applied_step:{matrix_lr_audit['last_applied_step']} "
+        f"floor:{args.muon_matrix_lr_floor:.8f} floor_active_steps:{int(matrix_lr_audit['floor_active_steps'])} "
+        f"first_floor_active_step:{matrix_lr_audit['first_floor_active_step']} "
+        f"step200_reached:{int(matrix_lr_audit['step200_reached'])} "
+        f"step200_nominal_lr_min:{float(matrix_lr_audit['step200_nominal_lr_min']) if matrix_lr_audit['step200_nominal_lr_min'] is not None else float('nan'):.8f} "
+        f"step200_effective_lr_min:{float(matrix_lr_audit['step200_effective_lr_min']) if matrix_lr_audit['step200_effective_lr_min'] is not None else float('nan'):.8f} "
+        f"last_global_lr_mul:{float(matrix_lr_audit['last_global_lr_mul']) if matrix_lr_audit['last_global_lr_mul'] is not None else float('nan'):.8f} "
+        f"min_nominal_lr:{float(matrix_lr_audit['min_nominal_lr']) if matrix_lr_audit['min_nominal_lr'] is not None else float('nan'):.8f} "
+        f"max_nominal_lr:{float(matrix_lr_audit['max_nominal_lr']):.8f} "
+        f"min_effective_lr:{float(matrix_lr_audit['min_effective_lr']) if matrix_lr_audit['min_effective_lr'] is not None else float('nan'):.8f} "
+        f"max_effective_lr:{float(matrix_lr_audit['max_effective_lr']):.8f} "
+        f"trace_steps_reached:{trace_steps_reached}"
     )
 
     # -----------------------------
