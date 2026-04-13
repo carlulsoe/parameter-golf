@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -857,14 +856,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-def param_group_l2_norm(params: list[Tensor]) -> float:
-    total_sq = 0.0
-    with torch.no_grad():
-        for param in params:
-            total_sq += float(param.detach().float().pow(2).sum().item())
-    return math.sqrt(total_sq)
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1180,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.scalar_weight_decay < 0:
-        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1232,9 +1221,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_tensor_count = len(scalar_params)
-    scalar_numel_count = sum(int(p.numel()) for p in scalar_params)
-    scalar_l2_norm_before = param_group_l2_norm(scalar_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1250,15 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.AdamW(
-        [
-            {
-                "params": scalar_params,
-                "lr": args.scalar_lr,
-                "base_lr": args.scalar_lr,
-                "weight_decay": args.scalar_weight_decay,
-            }
-        ],
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1281,14 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} scalar_weight_decay:{args.scalar_weight_decay}"
-    )
-    log0(
-        "optimizer_scalar_group: "
-        f"tensors:{scalar_tensor_count} "
-        f"numel:{scalar_numel_count} "
-        f"weight_decay:{args.scalar_weight_decay:.8f} "
-        f"param_l2_norm_before:{scalar_l2_norm_before:.8f}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1355,7 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    scalar_cumulative_lr_weight_decay = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1416,8 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        scalar_group = optimizer_scalar.param_groups[0]
-        scalar_cumulative_lr_weight_decay += float(scalar_group["lr"]) * float(scalar_group["weight_decay"])
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1449,17 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    scalar_l2_norm_after = param_group_l2_norm(scalar_params)
-    log0(
-        "optimizer_scalar_decay_audit: "
-        f"tensors:{scalar_tensor_count} "
-        f"numel:{scalar_numel_count} "
-        f"weight_decay:{args.scalar_weight_decay:.8f} "
-        f"cumulative_lr_weight_decay:{scalar_cumulative_lr_weight_decay:.8f} "
-        f"param_l2_norm_before:{scalar_l2_norm_before:.8f} "
-        f"param_l2_norm_after:{scalar_l2_norm_after:.8f} "
-        f"completed_updates:{step}"
     )
 
     # -----------------------------
