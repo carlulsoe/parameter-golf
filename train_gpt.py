@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.token_lr_mult <= 0.0:
+        raise ValueError(f"TOKEN_LR_MULT must be strictly positive, got {args.token_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1221,7 +1224,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    configured_token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr = configured_token_lr * args.token_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1261,6 +1265,11 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"optimizer_tok_scope_audit: tie_embeddings:{args.tie_embeddings} "
+        f"configured_token_lr:{configured_token_lr:.8f} token_lr_mult:{args.token_lr_mult:.8f} "
+        f"effective_token_lr:{token_lr:.8f} param_count:1 params:tok_emb.weight"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
