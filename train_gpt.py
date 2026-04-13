@@ -83,9 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    matrix_lr_warmdown_start_step = int(os.environ.get("MATRIX_LR_WARMDOWN_START_STEP", 0))
-    matrix_lr_warmdown_steps = int(os.environ.get("MATRIX_LR_WARMDOWN_STEPS", 0))
-    matrix_lr_warmdown_target = float(os.environ.get("MATRIX_LR_WARMDOWN_TARGET", 1.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1296,32 +1293,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    def matrix_lr_mul(step: int) -> float:
-        if args.matrix_lr_warmdown_steps <= 0:
-            return 1.0
-        if step < args.matrix_lr_warmdown_start_step:
-            return 1.0
-        progress = min((step - args.matrix_lr_warmdown_start_step + 1) / args.matrix_lr_warmdown_steps, 1.0)
-        return 1.0 + (args.matrix_lr_warmdown_target - 1.0) * progress
-
-    if args.matrix_lr_warmdown_start_step < 0:
-        raise ValueError(
-            f"MATRIX_LR_WARMDOWN_START_STEP must be non-negative, got {args.matrix_lr_warmdown_start_step}"
-        )
-    if args.matrix_lr_warmdown_steps < 0:
-        raise ValueError(f"MATRIX_LR_WARMDOWN_STEPS must be non-negative, got {args.matrix_lr_warmdown_steps}")
-    if not (0.0 < args.matrix_lr_warmdown_target <= 1.0):
-        raise ValueError(
-            f"MATRIX_LR_WARMDOWN_TARGET must be in (0, 1], got {args.matrix_lr_warmdown_target}"
-        )
-    log0(
-        "matrix_lr_schedule: "
-        f"start_step:{args.matrix_lr_warmdown_start_step} "
-        f"warmdown_steps:{args.matrix_lr_warmdown_steps} "
-        f"target:{args.matrix_lr_warmdown_target:.5f} "
-        "scope:optimizer_muon"
-    )
-
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1396,7 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        matrix_scale = matrix_lr_mul(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1417,8 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        for group in optimizer_muon.param_groups:
-            group["lr"] *= matrix_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1433,11 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            matrix_lr = optimizer_muon.param_groups[0]["lr"] if optimizer_muon.param_groups else 0.0
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"matrix_lr_mult:{matrix_scale:.5f} matrix_lr:{matrix_lr:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1452,14 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "matrix_lr_audit: "
-        f"completed_updates:{step} "
-        f"warmdown_start_step:{args.matrix_lr_warmdown_start_step} "
-        f"warmdown_steps:{args.matrix_lr_warmdown_steps} "
-        f"target:{args.matrix_lr_warmdown_target:.5f} "
-        f"last_matrix_lr_mult:{matrix_lr_mul(max(step - 1, 0)):.5f}"
     )
 
     # -----------------------------
