@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_use_synthetic_data = bool(int(os.environ.get("WARMUP_USE_SYNTHETIC_DATA", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -817,13 +818,43 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.next_batch_calls = 0
+        self.real_tokens_served = 0
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
+        self.next_batch_calls += 1
+        self.real_tokens_served += per_rank_span
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+class SyntheticWarmupBatchSource:
+    # Generates deterministic, varying fake token streams with the same shapes/dtypes as the real loader.
+    def __init__(self, vocab_size: int, rank: int, world_size: int, device: torch.device):
+        self.vocab_size = vocab_size
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.next_batch_calls = 0
+        self.synthetic_tokens_served = 0
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        start = self.rank * per_rank_span
+        base = torch.arange(start, start + per_rank_span, dtype=torch.int64)
+        call_idx = self.next_batch_calls
+        stride = 1 + 2 * (call_idx % 13)
+        offset = (call_idx * 977 + self.rank * 131) % self.vocab_size
+        local = (base * stride + offset) % self.vocab_size
+        self.next_batch_calls += 1
+        self.synthetic_tokens_served += per_rank_span
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -1268,6 +1299,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"compile_warmup_source:{'synthetic' if args.warmup_use_synthetic_data else 'real_loader'}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1296,6 +1328,11 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        warmup_batch_source = (
+            SyntheticWarmupBatchSource(args.vocab_size, rank, world_size, device)
+            if args.warmup_use_synthetic_data
+            else train_loader
+        )
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1304,7 +1341,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = warmup_batch_source.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1313,6 +1350,14 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        log0(
+            f"compile_warmup_audit source:{'synthetic' if args.warmup_use_synthetic_data else 'real_loader'} "
+            f"warmup_steps:{args.warmup_steps} grad_accum_steps:{grad_accum_steps} "
+            f"warmup_batches:{warmup_batch_source.next_batch_calls} "
+            f"real_loader_batches:{train_loader.next_batch_calls} real_loader_local_tokens:{train_loader.real_tokens_served} "
+            f"synthetic_batches:{getattr(warmup_batch_source, 'next_batch_calls', 0) if args.warmup_use_synthetic_data else 0} "
+            f"synthetic_local_tokens:{getattr(warmup_batch_source, 'synthetic_tokens_served', 0) if args.warmup_use_synthetic_data else 0}"
+        )
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1415,6 +1460,10 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    log0(
+        f"train_loader_audit measured_batches:{train_loader.next_batch_calls} "
+        f"measured_local_tokens:{train_loader.real_tokens_served}"
+    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
