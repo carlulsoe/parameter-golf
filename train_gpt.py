@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.scalar_weight_decay < 0.0:
+        raise ValueError(f"SCALAR_WEIGHT_DECAY must be non-negative, got {args.scalar_weight_decay}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1221,6 +1224,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_param_numel = sum(p.numel() for p in scalar_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,10 +1240,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    scalar_optimizer_cls = torch.optim.AdamW if args.scalar_weight_decay > 0 else torch.optim.Adam
+    optimizer_scalar = scalar_optimizer_cls(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.scalar_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1260,7 +1266,14 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"scalar_weight_decay:{args.scalar_weight_decay}"
+    )
+    log0(
+        f"optimizer_scalar_group: optimizer:{scalar_optimizer_cls.__name__} "
+        f"tensors:{len(scalar_params)} numel:{scalar_param_numel} "
+        f"decoupled_weight_decay:{args.scalar_weight_decay > 0} "
+        f"weight_decay:{args.scalar_weight_decay:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
