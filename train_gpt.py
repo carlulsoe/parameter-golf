@@ -83,6 +83,10 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    matrix_grad_audit_clip_norm = float(os.environ.get("MATRIX_GRAD_AUDIT_CLIP_NORM", 0.0))
+    matrix_grad_audit_steps = tuple(
+        int(step.strip()) for step in os.environ.get("MATRIX_GRAD_AUDIT_STEPS", "").split(",") if step.strip()
+    )
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -438,6 +442,19 @@ def quantize_float_tensor(
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+
+def matrix_grad_global_norm(params: list[Tensor]) -> Tensor:
+    total = None
+    for p in params:
+        if p.grad is None:
+            continue
+        if total is None:
+            total = torch.zeros((), device=p.grad.device, dtype=torch.float32)
+        total.add_(p.grad.detach().float().square().sum())
+    if total is None:
+        return torch.tensor(0.0, dtype=torch.float32)
+    return total.sqrt()
 
 def restore_passthrough_tensor(name: str, stored: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     out_t = stored.detach().to("cpu").contiguous()
@@ -1101,6 +1118,14 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if args.matrix_grad_audit_clip_norm < 0.0:
+        raise ValueError(
+            f"MATRIX_GRAD_AUDIT_CLIP_NORM must be non-negative, got {args.matrix_grad_audit_clip_norm}"
+        )
+    if any(step <= 0 for step in args.matrix_grad_audit_steps):
+        raise ValueError(f"MATRIX_GRAD_AUDIT_STEPS must contain positive integers, got {args.matrix_grad_audit_steps}")
+    if args.matrix_grad_audit_clip_norm > 0.0 and not args.matrix_grad_audit_steps:
+        raise ValueError("MATRIX_GRAD_AUDIT_STEPS must be non-empty when MATRIX_GRAD_AUDIT_CLIP_NORM > 0")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
@@ -1253,6 +1278,13 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    matrix_grad_audit_steps = tuple(sorted(set(args.matrix_grad_audit_steps)))
+    matrix_grad_audit_enabled = args.matrix_grad_audit_clip_norm > 0.0
+    matrix_param_numel = sum(p.numel() for p in matrix_params)
+    matrix_grad_audit_reached_steps: list[int] = []
+    matrix_grad_audit_hit_count = 0
+    matrix_grad_audit_max_norm = 0.0
+    matrix_grad_audit_last_norm = 0.0
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1268,6 +1300,17 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if matrix_grad_audit_enabled:
+        log0(
+            "matrix_grad_audit: "
+            "enabled:True "
+            "scope:optimizer_muon_matrix_params_pre_clip_global_norm "
+            "step_semantics:applied_step_one_based "
+            f"clip_norm:{args.matrix_grad_audit_clip_norm:.8f} "
+            f"steps:{','.join(str(step) for step in matrix_grad_audit_steps)} "
+            f"matrix_tensors:{len(matrix_params)} "
+            f"matrix_numel:{matrix_param_numel}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1388,6 +1431,21 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        applied_step = step + 1
+        if matrix_grad_audit_enabled and applied_step in matrix_grad_audit_steps:
+            total_norm = float(matrix_grad_global_norm(matrix_params).item())
+            matrix_grad_audit_reached_steps.append(applied_step)
+            matrix_grad_audit_last_norm = total_norm
+            matrix_grad_audit_max_norm = max(matrix_grad_audit_max_norm, total_norm)
+            would_clip = total_norm > args.matrix_grad_audit_clip_norm
+            matrix_grad_audit_hit_count += int(would_clip)
+            log0(
+                "matrix_grad_audit_trace: "
+                f"applied_step:{applied_step} "
+                f"total_norm:{total_norm:.8f} "
+                f"clip_norm:{args.matrix_grad_audit_clip_norm:.8f} "
+                f"would_clip:{would_clip}"
+            )
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1419,6 +1477,17 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if matrix_grad_audit_enabled:
+        log0(
+            "matrix_grad_audit_summary: "
+            f"configured_steps:{','.join(str(step) for step in matrix_grad_audit_steps)} "
+            f"reached_steps:{','.join(str(step) for step in matrix_grad_audit_reached_steps) or 'none'} "
+            f"sampled_steps:{len(matrix_grad_audit_reached_steps)} "
+            f"clip_hits:{matrix_grad_audit_hit_count} "
+            f"clip_hit_frac:{matrix_grad_audit_hit_count / max(len(matrix_grad_audit_reached_steps), 1):.8f} "
+            f"max_total_norm:{matrix_grad_audit_max_norm:.8f} "
+            f"last_total_norm:{matrix_grad_audit_last_norm:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
