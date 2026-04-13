@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -538,6 +539,30 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in results),
         "candidate_summary": candidate_summary,
     }
+
+def format_optimizer_group_eps(optimizer: torch.optim.Optimizer | None) -> str:
+    if optimizer is None:
+        return "inactive"
+    entries: list[str] = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        eps = group.get("eps")
+        entries.append(f"group{group_idx}:{'none' if eps is None else f'{float(eps):.8f}'}")
+    return " ".join(entries) if entries else "inactive"
+
+def param_group_names_from_optimizer(
+    optimizer: torch.optim.Optimizer,
+    param_to_name: dict[int, str],
+) -> list[str]:
+    names: list[str] = []
+    seen: set[int] = set()
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            names.append(param_to_name.get(param_id, f"<unknown:{param_id}>"))
+    return names
 
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
@@ -1202,6 +1227,12 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if args.token_adam_eps <= 0.0:
+        raise ValueError(f"TOKEN_ADAM_EPS must be positive, got {args.token_adam_eps}")
+    if args.token_adam_eps != args.adam_eps and not args.tie_embeddings:
+        raise ValueError("TOKEN_ADAM_EPS override requires TIE_EMBEDDINGS=1 so optimizer_tok stays scoped to the shared embedding/output matrix")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1225,7 +1256,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.token_adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1251,8 +1282,12 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    else:
+        optimizer_head = None
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    param_to_name = {id(param): name for name, param in base_model.named_parameters()}
+    optimizer_tok_param_names = param_group_names_from_optimizer(optimizer_tok, param_to_name)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1267,6 +1302,20 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        "optimizer_eps_audit: "
+        f"optimizer_tok:{format_optimizer_group_eps(optimizer_tok)} "
+        f"optimizer_scalar:{format_optimizer_group_eps(optimizer_scalar)} "
+        f"optimizer_head:{format_optimizer_group_eps(optimizer_head)} "
+        f"optimizer_muon:{format_optimizer_group_eps(optimizer_muon)}"
+    )
+    log0(
+        "optimizer_tok_scope_audit: "
+        f"tie_embeddings:{args.tie_embeddings} "
+        f"scope:{'tied_only' if args.tie_embeddings else 'untied'} "
+        f"param_count:{len(optimizer_tok_param_names)} "
+        f"params:{','.join(optimizer_tok_param_names) if optimizer_tok_param_names else 'none'}"
     )
     log0(f"seed:{args.seed}")
 
