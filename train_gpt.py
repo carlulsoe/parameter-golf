@@ -79,6 +79,9 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    embed_lr_warmdown_start_step = int(os.environ.get("EMBED_LR_WARMDOWN_START_STEP", -1))
+    embed_lr_warmdown_steps = int(os.environ.get("EMBED_LR_WARMDOWN_STEPS", 0))
+    embed_lr_warmdown_target = float(os.environ.get("EMBED_LR_WARMDOWN_TARGET", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,6 +1093,16 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.embed_lr_warmdown_start_step < -1:
+        raise ValueError(
+            f"EMBED_LR_WARMDOWN_START_STEP must be >= -1, got {args.embed_lr_warmdown_start_step}"
+        )
+    if args.embed_lr_warmdown_steps < 0:
+        raise ValueError(f"EMBED_LR_WARMDOWN_STEPS must be >= 0, got {args.embed_lr_warmdown_steps}")
+    if not (0.0 < args.embed_lr_warmdown_target <= 1.0):
+        raise ValueError(
+            f"EMBED_LR_WARMDOWN_TARGET must be in (0, 1], got {args.embed_lr_warmdown_target}"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1263,6 +1276,10 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"embed_lr_schedule start_step:{args.embed_lr_warmdown_start_step} "
+        f"warmdown_steps:{args.embed_lr_warmdown_steps} target:{args.embed_lr_warmdown_target:.5f}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1292,6 +1309,15 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def embed_lr_mult(applied_step: int) -> float:
+        if args.embed_lr_warmdown_steps <= 0 or args.embed_lr_warmdown_target >= 1.0:
+            return 1.0
+        start_step = args.embed_lr_warmdown_start_step
+        if start_step < 0 or applied_step < start_step:
+            return 1.0
+        progress = min((applied_step - start_step + 1) / max(args.embed_lr_warmdown_steps, 1), 1.0)
+        return 1.0 + (args.embed_lr_warmdown_target - 1.0) * progress
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1387,6 +1413,9 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        current_embed_lr_mult = embed_lr_mult(step)
+        for group in optimizer_tok.param_groups:
+            group["lr"] *= current_embed_lr_mult
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1403,7 +1432,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"embed_lr_mult:{current_embed_lr_mult:.5f} embed_lr:{optimizer_tok.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1448,11 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    last_applied_step = step - 1 if step > 0 else -1
+    log0(
+        f"embed_lr_audit completed_updates:{step} last_applied_step:{last_applied_step} "
+        f"last_embed_lr_mult:{embed_lr_mult(last_applied_step):.5f}"
     )
 
     # -----------------------------
