@@ -54,7 +54,6 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    wallclock_warmdown_iters = int(os.environ.get("WALLCLOCK_WARMDOWN_ITERS", 0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1172,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.wallclock_warmdown_iters < 0:
-        raise ValueError(
-            f"WALLCLOCK_WARMDOWN_ITERS must be non-negative, got {args.wallclock_warmdown_iters}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1286,19 +1281,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    wallclock_warmdown_iters = (
-        args.wallclock_warmdown_iters if args.wallclock_warmdown_iters > 0 else args.warmdown_iters
-    )
-    lr_scale_trace_steps = {0, 1, 9, 199}
-    lr_scale_trace_reached: list[int] = []
-
-    log0(
-        f"shared_lr_schedule warmdown_iters:{args.warmdown_iters} "
-        f"wallclock_warmdown_iters:{wallclock_warmdown_iters} "
-        f"wallclock_override_active:{max_wallclock_ms is not None} "
-        f"step0_scale:1.00000 step1_semantics:full_lr_before_first_update "
-        f"step2_semantics:wallclock_branch_can_decay"
-    )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1307,7 +1289,7 @@ def main() -> None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = wallclock_warmdown_iters * step_ms
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
@@ -1385,8 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if step in lr_scale_trace_steps:
-            lr_scale_trace_reached.append(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1421,11 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            remaining_ms = max(max_wallclock_ms - approx_training_time_ms, 0.0) if max_wallclock_ms is not None else -1.0
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"shared_lr_scale:{scale:.5f} remaining_ms:{remaining_ms:.0f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1437,12 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        f"shared_lr_audit warmdown_iters:{args.warmdown_iters} "
-        f"wallclock_warmdown_iters:{wallclock_warmdown_iters} "
-        f"wallclock_cap_ms:{max_wallclock_ms if max_wallclock_ms is not None else -1.0:.0f} "
-        f"completed_updates:{step} traced_applied_steps:{','.join(str(s) for s in lr_scale_trace_reached) if lr_scale_trace_reached else 'none'}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
