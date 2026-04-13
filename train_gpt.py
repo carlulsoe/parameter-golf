@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import glob
-import hashlib
 import inspect
 import io
 import math
@@ -56,13 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_order_audit = bool(int(os.environ.get("TRAIN_ORDER_AUDIT", "0")))
-    train_order_audit_measured_steps = int(os.environ.get("TRAIN_ORDER_AUDIT_MEASURED_STEPS", 356))
-    train_order_audit_warmup_steps = int(
-        os.environ.get("TRAIN_ORDER_AUDIT_WARMUP_STEPS", os.environ.get("WARMUP_STEPS", "20"))
-    )
-    train_order_audit_log_topk = int(os.environ.get("TRAIN_ORDER_AUDIT_LOG_TOPK", 4))
-    train_order_audit_seeds = os.environ.get("TRAIN_ORDER_AUDIT_SEEDS", "2027,31415,424242,8675309")
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -786,173 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_data_shard_num_tokens(file: Path) -> int:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    return num_tokens
-
-
-def parse_csv_int_list(raw_value: str, env_name: str) -> list[int]:
-    values = [chunk.strip() for chunk in raw_value.split(",") if chunk.strip()]
-    if not values:
-        raise ValueError(f"{env_name} must contain at least one integer, got {raw_value!r}")
-    parsed: list[int] = []
-    for chunk in values:
-        try:
-            parsed.append(int(chunk))
-        except ValueError as exc:
-            raise ValueError(f"{env_name} must contain comma-separated integers, got {raw_value!r}") from exc
-    return parsed
-
-
-def shard_order_digest(files: list[Path]) -> str:
-    joined = "\n".join(file.name for file in files).encode("utf-8")
-    return hashlib.sha256(joined).hexdigest()[:16]
-
-
-def build_stream_ranges(
-    ordered_files: list[Path], shard_num_tokens: dict[Path, int], start_token: int, budget_tokens: int
-) -> list[tuple[Path, int, int]]:
-    if budget_tokens <= 0:
-        return []
-    cycle_tokens = sum(shard_num_tokens[file] for file in ordered_files)
-    if cycle_tokens <= 0:
-        raise ValueError("Training shard token budget must be positive")
-
-    order_idx = 0
-    pos = start_token % cycle_tokens
-    while pos >= shard_num_tokens[ordered_files[order_idx]]:
-        pos -= shard_num_tokens[ordered_files[order_idx]]
-        order_idx += 1
-
-    ranges: list[tuple[Path, int, int]] = []
-    remaining = budget_tokens
-    while remaining > 0:
-        file = ordered_files[order_idx]
-        num_tokens = shard_num_tokens[file]
-        take = min(remaining, num_tokens - pos)
-        ranges.append((file, pos, pos + take))
-        remaining -= take
-        order_idx = (order_idx + 1) % len(ordered_files)
-        pos = 0
-    return ranges
-
-
-def interval_overlap(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
-    a = sorted(a)
-    b = sorted(b)
-    i = 0
-    j = 0
-    overlap = 0
-    while i < len(a) and j < len(b):
-        a_start, a_end = a[i]
-        b_start, b_end = b[j]
-        overlap += max(0, min(a_end, b_end) - max(a_start, b_start))
-        if a_end <= b_end:
-            i += 1
-        else:
-            j += 1
-    return overlap
-
-
-def exposure_overlap_tokens(
-    first: list[tuple[Path, int, int]], second: list[tuple[Path, int, int]]
-) -> int:
-    first_by_file: dict[Path, list[tuple[int, int]]] = {}
-    second_by_file: dict[Path, list[tuple[int, int]]] = {}
-    for file, start, end in first:
-        first_by_file.setdefault(file, []).append((start, end))
-    for file, start, end in second:
-        second_by_file.setdefault(file, []).append((start, end))
-    overlap = 0
-    for file in first_by_file.keys() & second_by_file.keys():
-        overlap += interval_overlap(first_by_file[file], second_by_file[file])
-    return overlap
-
-
-def audit_train_order_exposure(
-    args: Hyperparameters, log0, train_files: list[Path], world_size: int, grad_accum_steps: int
-) -> None:
-    if not args.train_order_audit:
-        return
-    if args.train_order_audit_measured_steps < 0:
-        raise ValueError(
-            f"TRAIN_ORDER_AUDIT_MEASURED_STEPS must be non-negative, got {args.train_order_audit_measured_steps}"
-        )
-    if args.train_order_audit_warmup_steps < 0:
-        raise ValueError(
-            f"TRAIN_ORDER_AUDIT_WARMUP_STEPS must be non-negative, got {args.train_order_audit_warmup_steps}"
-        )
-    if args.train_order_audit_log_topk <= 0:
-        raise ValueError(f"TRAIN_ORDER_AUDIT_LOG_TOPK must be positive, got {args.train_order_audit_log_topk}")
-
-    audit_seeds = parse_csv_int_list(args.train_order_audit_seeds, "TRAIN_ORDER_AUDIT_SEEDS")
-    shard_num_tokens = {file: load_data_shard_num_tokens(file) for file in train_files}
-    sorted_files = list(train_files)
-    local_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-    per_loader_call_tokens = (local_tokens + 1) * world_size
-    warmup_tokens = args.train_order_audit_warmup_steps * grad_accum_steps * per_loader_call_tokens
-    measured_tokens = args.train_order_audit_measured_steps * grad_accum_steps * per_loader_call_tokens
-    sorted_warmup = build_stream_ranges(sorted_files, shard_num_tokens, 0, warmup_tokens)
-    sorted_measured_reset = build_stream_ranges(sorted_files, shard_num_tokens, 0, measured_tokens)
-    sorted_measured_resume = build_stream_ranges(sorted_files, shard_num_tokens, warmup_tokens, measured_tokens)
-    replay_overlap_reset = exposure_overlap_tokens(sorted_warmup, sorted_measured_reset)
-    replay_overlap_resume = exposure_overlap_tokens(sorted_warmup, sorted_measured_resume)
-    resume_novelty_vs_reset = measured_tokens - exposure_overlap_tokens(sorted_measured_reset, sorted_measured_resume)
-    total_train_tokens = sum(shard_num_tokens.values())
-    sorted_prefix = ",".join(file.name for file in sorted_files[: min(3, len(sorted_files))])
-
-    log0(
-        "train_order_audit: "
-        f"enabled:1 seeds:{len(audit_seeds)} world_size:{world_size} grad_accum_steps:{grad_accum_steps} "
-        f"per_loader_call_tokens:{per_loader_call_tokens} step_stream_tokens:{grad_accum_steps * per_loader_call_tokens} "
-        f"warmup_steps:{args.train_order_audit_warmup_steps} measured_steps:{args.train_order_audit_measured_steps} "
-        f"warmup_stream_tokens:{warmup_tokens} measured_stream_tokens:{measured_tokens} total_train_tokens:{total_train_tokens}"
-    )
-    log0(
-        "train_order_audit_sorted: "
-        f"digest:{shard_order_digest(sorted_files)} prefix:{sorted_prefix} "
-        f"warmup_measured_overlap_reset:{replay_overlap_reset} warmup_measured_overlap_resume:{replay_overlap_resume} "
-        f"resume_novelty_vs_reset:{resume_novelty_vs_reset}"
-    )
-
-    seed_summaries: list[dict[str, object]] = []
-    for seed in audit_seeds:
-        shuffled_files = list(sorted_files)
-        random.Random(seed).shuffle(shuffled_files)
-        measured_reset = build_stream_ranges(shuffled_files, shard_num_tokens, 0, measured_tokens)
-        measured_resume = build_stream_ranges(shuffled_files, shard_num_tokens, warmup_tokens, measured_tokens)
-        overlap_vs_sorted_reset = exposure_overlap_tokens(sorted_measured_reset, measured_reset)
-        overlap_vs_sorted_resume = exposure_overlap_tokens(sorted_measured_resume, measured_resume)
-        seed_summaries.append(
-            {
-                "seed": seed,
-                "digest": shard_order_digest(shuffled_files),
-                "prefix": ",".join(file.name for file in shuffled_files[: min(3, len(shuffled_files))]),
-                "overlap_vs_sorted_reset": overlap_vs_sorted_reset,
-                "overlap_vs_sorted_resume": overlap_vs_sorted_resume,
-                "novelty_vs_sorted_resume": measured_tokens - overlap_vs_sorted_resume,
-            }
-        )
-
-    seed_summaries.sort(key=lambda item: (-int(item["novelty_vs_sorted_resume"]), int(item["seed"])))
-    for summary in seed_summaries[: min(args.train_order_audit_log_topk, len(seed_summaries))]:
-        log0(
-            "train_order_audit_seed: "
-            f"seed:{summary['seed']} digest:{summary['digest']} prefix:{summary['prefix']} "
-            f"overlap_vs_sorted_reset:{summary['overlap_vs_sorted_reset']} "
-            f"overlap_vs_sorted_resume:{summary['overlap_vs_sorted_resume']} "
-            f"novelty_vs_sorted_resume:{summary['novelty_vs_sorted_resume']}"
-        )
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -1341,8 +1166,7 @@ def main() -> None:
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
     dataset_dir = Path(args.data_path).resolve()
-    train_files = [Path(p) for p in sorted(glob.glob(args.train_files))]
-    actual_train_files = len(train_files)
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     if args.train_seq_len <= 0:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
@@ -1354,7 +1178,6 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    audit_train_order_exposure(args, log0, train_files, world_size, grad_accum_steps)
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
