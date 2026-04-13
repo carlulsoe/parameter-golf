@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    control_lr_scale = float(os.environ.get("CONTROL_LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1091,8 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if args.control_lr_scale < 0.0:
-        raise ValueError(f"CONTROL_LR_SCALE must be non-negative, got {args.control_lr_scale}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1217,21 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
+    scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    control_named_params = [
-        (name, p)
-        for name, p in block_named_params
-        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        control_named_params.append(("skip_weights", base_model.skip_weights))
-    control_params = [p for _, p in control_named_params]
-    control_param_names = [name for name, _ in control_named_params]
-    scalar_control_lr = args.scalar_lr * args.control_lr_scale
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1247,22 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar_groups = []
-    if scalar_named_params:
-        optimizer_scalar_groups.append(
-            {"params": scalar_named_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "scalar"}
-        )
-    if control_params:
-        optimizer_scalar_groups.append(
-            {
-                "params": control_params,
-                "lr": scalar_control_lr,
-                "base_lr": scalar_control_lr,
-                "group_name": "control",
-            }
-        )
     optimizer_scalar = torch.optim.Adam(
-        optimizer_scalar_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1287,13 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_scalar_groups: scalar_tensors:{len(scalar_named_params)} "
-        f"scalar_numel:{sum(int(p.numel()) for p in scalar_named_params)} "
-        f"control_tensors:{len(control_params)} control_numel:{sum(int(p.numel()) for p in control_params)} "
-        f"control_lr_scale:{args.control_lr_scale:.5f} control_lr:{scalar_control_lr:.8f}"
-    )
-    log0(f"optimizer_control_names:{','.join(control_param_names) if control_param_names else 'none'}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1447,12 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        f"optimizer_scalar_final: completed_updates:{step} "
-        f"scalar_lr:{next((group['lr'] for group in optimizer_scalar.param_groups if group.get('group_name') == 'scalar'), 0.0):.8f} "
-        f"control_lr:{next((group['lr'] for group in optimizer_scalar.param_groups if group.get('group_name') == 'control'), 0.0):.8f} "
-        f"control_lr_scale:{args.control_lr_scale:.5f}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
