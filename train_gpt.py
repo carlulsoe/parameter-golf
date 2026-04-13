@@ -356,15 +356,6 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
 )
-INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT = bool(
-    int(os.environ.get("INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT", "0"))
-)
-INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_BPB_GAIN = float(
-    os.environ.get("INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_BPB_GAIN", 0.0001)
-)
-INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_LOSS_GAIN = float(
-    os.environ.get("INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_LOSS_GAIN", 0.0001)
-)
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
 for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
@@ -401,14 +392,7 @@ def keep_float_tensor_with_fp32_patterns(
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     return keep_float_tensor_with_fp32_patterns(name, t, passthrough_orig_dtypes, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)
 
-def keep_float_tensor_for_export(
-    name: str,
-    t: Tensor,
-    passthrough_orig_dtypes: dict[str, str],
-    extra_fp32_names: tuple[str, ...] = (),
-) -> Tensor:
-    if name in extra_fp32_names:
-        return t.float().contiguous()
+def keep_float_tensor_for_export(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     return keep_float_tensor_with_fp32_patterns(
         name,
         t,
@@ -624,10 +608,7 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
     )
     return best
 
-def quantize_state_dict_int8(
-    state_dict: dict[str, Tensor],
-    extra_keep_float_fp32_names: tuple[str, ...] = (),
-):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -713,15 +694,10 @@ def quantize_state_dict_int8(
         keep_auto = name == selected_auto_keep_name
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
             baseline_kept_bytes = tensor_nbytes(keep_float_tensor(name, t, {}))
-            kept = keep_float_tensor_for_export(
-                name,
-                t,
-                passthrough_orig_dtypes,
-                extra_fp32_names=extra_keep_float_fp32_names,
-            )
+            kept = keep_float_tensor_for_export(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS) or name in extra_keep_float_fp32_names:
+            if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS):
                 stats["extra_fp32_keep_tensor_count"] += 1
                 stats["extra_fp32_keep_extra_bytes"] += tensor_nbytes(kept) - baseline_kept_bytes
             if keep_large:
@@ -1458,8 +1434,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    final_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-    quant_obj, quant_stats = quantize_state_dict_int8(final_state_dict)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1576,74 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
-    if INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT:
-        audit_selected_name = str(quant_stats["auto_keep_selected_name"])
-        if not audit_selected_name:
-            log0("Int8 selected-auto-keep fp32 audit: skipped reason:no_selected_auto_keep_tensor")
-        else:
-            audit_quant_obj, audit_quant_stats = quantize_state_dict_int8(
-                final_state_dict,
-                extra_keep_float_fp32_names=(audit_selected_name,),
-            )
-            audit_quant_buf = io.BytesIO()
-            torch.save(audit_quant_obj, audit_quant_buf)
-            audit_quant_raw = audit_quant_buf.getvalue()
-            audit_quant_blob = zlib.compress(audit_quant_raw, level=9)
-            audit_quant_bytes = len(audit_quant_blob)
-            audit_total_submission_bytes = audit_quant_bytes + len(code.encode("utf-8"))
-            audit_size_headroom = SUBMISSION_SIZE_CAP_BYTES - audit_total_submission_bytes
-            base_model.load_state_dict(dequantize_state_dict_int8(audit_quant_obj), strict=True)
-            torch.cuda.synchronize()
-            t_audit_eval = time.perf_counter()
-            audit_val_loss, audit_val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            torch.cuda.synchronize()
-            audit_val_bpb_gain = q_val_bpb - audit_val_bpb
-            audit_val_loss_gain = q_val_loss - audit_val_loss
-            followup_selected = (
-                audit_size_headroom >= 0
-                and audit_val_bpb_gain >= INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_BPB_GAIN
-                and audit_val_loss_gain >= INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_LOSS_GAIN
-            )
-            log0(
-                "Int8 selected-auto-keep fp32 audit: "
-                f"selected:{audit_selected_name} "
-                f"extra_fp32_tensors:{audit_quant_stats['extra_fp32_keep_tensor_count']} "
-                f"extra_fp32_extra_bytes:{audit_quant_stats['extra_fp32_keep_extra_bytes']} "
-                f"submission_bytes:{audit_total_submission_bytes} "
-                f"size_headroom:{audit_size_headroom}"
-            )
-            log0(
-                "Int8 selected-auto-keep fp32 audit thresholds: "
-                f"min_val_bpb_gain:{INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_BPB_GAIN:.8f} "
-                f"min_val_loss_gain:{INT8_AUTO_KEEP_FLOAT_SELECTED_FP32_AUDIT_MIN_VAL_LOSS_GAIN:.8f}"
-            )
-            log0(
-                f"final_int8_zlib_roundtrip_selected_fp32_audit val_loss:{audit_val_loss:.4f} "
-                f"val_bpb:{audit_val_bpb:.4f} "
-                f"eval_time:{1000.0 * (time.perf_counter() - t_audit_eval):.0f}ms"
-            )
-            log0(
-                "final_int8_zlib_roundtrip_selected_fp32_audit_exact "
-                f"val_loss:{audit_val_loss:.8f} val_bpb:{audit_val_bpb:.8f}"
-            )
-            log0(
-                "Int8 selected-auto-keep fp32 audit delta: "
-                f"val_loss_gain:{audit_val_loss_gain:.8f} "
-                f"val_bpb_gain:{audit_val_bpb_gain:.8f} "
-                f"followup:{'yes' if followup_selected else 'no'}"
-            )
 
     if distributed:
         dist.destroy_process_group()
