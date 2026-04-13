@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_grad_clip_norm = float(os.environ.get("SCALAR_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,12 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.scalar_grad_clip_norm < 0:
+        raise ValueError(f"SCALAR_GRAD_CLIP_NORM must be non-negative, got {args.scalar_grad_clip_norm}")
+    if args.grad_clip_norm > 0 and args.scalar_grad_clip_norm > 0:
+        raise ValueError("GRAD_CLIP_NORM and SCALAR_GRAD_CLIP_NORM are mutually exclusive")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1253,6 +1260,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    scalar_param_count = len(scalar_params)
+    scalar_param_numel = sum(p.numel() for p in scalar_params)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1267,6 +1276,14 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"optimizer_clipping: grad_clip_norm:{args.grad_clip_norm} "
+        f"scalar_grad_clip_norm:{args.scalar_grad_clip_norm}"
+    )
+    log0(
+        f"optimizer_scalar_group: tensors:{scalar_param_count} numel:{scalar_param_numel} "
+        f"log_norm_steps:existing_train_logs_only"
     )
     log0(f"seed:{args.seed}")
 
@@ -1388,8 +1405,19 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        log_step = step + 1
+        should_log_scalar_grad_norm = (
+            args.scalar_grad_clip_norm > 0
+            and args.train_log_every > 0
+            and (log_step <= 10 or log_step % args.train_log_every == 0)
+        )
+        scalar_grad_norm_value: float | None = None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        elif args.scalar_grad_clip_norm > 0:
+            scalar_grad_norm = torch.nn.utils.clip_grad_norm_(scalar_params, args.scalar_grad_clip_norm)
+            if should_log_scalar_grad_norm:
+                scalar_grad_norm_value = float(scalar_grad_norm.detach().float().item())
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1401,9 +1429,15 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            scalar_grad_norm_msg = (
+                f" scalar_grad_norm:{scalar_grad_norm_value:.4f}"
+                if scalar_grad_norm_value is not None
+                else ""
+            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{scalar_grad_norm_msg}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1453,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.scalar_grad_clip_norm > 0:
+        log0(
+            f"scalar_grad_clip_audit: tensors:{scalar_param_count} numel:{scalar_param_numel} "
+            f"clip_norm:{args.scalar_grad_clip_norm} norm_logging:existing_train_logs_only"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
