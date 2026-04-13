@@ -1253,6 +1253,14 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    scalar_param_count = sum(p.numel() for p in scalar_params)
+    scalar_trace_steps = {0, 1, 9, 199}
+    scalar_trace_steps_reached: list[str] = []
+    scalar_lr_min_seen = float("inf")
+    scalar_lr_max_seen = 0.0
+    scalar_last_applied_step = -1
+    scalar_last_live_lr_min = 0.0
+    scalar_last_live_lr_max = 0.0
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1267,6 +1275,15 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        "scalar_lr_audit_setup: "
+        "step_semantics:applied_step_zero_based "
+        f"groups:{len(optimizer_scalar.param_groups)} "
+        f"tensors:{len(scalar_params)} "
+        f"params:{scalar_param_count} "
+        f"base_lr_min:{min(group['base_lr'] for group in optimizer_scalar.param_groups):.8f} "
+        f"base_lr_max:{max(group['base_lr'] for group in optimizer_scalar.param_groups):.8f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1387,6 +1404,21 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        scalar_live_lrs = [group["lr"] for group in optimizer_scalar.param_groups]
+        scalar_last_applied_step = step
+        scalar_last_live_lr_min = min(scalar_live_lrs)
+        scalar_last_live_lr_max = max(scalar_live_lrs)
+        scalar_lr_min_seen = min(scalar_lr_min_seen, scalar_last_live_lr_min)
+        scalar_lr_max_seen = max(scalar_lr_max_seen, scalar_last_live_lr_max)
+        if step in scalar_trace_steps:
+            scalar_trace_steps_reached.append(str(step))
+            log0(
+                "scalar_lr_trace: "
+                f"applied_step:{step} "
+                f"scale:{scale:.8f} "
+                f"live_lr_min:{scalar_last_live_lr_min:.8f} "
+                f"live_lr_max:{scalar_last_live_lr_max:.8f}"
+            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1414,6 +1446,20 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if scalar_last_applied_step >= 0:
+        log0(
+            "scalar_lr_audit: "
+            f"configured_scalar_lr:{args.scalar_lr:.8f} "
+            f"completed_updates:{step} "
+            f"measured_stop_step:{step} "
+            f"last_applied_step:{scalar_last_applied_step} "
+            f"min_live_lr:{scalar_lr_min_seen:.8f} "
+            f"max_live_lr:{scalar_lr_max_seen:.8f} "
+            f"last_live_lr_min:{scalar_last_live_lr_min:.8f} "
+            f"last_live_lr_max:{scalar_last_live_lr_max:.8f} "
+            f"trace_steps_reached:{','.join(scalar_trace_steps_reached)}"
+        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
