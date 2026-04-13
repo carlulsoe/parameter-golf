@@ -856,6 +856,67 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def scalar_param_audit(
+    scalar_named_params: list[tuple[str, Tensor]],
+) -> tuple[int, int, int, int, int, int, int, int, str]:
+    control_tensors = 0
+    control_numel = 0
+    skip_tensors = 0
+    skip_numel = 0
+    other_scalar_tensors = 0
+    other_scalar_numel = 0
+    control_family_counts: dict[str, int] = {}
+    family_aliases = {
+        "q_gain": "q_gain",
+        "attn_scale": "attn_scale",
+        "attn_scales": "attn_scale",
+        "mlp_scale": "mlp_scale",
+        "mlp_scales": "mlp_scale",
+        "resid_mix": "resid_mix",
+        "resid_mixes": "resid_mix",
+    }
+
+    for name, param in scalar_named_params:
+        if name == "skip_weights":
+            skip_tensors += 1
+            skip_numel += int(param.numel())
+            continue
+        matched_patterns = [pattern for pattern in CONTROL_TENSOR_NAME_PATTERNS if pattern in name]
+        if matched_patterns:
+            control_tensors += 1
+            control_numel += int(param.numel())
+            family = None
+            for pattern in matched_patterns:
+                family = family_aliases.get(pattern, pattern)
+                if family != "skip_weight":
+                    break
+            if family == "skip_weight":
+                family = "skip_weights"
+            if family is not None:
+                control_family_counts[family] = control_family_counts.get(family, 0) + 1
+        else:
+            other_scalar_tensors += 1
+            other_scalar_numel += int(param.numel())
+
+    total_tensors = len(scalar_named_params)
+    total_numel = sum(int(param.numel()) for _, param in scalar_named_params)
+    control_families = ",".join(
+        f"{family}:{count}"
+        for family, count in sorted(control_family_counts.items())
+    ) if control_family_counts else "none"
+    return (
+        total_tensors,
+        total_numel,
+        control_tensors,
+        control_numel,
+        skip_tensors,
+        skip_numel,
+        other_scalar_tensors,
+        other_scalar_numel,
+        control_families,
+    )
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1214,13 +1275,14 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [param for _, param in scalar_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1253,6 +1315,17 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    (
+        scalar_total_tensors,
+        scalar_total_numel,
+        scalar_control_tensors,
+        scalar_control_numel,
+        scalar_skip_tensors,
+        scalar_skip_numel,
+        scalar_other_tensors,
+        scalar_other_numel,
+        scalar_control_families,
+    ) = scalar_param_audit(scalar_named_params)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1261,6 +1334,14 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "optimizer_scalar_scope "
+        f"total_tensors:{scalar_total_tensors} total_numel:{scalar_total_numel} "
+        f"control_tensors:{scalar_control_tensors} control_numel:{scalar_control_numel} "
+        f"skip_tensors:{scalar_skip_tensors} skip_numel:{scalar_skip_numel} "
+        f"other_scalar_tensors:{scalar_other_tensors} other_scalar_numel:{scalar_other_numel} "
+        f"control_families:{scalar_control_families}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
