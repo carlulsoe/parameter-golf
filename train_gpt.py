@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -856,6 +857,25 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def summarize_named_params(
+    named_params: list[tuple[str, Tensor]],
+    control_name_patterns: tuple[str, ...],
+) -> dict[str, object]:
+    names = [name for name, _ in named_params]
+    return {
+        "names": names,
+        "tensor_count": len(named_params),
+        "numel": sum(int(param.numel()) for _, param in named_params),
+        "control_tensor_count": sum(
+            1 for name, _ in named_params if any(pattern in name for pattern in control_name_patterns)
+        ),
+        "other_low_dim_tensor_count": sum(
+            1 for name, param in named_params if param.ndim < 2 and not any(pattern in name for pattern in control_name_patterns)
+        ),
+        "skip_weight_tensor_count": sum(1 for name, _ in named_params if "skip_weight" in name),
+    }
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1202,6 +1222,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if not 0.0 <= args.scalar_beta2 < 1.0:
+        raise ValueError(f"SCALAR_BETA2 must satisfy 0 <= beta2 < 1, got {args.scalar_beta2}")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1219,8 +1241,14 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    scalar_named_params = [
+        (f"blocks.{name}", p)
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1238,7 +1266,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.scalar_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1253,6 +1281,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    scalar_scope = summarize_named_params(scalar_named_params, CONTROL_TENSOR_NAME_PATTERNS)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1260,7 +1289,21 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"beta2:{args.beta2} scalar_beta2:{args.scalar_beta2}"
+    )
+    log0(
+        "optimizer_scalar_scope_audit: "
+        f"param_groups:{len(optimizer_scalar.param_groups)} "
+        f"tensors:{scalar_scope['tensor_count']} "
+        f"numel:{scalar_scope['numel']} "
+        f"control_tensors:{scalar_scope['control_tensor_count']} "
+        f"other_low_dim_tensors:{scalar_scope['other_low_dim_tensor_count']} "
+        f"skip_weight_tensors:{scalar_scope['skip_weight_tensor_count']} "
+        f"base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
+        f"live_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"beta2:{optimizer_scalar.param_groups[0]['betas'][1]:.8f} "
+        f"params:{','.join(scalar_scope['names'])}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1418,6 +1461,18 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_scalar_final_audit: "
+        f"param_groups:{len(optimizer_scalar.param_groups)} "
+        f"tensors:{scalar_scope['tensor_count']} "
+        f"numel:{scalar_scope['numel']} "
+        f"control_tensors:{scalar_scope['control_tensor_count']} "
+        f"other_low_dim_tensors:{scalar_scope['other_low_dim_tensor_count']} "
+        f"skip_weight_tensors:{scalar_scope['skip_weight_tensor_count']} "
+        f"final_applied_step:{step} "
+        f"final_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"beta2:{optimizer_scalar.param_groups[0]['betas'][1]:.8f}"
     )
 
     # -----------------------------
