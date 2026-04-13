@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -787,26 +786,15 @@ class TokenStream:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
-        self.pass_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_raw_tokens_taken = 0
 
     def _advance_file(self) -> None:
-        if self.file_idx == len(self.files) - 1:
-            self.pass_idx += 1
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
-    def snapshot(self) -> str:
-        return (
-            f"pass_idx:{self.pass_idx} file_idx:{self.file_idx} file:{self.files[self.file_idx].name} "
-            f"pos:{self.pos} shard_tokens:{self.tokens.numel()} total_raw_tokens_taken:{self.total_raw_tokens_taken}"
-        )
-
-    def take_with_manifest(self, n: int) -> tuple[Tensor, list[str]]:
-        spans: list[str] = []
+    def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
         while remaining > 0:
@@ -815,18 +803,10 @@ class TokenStream:
                 self._advance_file()
                 continue
             k = min(remaining, avail)
-            start = self.pos
-            end = self.pos + k
-            spans.append(f"pass{self.pass_idx}:{self.files[self.file_idx].name}[{start}:{end}]")
-            chunks.append(self.tokens[start:end])
-            self.pos = end
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k
             remaining -= k
-        self.total_raw_tokens_taken += n
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks), spans
-
-    def take(self, n: int) -> Tensor:
-        chunk, _ = self.take_with_manifest(n)
-        return chunk
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
 class DistributedTokenLoader:
@@ -837,38 +817,11 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
-        self.last_batch_audit: dict[str, int | str] | None = None
-
-    def batch_geometry(self, global_tokens: int, grad_accum_steps: int) -> dict[str, int]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        realized_train_tokens = local_tokens * self.world_size
-        raw_tokens = (local_tokens + 1) * self.world_size
-        return {
-            "requested_global_tokens_per_step": global_tokens,
-            "grad_accum_steps": grad_accum_steps,
-            "realized_train_tokens_per_micro": realized_train_tokens,
-            "realized_train_tokens_per_step": realized_train_tokens * grad_accum_steps,
-            "raw_tokens_per_micro": raw_tokens,
-            "raw_tokens_per_step": raw_tokens * grad_accum_steps,
-            "shift_token_overhead_per_micro": self.world_size,
-            "shift_token_overhead_per_step": self.world_size * grad_accum_steps,
-        }
-
-    def snapshot(self) -> str:
-        return self.stream.snapshot()
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk, span_manifest = self.stream.take_with_manifest(per_rank_span * self.world_size)
-        self.last_batch_audit = {
-            "local_tokens_per_rank": local_tokens,
-            "per_rank_span": per_rank_span,
-            "realized_train_tokens": local_tokens * self.world_size,
-            "raw_tokens_consumed": per_rank_span * self.world_size,
-            "shift_token_overhead": self.world_size,
-            "span_manifest": ";".join(span_manifest),
-        }
+        chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
@@ -1313,7 +1266,6 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1344,24 +1296,6 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
-        warmup_geometry = train_loader.batch_geometry(args.train_batch_tokens, grad_accum_steps)
-        warmup_start_state = train_loader.snapshot()
-        warmup_raw_tokens_consumed = 0
-        warmup_train_tokens_consumed = 0
-        warmup_shift_token_overhead = 0
-        warmup_span_manifests: list[str] = []
-        log0(
-            "warmup_loader_geometry_exact: "
-            f"requested_global_tokens_per_step:{warmup_geometry['requested_global_tokens_per_step']} "
-            f"grad_accum_steps:{warmup_geometry['grad_accum_steps']} "
-            f"realized_train_tokens_per_micro:{warmup_geometry['realized_train_tokens_per_micro']} "
-            f"realized_train_tokens_per_step:{warmup_geometry['realized_train_tokens_per_step']} "
-            f"raw_tokens_per_micro:{warmup_geometry['raw_tokens_per_micro']} "
-            f"raw_tokens_per_step:{warmup_geometry['raw_tokens_per_step']} "
-            f"shift_token_overhead_per_micro:{warmup_geometry['shift_token_overhead_per_micro']} "
-            f"shift_token_overhead_per_step:{warmup_geometry['shift_token_overhead_per_step']}"
-        )
-        log0(f"warmup_loader_state_start:{warmup_start_state}")
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1371,15 +1305,6 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                if train_loader.last_batch_audit is None:
-                    raise RuntimeError("train_loader.next_batch() did not populate loader audit metadata")
-                batch_audit = train_loader.last_batch_audit
-                warmup_raw_tokens_consumed += int(batch_audit["raw_tokens_consumed"])
-                warmup_train_tokens_consumed += int(batch_audit["realized_train_tokens"])
-                warmup_shift_token_overhead += int(batch_audit["shift_token_overhead"])
-                warmup_span_manifests.append(
-                    f"w{warmup_step + 1}m{micro_step + 1}:{batch_audit['span_manifest']}"
-                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1394,22 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        warmup_end_state = train_loader.snapshot()
-        log0(
-            "warmup_loader_accounting_exact: "
-            f"optimizer_steps:{args.warmup_steps} "
-            f"micro_steps:{args.warmup_steps * grad_accum_steps} "
-            f"consumed_raw_tokens:{warmup_raw_tokens_consumed} "
-            f"consumed_train_tokens:{warmup_train_tokens_consumed} "
-            f"shift_token_overhead:{warmup_shift_token_overhead}"
-        )
-        log0(f"warmup_loader_state_post_warmup:{warmup_end_state}")
-        log0(f"warmup_loader_span_manifest:{' | '.join(warmup_span_manifests)}")
-        if args.reset_train_loader_after_warmup:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-            log0(f"warmup_loader_state_after_decision:mode:reset state:{train_loader.snapshot()}")
-        else:
-            log0(f"warmup_loader_state_after_decision:mode:resume state:{train_loader.snapshot()}")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
