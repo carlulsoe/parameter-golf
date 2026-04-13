@@ -87,6 +87,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_lr_warmdown_start_step = int(os.environ.get("SCALAR_LR_WARMDOWN_START_STEP", 0))
+    scalar_lr_warmdown_steps = int(os.environ.get("SCALAR_LR_WARMDOWN_STEPS", 0))
+    scalar_lr_warmdown_target = float(os.environ.get("SCALAR_LR_WARMDOWN_TARGET", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1269,6 +1272,23 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.scalar_lr_warmdown_start_step < 0:
+        raise ValueError(
+            f"SCALAR_LR_WARMDOWN_START_STEP must be non-negative, got {args.scalar_lr_warmdown_start_step}"
+        )
+    if args.scalar_lr_warmdown_steps < 0:
+        raise ValueError(f"SCALAR_LR_WARMDOWN_STEPS must be non-negative, got {args.scalar_lr_warmdown_steps}")
+    if not 0.0 <= args.scalar_lr_warmdown_target <= 1.0:
+        raise ValueError(
+            f"SCALAR_LR_WARMDOWN_TARGET must be in [0, 1], got {args.scalar_lr_warmdown_target}"
+        )
+    scalar_lr_warmdown_enabled = args.scalar_lr_warmdown_steps > 0 and args.scalar_lr_warmdown_target < 1.0
+    log0(
+        f"scalar_lr_schedule: enabled:{scalar_lr_warmdown_enabled} "
+        f"start_step:{args.scalar_lr_warmdown_start_step} "
+        f"warmdown_steps:{args.scalar_lr_warmdown_steps} "
+        f"target:{args.scalar_lr_warmdown_target:.5f} scope:optimizer_scalar"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1292,6 +1312,17 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def scalar_lr_mul(step: int) -> float:
+        if not scalar_lr_warmdown_enabled:
+            return 1.0
+        if step < args.scalar_lr_warmdown_start_step:
+            return 1.0
+        if args.scalar_lr_warmdown_steps <= 1:
+            return args.scalar_lr_warmdown_target
+        progress = min(step - args.scalar_lr_warmdown_start_step, args.scalar_lr_warmdown_steps - 1)
+        frac = progress / (args.scalar_lr_warmdown_steps - 1)
+        return 1.0 + frac * (args.scalar_lr_warmdown_target - 1.0)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1331,6 +1362,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    last_scalar_lr_mult = 1.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1367,6 +1399,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        scalar_scale = scalar_lr_mul(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1420,9 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_scalar.param_groups:
+            group["lr"] = group["base_lr"] * scale * scalar_scale
+        last_scalar_lr_mult = scalar_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1403,7 +1439,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"scalar_lr_mult:{scalar_scale:.5f} scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1455,14 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"scalar_lr_audit: completed_updates:{step} "
+        f"warmdown_enabled:{scalar_lr_warmdown_enabled} "
+        f"start_step:{args.scalar_lr_warmdown_start_step} "
+        f"warmdown_steps:{args.scalar_lr_warmdown_steps} "
+        f"target:{args.scalar_lr_warmdown_target:.5f} "
+        f"last_scalar_lr_mult:{last_scalar_lr_mult:.5f}"
     )
 
     # -----------------------------
