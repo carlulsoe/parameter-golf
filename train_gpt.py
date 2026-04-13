@@ -1242,6 +1242,23 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+
+    def summarize_optimizer_groups(optimizer: torch.optim.Optimizer) -> tuple[int, int, int, float, float, float, float]:
+        groups = optimizer.param_groups
+        tensor_count = sum(len(group["params"]) for group in groups)
+        param_count = sum(int(p.numel()) for group in groups for p in group["params"])
+        base_lrs = [float(group.get("base_lr", group["lr"])) for group in groups]
+        live_lrs = [float(group["lr"]) for group in groups]
+        return (
+            len(groups),
+            tensor_count,
+            param_count,
+            min(base_lrs) if base_lrs else 0.0,
+            max(base_lrs) if base_lrs else 0.0,
+            min(live_lrs) if live_lrs else 0.0,
+            max(live_lrs) if live_lrs else 0.0,
+        )
+
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1261,6 +1278,21 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    (
+        scalar_group_count,
+        scalar_tensor_count,
+        scalar_param_count,
+        scalar_min_base_lr,
+        scalar_max_base_lr,
+        scalar_min_live_lr,
+        scalar_max_live_lr,
+    ) = summarize_optimizer_groups(optimizer_scalar)
+    log0(
+        "scalar_lr_audit_setup: "
+        f"groups:{scalar_group_count} tensor_count:{scalar_tensor_count} param_count:{scalar_param_count} "
+        f"base_lr_min:{scalar_min_base_lr:.8f} base_lr_max:{scalar_max_base_lr:.8f} "
+        f"live_lr_min:{scalar_min_live_lr:.8f} live_lr_max:{scalar_max_live_lr:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1327,6 +1359,12 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    scalar_lr_trace_steps = (1, 2, 10, 200)
+    scalar_lr_trace_reached = {trace_step: 0 for trace_step in scalar_lr_trace_steps}
+    min_scalar_live_lr = float("inf")
+    max_scalar_live_lr = 0.0
+    last_scalar_live_lr = 0.0
+    last_scalar_lr_mul = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1425,11 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        _, _, _, _, _, scalar_min_live_lr, scalar_max_live_lr = summarize_optimizer_groups(optimizer_scalar)
+        min_scalar_live_lr = min(min_scalar_live_lr, scalar_min_live_lr)
+        max_scalar_live_lr = max(max_scalar_live_lr, scalar_max_live_lr)
+        last_scalar_live_lr = scalar_max_live_lr
+        last_scalar_lr_mul = scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1395,6 +1438,13 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if step in scalar_lr_trace_reached:
+            scalar_lr_trace_reached[step] = 1
+            log0(
+                "scalar_lr_trace: "
+                f"step:{step} lr_mul:{last_scalar_lr_mul:.8f} "
+                f"live_lr_min:{scalar_min_live_lr:.8f} live_lr_max:{scalar_max_live_lr:.8f}"
+            )
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1414,6 +1464,29 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if min_scalar_live_lr == float("inf"):
+        min_scalar_live_lr = 0.0
+    (
+        scalar_group_count,
+        scalar_tensor_count,
+        scalar_param_count,
+        scalar_min_base_lr,
+        scalar_max_base_lr,
+        scalar_min_live_lr_now,
+        scalar_max_live_lr_now,
+    ) = summarize_optimizer_groups(optimizer_scalar)
+    log0(
+        "scalar_lr_audit: "
+        f"completed_updates:{step} measured_stop_step:{step if stop_after_step is None else stop_after_step} "
+        f"groups:{scalar_group_count} tensor_count:{scalar_tensor_count} param_count:{scalar_param_count} "
+        f"base_lr_min:{scalar_min_base_lr:.8f} base_lr_max:{scalar_max_base_lr:.8f} "
+        f"min_live_lr:{min_scalar_live_lr:.8f} max_live_lr:{max_scalar_live_lr:.8f} "
+        f"last_live_lr:{last_scalar_live_lr:.8f} current_live_lr_min:{scalar_min_live_lr_now:.8f} "
+        f"current_live_lr_max:{scalar_max_live_lr_now:.8f} last_lr_mul:{last_scalar_lr_mul:.8f} "
+        f"step1_reached:{scalar_lr_trace_reached[1]} step2_reached:{scalar_lr_trace_reached[2]} "
+        f"step10_reached:{scalar_lr_trace_reached[10]} step200_reached:{scalar_lr_trace_reached[200]}"
+    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
