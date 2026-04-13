@@ -1327,6 +1327,9 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    first_local_cap_step: int | None = None
+    first_local_cap_train_time_ms: float | None = None
+    last_applied_lr_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1370,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        last_applied_lr_scale = scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1407,7 +1411,11 @@ def main() -> None:
             )
 
         # Needed to sync whether we've reached the wallclock cap.
-        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        reached_cap_local = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        if reached_cap_local and first_local_cap_step is None:
+            first_local_cap_step = step
+            first_local_cap_train_time_ms = approx_training_time_ms
+        reached_cap = reached_cap_local
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
@@ -1418,6 +1426,31 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    local_cap_step_str = str(first_local_cap_step) if first_local_cap_step is not None else "none"
+    local_cap_time_str = (
+        f"{first_local_cap_train_time_ms:.0f}" if first_local_cap_train_time_ms is not None else "none"
+    )
+    max_wallclock_ms_str = f"{max_wallclock_ms:.0f}" if max_wallclock_ms is not None else "none"
+    optimizer_lr_summary = " ".join(
+        f"{name}:{opt.param_groups[0]['lr']:.8f}"
+        for name, opt in (
+            ("tok", optimizer_tok),
+            ("head", optimizer_head if base_model.lm_head is not None else None),
+            ("muon", optimizer_muon),
+            ("scalar", optimizer_scalar),
+        )
+        if opt is not None and opt.param_groups
+    )
+    log0(
+        "training_stop_audit: "
+        f"completed_updates:{step} "
+        f"stop_after_step:{stop_after_step if stop_after_step is not None else 'none'} "
+        f"max_wallclock_ms:{max_wallclock_ms_str} "
+        f"first_local_cap_step:{local_cap_step_str} "
+        f"first_local_cap_train_time_ms:{local_cap_time_str} "
+        f"last_applied_lr_scale:{last_applied_lr_scale:.8f} "
+        f"optimizer_lrs:{optimizer_lr_summary}"
     )
 
     # -----------------------------
