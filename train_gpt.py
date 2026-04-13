@@ -83,7 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_nesterov_warmup_steps = int(os.environ.get("MUON_NESTEROV_WARMUP_STEPS", 0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -118,14 +117,6 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
-        self.applied_steps = 0
-        self.first_applied_step: int | None = None
-        self.first_applied_lr: float | None = None
-        self.first_applied_momentum: float | None = None
-        self.first_applied_nesterov: bool | None = None
-        self.first_nesterov_true_step: int | None = None
-        self.first_nesterov_true_momentum: float | None = None
-        self.first_nesterov_true_lr: float | None = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -153,15 +144,6 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    if self.first_applied_step is None:
-                        self.first_applied_step = self.applied_steps
-                        self.first_applied_lr = float(lr)
-                        self.first_applied_momentum = float(momentum)
-                        self.first_applied_nesterov = bool(nesterov)
-                    if nesterov and self.first_nesterov_true_step is None:
-                        self.first_nesterov_true_step = self.applied_steps
-                        self.first_nesterov_true_momentum = float(momentum)
-                        self.first_nesterov_true_lr = float(lr)
                     g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
@@ -185,7 +167,6 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
-        self.applied_steps += 1
         return loss
 
 
@@ -1282,13 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        "muon_nesterov_schedule: "
-        f"warmup_steps:{args.muon_nesterov_warmup_steps} "
-        f"warmup_mode:{'disabled' if args.muon_nesterov_warmup_steps > 0 else 'baseline'} "
-        f"nesterov_before_warmup:{False if args.muon_nesterov_warmup_steps > 0 else True} "
-        f"nesterov_after_warmup:True"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1407,10 +1381,8 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        muon_nesterov = step >= args.muon_nesterov_warmup_steps
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-            group["nesterov"] = muon_nesterov
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1443,18 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        "muon_step_audit: "
-        f"applied_steps:{optimizer_muon.applied_steps} "
-        f"configured_nesterov_warmup_steps:{args.muon_nesterov_warmup_steps} "
-        f"first_applied_step:{optimizer_muon.first_applied_step if optimizer_muon.first_applied_step is not None else 'none'} "
-        f"first_applied_lr:{optimizer_muon.first_applied_lr if optimizer_muon.first_applied_lr is not None else 0.0:.8f} "
-        f"first_applied_momentum:{optimizer_muon.first_applied_momentum if optimizer_muon.first_applied_momentum is not None else 0.0:.8f} "
-        f"first_applied_nesterov:{optimizer_muon.first_applied_nesterov if optimizer_muon.first_applied_nesterov is not None else 'none'} "
-        f"first_nesterov_true_step:{optimizer_muon.first_nesterov_true_step if optimizer_muon.first_nesterov_true_step is not None else 'none'} "
-        f"first_nesterov_true_lr:{optimizer_muon.first_nesterov_true_lr if optimizer_muon.first_nesterov_true_lr is not None else 0.0:.8f} "
-        f"first_nesterov_true_momentum:{optimizer_muon.first_nesterov_true_momentum if optimizer_muon.first_nesterov_true_momentum is not None else 0.0:.8f}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
