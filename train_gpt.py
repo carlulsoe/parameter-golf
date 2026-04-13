@@ -37,6 +37,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
+def parse_env_bool01(name: str, default: str) -> bool:
+    raw = os.environ.get(name, default)
+    if raw not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -81,6 +87,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_nesterov = parse_env_bool01("MUON_NESTEROV", "1")
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -1209,6 +1216,7 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    block_param_name_by_id = {id(p): name for name, p in block_named_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1233,6 +1241,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        nesterov=args.muon_nesterov,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1262,6 +1271,30 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+
+    def log_muon_group_audit(stage: str) -> None:
+        live_muon_param_names = [
+            block_param_name_by_id.get(id(p), f"<unknown:{tuple(p.shape)}>")
+            for group in optimizer_muon.param_groups
+            for p in group["params"]
+        ]
+        live_muon_tensor_count = len(live_muon_param_names)
+        live_muon_numel = sum(
+            int(p.numel())
+            for group in optimizer_muon.param_groups
+            for p in group["params"]
+        )
+        nesterov_flags = ",".join(str(int(bool(group.get("nesterov", False)))) for group in optimizer_muon.param_groups)
+        log0(
+            f"optimizer_muon_audit stage:{stage} "
+            f"groups:{len(optimizer_muon.param_groups)} "
+            f"nesterov_flags:{nesterov_flags or 'none'} "
+            f"tensors:{live_muon_tensor_count} "
+            f"numel:{live_muon_numel}"
+        )
+        log0(f"optimizer_muon_scope stage:{stage} names:{','.join(live_muon_param_names) or 'none'}")
+
+    log_muon_group_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1316,6 +1349,7 @@ def main() -> None:
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        log_muon_group_audit("post_warmup_restore")
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
@@ -1419,6 +1453,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_muon_group_audit("shutdown")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
