@@ -54,7 +54,6 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    shared_lr_audit_steps = os.environ.get("SHARED_LR_AUDIT_STEPS", "")
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1282,40 +1281,17 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    raw_shared_lr_audit_steps = args.shared_lr_audit_steps.strip()
-    if raw_shared_lr_audit_steps:
-        shared_lr_audit_steps = []
-        for raw_step in raw_shared_lr_audit_steps.split(","):
-            raw_step = raw_step.strip()
-            if not raw_step:
-                raise ValueError("SHARED_LR_AUDIT_STEPS must not contain empty entries")
-            parsed_step = int(raw_step)
-            if parsed_step < 0:
-                raise ValueError("SHARED_LR_AUDIT_STEPS entries must be non-negative")
-            if parsed_step not in shared_lr_audit_steps:
-                shared_lr_audit_steps.append(parsed_step)
-    else:
-        shared_lr_audit_steps = []
-    shared_lr_audit_step_set = set(shared_lr_audit_steps)
 
-    def shared_lr_state(step: int, elapsed_ms: float) -> tuple[float, float | None]:
+    def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
-            return 1.0, None
+            return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            scale = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-            return scale, None
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         warmdown_ms = args.warmdown_iters * step_ms
-        scale = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-        return scale, remaining_ms
-
-    if shared_lr_audit_steps:
-        log0(
-            f"shared_lr_audit enabled:True steps:{','.join(str(step) for step in shared_lr_audit_steps)} "
-            f"step_semantics:applied_step_zero_based scope:shared_live_scheduler"
-        )
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1351,10 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_shared_lr_scale = 1.0
-    last_remaining_ms: float | None = None
-    min_shared_lr_scale = 1.0
-    reached_shared_lr_audit_steps: list[int] = []
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1394,17 +1366,7 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale, remaining_ms = shared_lr_state(step, elapsed_ms)
-        last_shared_lr_scale = scale
-        last_remaining_ms = remaining_ms
-        min_shared_lr_scale = min(min_shared_lr_scale, scale)
-        if step in shared_lr_audit_step_set:
-            reached_shared_lr_audit_steps.append(step)
-            remaining_ms_text = f"{remaining_ms:.1f}" if remaining_ms is not None else "na"
-            log0(
-                f"shared_lr_audit_step applied_step:{step} shared_lr_scale:{scale:.8f} "
-                f"elapsed_ms:{elapsed_ms:.1f} remaining_ms:{remaining_ms_text}"
-            )
+        scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1452,16 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    if shared_lr_audit_steps:
-        remaining_ms_text = f"{last_remaining_ms:.1f}" if last_remaining_ms is not None else "na"
-        reached_steps_text = ",".join(str(step) for step in reached_shared_lr_audit_steps) or "none"
-        log0(
-            f"shared_lr_audit_summary configured_steps:{','.join(str(step) for step in shared_lr_audit_steps)} "
-            f"reached_steps:{reached_steps_text} completed_updates:{step} "
-            f"last_shared_lr_scale:{last_shared_lr_scale:.8f} min_shared_lr_scale:{min_shared_lr_scale:.8f} "
-            f"last_remaining_ms:{remaining_ms_text}"
-        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
