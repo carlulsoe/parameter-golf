@@ -37,6 +37,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
+DEFAULT_TIED_EMBED_LR = 0.05
+
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -1157,6 +1159,16 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    if args.tied_embed_lr <= 0.0:
+        raise ValueError(f"TIED_EMBED_LR must be positive, got {args.tied_embed_lr}")
+    tied_embed_lr_override_active = not math.isclose(
+        args.tied_embed_lr,
+        DEFAULT_TIED_EMBED_LR,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    if tied_embed_lr_override_active and not args.tie_embeddings:
+        raise ValueError("Non-default TIED_EMBED_LR requires TIE_EMBEDDINGS=1")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1261,6 +1273,15 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        "optimizer_tok_scope_audit: "
+        f"tie_embeddings:{base_model.tie_embeddings} "
+        f"tied_embed_lr_override_active:{tied_embed_lr_override_active} "
+        f"token_lr_source:{'TIED_EMBED_LR' if base_model.tie_embeddings else 'EMBED_LR'} "
+        f"optimizer_tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+        f"optimizer_head:{'inactive' if base_model.lm_head is None else 'active'} "
+        f"lm_head_shape:{'none' if base_model.lm_head is None else tuple(base_model.lm_head.weight.shape)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
