@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import hashlib
 import inspect
 import io
 import math
@@ -60,6 +61,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    train_shard_order = os.environ.get("TRAIN_SHARD_ORDER", "sorted")
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -781,18 +783,42 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
+    def __init__(self, pattern: str, seed: int, shard_order: str):
+        base_files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not base_files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        if shard_order == "sorted":
+            rotation = 0
+            files = base_files
+        elif shard_order == "seed_rotate_nonzero":
+            rotation = 0 if len(base_files) <= 1 else (seed % (len(base_files) - 1)) + 1
+            files = base_files[rotation:] + base_files[:rotation]
+        else:
+            raise ValueError(
+                "TRAIN_SHARD_ORDER must be one of {'sorted', 'seed_rotate_nonzero'}, "
+                f"got {shard_order!r}"
+            )
+        self.files = files
+        self.shard_order = shard_order
+        self.rotation = rotation
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.pass_idx = 0
+        self.visited_shards: list[tuple[int, int, str]] = []
+        self._record_visit()
+
+    def _record_visit(self) -> None:
+        self.visited_shards.append((self.pass_idx, self.file_idx, self.files[self.file_idx].name))
 
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        next_file_idx = (self.file_idx + 1) % len(self.files)
+        if next_file_idx == 0 and self.file_idx != 0:
+            self.pass_idx += 1
+        self.file_idx = next_file_idx
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
+        self._record_visit()
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -808,15 +834,42 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
+    def state_str(self) -> str:
+        return (
+            f"pass_idx:{self.pass_idx} file_idx:{self.file_idx} "
+            f"pos:{self.pos} file:{self.files[self.file_idx].name}"
+        )
+
+    def order_manifest_digest(self) -> str:
+        manifest = "\n".join(f"{idx}:{file.name}" for idx, file in enumerate(self.files))
+        return hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+
+    def order_manifest_chunks(self, chunk_size: int = 16) -> list[str]:
+        entries = [f"{idx}:{file.name}" for idx, file in enumerate(self.files)]
+        return [
+            " ".join(entries[start : start + chunk_size])
+            for start in range(0, len(entries), chunk_size)
+        ]
+
+    def visited_shard_chunks(self, chunk_size: int = 16) -> list[str]:
+        entries = [
+            f"{idx}:pass{pass_idx}/file{file_idx}:{name}"
+            for idx, (pass_idx, file_idx, name) in enumerate(self.visited_shards)
+        ]
+        return [
+            " ".join(entries[start : start + chunk_size])
+            for start in range(0, len(entries), chunk_size)
+        ]
+
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, seed: int, shard_order: str):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, seed=seed, shard_order=shard_order)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1274,7 +1327,38 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        seed=args.seed,
+        shard_order=args.train_shard_order,
+    )
+
+    def log_train_loader_manifest(loader: DistributedTokenLoader, phase: str) -> None:
+        digest = loader.stream.order_manifest_digest()
+        log0(
+            "train_loader_shard_order: "
+            f"phase:{phase} mode:{loader.stream.shard_order} rotation:{loader.stream.rotation} "
+            f"total_shards:{len(loader.stream.files)} manifest_sha256:{digest}"
+        )
+        for chunk_idx, chunk in enumerate(loader.stream.order_manifest_chunks(), start=1):
+            log0(f"train_loader_shard_manifest_chunk: phase:{phase} chunk:{chunk_idx} {chunk}")
+
+    def log_train_loader_state(loader: DistributedTokenLoader, phase: str) -> None:
+        log0(f"train_loader_state: phase:{phase} {loader.stream.state_str()}")
+
+    def log_train_loader_visited_sequence(loader: DistributedTokenLoader, phase: str) -> None:
+        log0(
+            "train_loader_shard_sequence: "
+            f"phase:{phase} entries:{len(loader.stream.visited_shards)}"
+        )
+        for chunk_idx, chunk in enumerate(loader.stream.visited_shard_chunks(), start=1):
+            log0(f"train_loader_shard_sequence_chunk: phase:{phase} chunk:{chunk_idx} {chunk}")
+
+    log_train_loader_manifest(train_loader, phase="startup")
+    log_train_loader_state(train_loader, phase="startup")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,13 +1397,25 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        log_train_loader_state(train_loader, phase="post_warmup_consumed")
+        log_train_loader_visited_sequence(train_loader, phase="warmup_consumed")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            seed=args.seed,
+            shard_order=args.train_shard_order,
+        )
+        log0("train_loader_warmup_branch: action:reset_replay_prefix")
+        log_train_loader_state(train_loader, phase="active_after_warmup_reset")
+        log_train_loader_visited_sequence(train_loader, phase="active_after_warmup_reset")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1515,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_train_loader_state(train_loader, phase="run_end")
+    log_train_loader_visited_sequence(train_loader, phase="measured_training")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
