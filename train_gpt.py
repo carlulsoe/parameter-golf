@@ -88,9 +88,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-
-GLOBAL_GRAD_CLIP_TRACE_STEPS = (0, 1, 9, 31, 63, 127, 199, 255, 319, 351)
-
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1271,10 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"optimizer_clipping scope:whole_model grad_clip_norm:{args.grad_clip_norm:.5f} "
-        f"trace_steps:{','.join(str(s) for s in GLOBAL_GRAD_CLIP_TRACE_STEPS)}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1396,14 +1389,7 @@ def main() -> None:
                 group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-            if step in GLOBAL_GRAD_CLIP_TRACE_STEPS:
-                total_grad_norm_value = float(total_grad_norm.item())
-                clip_coef = min(args.grad_clip_norm / (total_grad_norm_value + 1e-6), 1.0)
-                log0(
-                    f"global_grad_clip_trace applied_step:{step} pre_clip_grad_norm:{total_grad_norm_value:.5f} "
-                    f"clip_coef_lt_1:{clip_coef < 1.0}"
-                )
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1432,10 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"global_grad_clip_audit grad_clip_norm:{args.grad_clip_norm:.5f} "
-        f"trace_steps_reached:{','.join(str(s) for s in GLOBAL_GRAD_CLIP_TRACE_STEPS if s < step) or 'none'}"
     )
 
     # -----------------------------
