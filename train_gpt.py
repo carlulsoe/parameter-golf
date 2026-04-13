@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    attn_scale_beta2 = float(os.environ.get("ATTN_SCALE_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1171,6 +1172,15 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    for beta_name, beta_value in (
+        ("BETA1", args.beta1),
+        ("BETA2", args.beta2),
+        ("ATTN_SCALE_BETA2", args.attn_scale_beta2),
+    ):
+        if not 0.0 <= beta_value < 1.0:
+            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1209,18 +1219,24 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    attn_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith("attn_scale")]
+    attn_scale_param_ids = {id(p) for _, p in attn_scale_named_params}
+    attn_scale_split_active = args.attn_scale_beta2 != args.beta2
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if attn_scale_split_active:
+        scalar_named_params = [(name, p) for name, p in scalar_named_params if id(p) not in attn_scale_param_ids]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [p for _, p in scalar_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1243,6 +1259,15 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_attn_scale: torch.optim.Optimizer | None = None
+    if attn_scale_split_active:
+        optimizer_attn_scale = torch.optim.Adam(
+            [{"params": [p for _, p in attn_scale_named_params], "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.attn_scale_beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_attn_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1251,6 +1276,27 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    scalar_tensor_count = len(scalar_named_params)
+    scalar_numel = sum(p.numel() for _, p in scalar_named_params)
+    attn_scale_tensor_count = len(attn_scale_named_params)
+    attn_scale_numel = sum(p.numel() for _, p in attn_scale_named_params)
+    attn_scale_names = ",".join(name for name, _ in attn_scale_named_params)
+
+    def log_attn_scale_optimizer_state(stage: str) -> None:
+        attn_scale_lr = optimizer_attn_scale.param_groups[0]["lr"] if optimizer_attn_scale is not None else optimizer_scalar.param_groups[0]["lr"]
+        log0(
+            f"optimizer_betas:stage:{stage} beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+            f"attn_scale_beta2:{args.attn_scale_beta2:.5f}"
+        )
+        log0(
+            f"optimizer_scalar_groups:stage:{stage} attn_scale_split_active:{attn_scale_split_active} "
+            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+            f"attn_scale_tensors:{attn_scale_tensor_count} attn_scale_numel:{attn_scale_numel} "
+            f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} attn_scale_lr:{attn_scale_lr:.8f}"
+        )
+        if optimizer_attn_scale is not None:
+            log0(f"optimizer_attn_scale_names:{attn_scale_names}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1262,6 +1308,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log_attn_scale_optimizer_state(stage="startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1367,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_attn_scale_optimizer_state(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1467,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_attn_scale_optimizer_state(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
