@@ -1269,6 +1269,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    muon_momentum_warmup_end_applied_step = 1 if args.muon_momentum_warmup_steps <= 0 else args.muon_momentum_warmup_steps + 1
+    log0(
+        f"muon_momentum_schedule: warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"warmup_end_applied_step:{muon_momentum_warmup_end_applied_step}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1327,6 +1333,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    muon_target_momentum_logged = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1383,6 +1390,13 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        if not muon_target_momentum_logged and step >= args.muon_momentum_warmup_steps:
+            log0(
+                f"muon_momentum_target_reached: applied_step:{step + 1} "
+                f"momentum:{muon_momentum:.5f} "
+                f"warmup_end_applied_step:{muon_momentum_warmup_end_applied_step}"
+            )
+            muon_target_momentum_logged = True
 
         for opt in optimizers:
             for group in opt.param_groups:
