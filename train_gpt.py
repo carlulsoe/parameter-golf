@@ -137,11 +137,14 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            applied_step = int(group.get("applied_steps", 0))
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
             curr = 0
+            active_tensors = 0
+            active_numel = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
@@ -156,6 +159,8 @@ class Muon(torch.optim.Optimizer):
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    active_tensors += 1
+                    active_numel += int(p.numel())
                 curr += p.numel()
 
             if distributed:
@@ -166,6 +171,14 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
+
+            group["last_applied_step"] = applied_step
+            group["last_applied_lr"] = float(lr)
+            group["last_applied_momentum"] = float(momentum)
+            group["last_applied_nesterov"] = bool(nesterov)
+            group["last_active_tensors"] = active_tensors
+            group["last_active_numel"] = active_numel
+            group["applied_steps"] = applied_step + 1
 
         return loss
 
@@ -1270,6 +1283,30 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    def muon_momentum_for_step(applied_step: int) -> float:
+        frac = min(applied_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+
+    muon_trace_steps = sorted({
+        0,
+        1,
+        9,
+        max(args.muon_momentum_warmup_steps - 1, 0),
+        args.muon_momentum_warmup_steps,
+        199,
+    })
+    log0(
+        "muon_momentum_schedule:"
+        f" step_semantics:applied_step_zero_based"
+        f" warmup_start:{args.muon_momentum_warmup_start:.5f}"
+        f" target:{args.muon_momentum:.5f}"
+        f" warmup_steps:{args.muon_momentum_warmup_steps}"
+        f" warmup_last_interp_step:{max(args.muon_momentum_warmup_steps - 1, 0)}"
+        f" full_momentum_start_step:{args.muon_momentum_warmup_steps}"
+        f" step0_momentum:{muon_momentum_for_step(0):.5f}"
+        f" trace_steps:{','.join(str(s) for s in muon_trace_steps)}"
+    )
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1379,8 +1416,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_step(step)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1393,6 +1429,19 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        muon_group = optimizer_muon.param_groups[0]
+        last_applied_muon_step = int(muon_group.get("last_applied_step", -1))
+        if last_applied_muon_step in muon_trace_steps:
+            log0(
+                "muon_momentum_trace:"
+                f" step:{last_applied_muon_step}"
+                f" momentum:{float(muon_group.get('last_applied_momentum', 0.0)):.5f}"
+                f" lr:{float(muon_group.get('last_applied_lr', 0.0)):.8f}"
+                f" nesterov:{bool(muon_group.get('last_applied_nesterov', True))}"
+                f" active_tensors:{int(muon_group.get('last_active_tensors', 0))}"
+                f" active_numel:{int(muon_group.get('last_active_numel', 0))}"
+            )
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1414,6 +1463,27 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    muon_group = optimizer_muon.param_groups[0]
+    last_applied_muon_step = int(muon_group.get("last_applied_step", -1))
+    last_applied_muon_momentum = float(muon_group.get("last_applied_momentum", muon_momentum_for_step(max(last_applied_muon_step, 0))))
+    warmup_fraction_completed = (
+        min((last_applied_muon_step + 1) / args.muon_momentum_warmup_steps, 1.0)
+        if args.muon_momentum_warmup_steps > 0 and last_applied_muon_step >= 0
+        else (1.0 if args.muon_momentum_warmup_steps <= 0 else 0.0)
+    )
+    trace_steps_reached = ",".join(str(s) for s in muon_trace_steps if s <= last_applied_muon_step)
+    log0(
+        "muon_momentum_audit:"
+        f" warmup_steps:{args.muon_momentum_warmup_steps}"
+        f" warmup_start:{args.muon_momentum_warmup_start:.5f}"
+        f" target:{args.muon_momentum:.5f}"
+        f" last_applied_step:{last_applied_muon_step}"
+        f" last_applied_momentum:{last_applied_muon_momentum:.5f}"
+        f" warmup_fraction_completed:{warmup_fraction_completed:.5f}"
+        f" trace_steps_reached:{trace_steps_reached if trace_steps_reached else 'none'}"
+        f" applied_steps:{int(muon_group.get('applied_steps', 0))}"
+    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
