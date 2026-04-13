@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1171,6 +1172,12 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be strictly positive, got {args.adam_eps}")
+    if args.token_adam_eps <= 0.0:
+        raise ValueError(f"TOKEN_ADAM_EPS must be strictly positive, got {args.token_adam_eps}")
+    if not args.tie_embeddings and not math.isclose(args.token_adam_eps, args.adam_eps, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("TOKEN_ADAM_EPS != ADAM_EPS requires TIE_EMBEDDINGS=1 so optimizer_tok stays on the shared embedding/logit matrix")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1225,7 +1232,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.token_adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1261,6 +1268,14 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    optimizer_head_eps = f"{args.adam_eps:.8g}" if base_model.lm_head is not None else "inactive"
+    log0(
+        "optimizer_eps_scope "
+        f"optimizer_tok:{args.token_adam_eps:.8g} "
+        f"optimizer_scalar:{args.adam_eps:.8g} "
+        f"optimizer_head:{optimizer_head_eps} "
+        "muon_eps:none"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
