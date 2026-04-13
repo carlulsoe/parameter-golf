@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1268,6 +1269,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"ema_decay:{args.ema_decay:.6f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1281,6 +1283,11 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    ema_state: dict[str, Tensor] | None = None
+    ema_update_count = 0
+
+    if not (0.0 <= args.ema_decay < 1.0):
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1320,6 +1327,12 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.ema_decay > 0.0:
+        ema_state = {}
+        for name, tensor in base_model.state_dict().items():
+            detached = tensor.detach().clone()
+            ema_state[name] = detached.float() if detached.is_floating_point() else detached
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1392,6 +1405,13 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state is not None:
+            one_minus_decay = 1.0 - args.ema_decay
+            for name, tensor in base_model.state_dict().items():
+                ema_tensor = ema_state[name]
+                if ema_tensor.is_floating_point():
+                    ema_tensor.mul_(args.ema_decay).add_(tensor.detach().float(), alpha=one_minus_decay)
+            ema_update_count += 1
         zero_grad_all()
 
         step += 1
@@ -1426,15 +1446,23 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    export_state_dict = base_model.state_dict()
+    if ema_state is not None:
+        export_state_dict = {name: tensor.detach().clone() for name, tensor in ema_state.items()}
+        base_model.load_state_dict(export_state_dict, strict=True)
+        log0(f"ema_export:enabled updates:{ema_update_count} decay:{args.ema_decay:.6f}")
+    else:
+        log0("ema_export:disabled")
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
