@@ -78,6 +78,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr_min_scale = float(os.environ.get("MATRIX_LR_MIN_SCALE", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1251,6 +1252,8 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    if not 0.0 <= args.matrix_lr_min_scale <= 1.0:
+        raise ValueError(f"MATRIX_LR_MIN_SCALE must be in [0, 1], got {args.matrix_lr_min_scale}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1260,7 +1263,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} matrix_lr_min_scale:{args.matrix_lr_min_scale} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1327,6 +1330,11 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    matrix_lr_floor_active_steps = 0
+    matrix_lr_floor_first_step = 0
+    matrix_lr_floor_last_step = 0
+    last_shared_lr_scale = 1.0
+    last_matrix_lr_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1367,6 +1375,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        matrix_scale = max(scale, args.matrix_lr_min_scale)
+        last_shared_lr_scale = scale
+        last_matrix_lr_scale = matrix_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1384,9 +1395,16 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
+        if matrix_scale > scale:
+            matrix_lr_floor_active_steps += 1
+            if matrix_lr_floor_first_step == 0:
+                matrix_lr_floor_first_step = step + 1
+            matrix_lr_floor_last_step = step + 1
+
         for opt in optimizers:
+            opt_scale = matrix_scale if opt is optimizer_muon else scale
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+                group["lr"] = group["base_lr"] * opt_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1436,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "matrix_lr_floor_audit: "
+        f"min_scale:{args.matrix_lr_min_scale:.5f} "
+        f"active_steps:{matrix_lr_floor_active_steps} "
+        f"first_active_step:{matrix_lr_floor_first_step} "
+        f"last_active_step:{matrix_lr_floor_last_step} "
+        f"last_shared_scale:{last_shared_lr_scale:.5f} "
+        f"last_matrix_scale:{last_matrix_lr_scale:.5f}"
     )
 
     # -----------------------------
