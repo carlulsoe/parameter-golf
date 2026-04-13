@@ -78,6 +78,9 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr_warmdown_start_step = int(os.environ.get("MATRIX_LR_WARMDOWN_START_STEP", 0))
+    matrix_lr_warmdown_steps = int(os.environ.get("MATRIX_LR_WARMDOWN_STEPS", 0))
+    matrix_lr_warmdown_target = float(os.environ.get("MATRIX_LR_WARMDOWN_TARGET", 1.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1089,6 +1092,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.matrix_lr_warmdown_start_step < 0:
+        raise ValueError(f"MATRIX_LR_WARMDOWN_START_STEP must be non-negative, got {args.matrix_lr_warmdown_start_step}")
+    if args.matrix_lr_warmdown_steps < 0:
+        raise ValueError(f"MATRIX_LR_WARMDOWN_STEPS must be non-negative, got {args.matrix_lr_warmdown_steps}")
+    if not (0.0 < args.matrix_lr_warmdown_target <= 1.0):
+        raise ValueError(f"MATRIX_LR_WARMDOWN_TARGET must be in (0, 1], got {args.matrix_lr_warmdown_target}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1262,6 +1271,24 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    matrix_lr_warmdown_enabled = args.matrix_lr_warmdown_steps > 0 and args.matrix_lr_warmdown_target < 1.0
+    first_reduced_completed_update = (
+        args.matrix_lr_warmdown_start_step + 1 if matrix_lr_warmdown_enabled else None
+    )
+    target_reached_completed_update = (
+        args.matrix_lr_warmdown_start_step + args.matrix_lr_warmdown_steps if matrix_lr_warmdown_enabled else None
+    )
+    log0(
+        "matrix_lr_schedule: "
+        f"enabled:{int(matrix_lr_warmdown_enabled)} "
+        f"warmdown_start_step:{args.matrix_lr_warmdown_start_step} "
+        f"warmdown_steps:{args.matrix_lr_warmdown_steps} "
+        f"warmdown_target:{args.matrix_lr_warmdown_target:.5f} "
+        "scope:optimizer_muon_only "
+        "optimizer_step_semantics:pre_update_completed_updates "
+        f"first_reduced_completed_update:{first_reduced_completed_update if first_reduced_completed_update is not None else 'none'} "
+        f"target_reached_completed_update:{target_reached_completed_update if target_reached_completed_update is not None else 'none'}"
+    )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1292,6 +1319,17 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def matrix_lr_mul(step: int) -> float:
+        if not matrix_lr_warmdown_enabled or step < args.matrix_lr_warmdown_start_step:
+            return 1.0
+        progress = min((step - args.matrix_lr_warmdown_start_step + 1) / max(args.matrix_lr_warmdown_steps, 1), 1.0)
+        return 1.0 + (args.matrix_lr_warmdown_target - 1.0) * progress
+
+    def format_last_matrix_lr_fields(update: int | None, mult: float | None, lr: float | None) -> str:
+        if update is None or mult is None or lr is None:
+            return "matrix_lr_update:none matrix_lr_mult:none matrix_lr:none"
+        return f"matrix_lr_update:{update} matrix_lr_mult:{mult:.5f} matrix_lr:{lr:.8f}"
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1327,6 +1365,9 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    last_applied_matrix_lr_update: int | None = None
+    last_applied_matrix_lr_mult: float | None = None
+    last_applied_matrix_lr: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1352,7 +1393,8 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"{format_last_matrix_lr_fields(last_applied_matrix_lr_update, last_applied_matrix_lr_mult, last_applied_matrix_lr)}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1367,6 +1409,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        matrix_scale = matrix_lr_mul(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1430,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_muon.param_groups:
+            group["lr"] *= matrix_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1395,6 +1440,9 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        last_applied_matrix_lr_update = step
+        last_applied_matrix_lr_mult = matrix_scale
+        last_applied_matrix_lr = float(optimizer_muon.param_groups[0]["lr"])
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1403,7 +1451,10 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"matrix_lr_update:{last_applied_matrix_lr_update} "
+                f"matrix_lr_mult:{last_applied_matrix_lr_mult:.5f} "
+                f"matrix_lr:{last_applied_matrix_lr:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1415,6 +1466,17 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    log0(
+        "matrix_lr_audit: "
+        f"completed_updates:{step} "
+        f"enabled:{int(matrix_lr_warmdown_enabled)} "
+        f"warmdown_start_step:{args.matrix_lr_warmdown_start_step} "
+        f"warmdown_steps:{args.matrix_lr_warmdown_steps} "
+        f"warmdown_target:{args.matrix_lr_warmdown_target:.5f} "
+        f"first_reduced_completed_update:{first_reduced_completed_update if first_reduced_completed_update is not None else 'none'} "
+        f"target_reached_completed_update:{target_reached_completed_update if target_reached_completed_update is not None else 'none'} "
+        f"{format_last_matrix_lr_fields(last_applied_matrix_lr_update, last_applied_matrix_lr_mult, last_applied_matrix_lr)}"
+    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
