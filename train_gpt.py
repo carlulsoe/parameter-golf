@@ -77,7 +77,6 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    token_embed_init_audit_steps = int(os.environ.get("TOKEN_EMBED_INIT_AUDIT_STEPS", 0))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.token_embed_init_audit_steps < 0:
-        raise ValueError(
-            f"TOKEN_EMBED_INIT_AUDIT_STEPS must be non-negative, got {args.token_embed_init_audit_steps}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1275,29 +1270,6 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    token_embed_audit_initial_param_rms = float(base_model.tok_emb.weight.detach().float().square().mean().sqrt().item())
-    token_embed_audit_trace_steps: set[int] = set()
-    if args.token_embed_init_audit_steps > 0:
-        trace_step = 1
-        while trace_step <= args.token_embed_init_audit_steps:
-            token_embed_audit_trace_steps.add(trace_step)
-            trace_step *= 2
-        token_embed_audit_trace_steps.add(args.token_embed_init_audit_steps)
-        log0(
-            "token_embed_init_audit: "
-            "scope:optimizer_tok "
-            "target:tok_emb.weight "
-            f"configured_steps:{args.token_embed_init_audit_steps} "
-            f"tied_embed_init_std:{args.tied_embed_init_std:.8f} "
-            f"initial_param_rms:{token_embed_audit_initial_param_rms:.8f} "
-            f"param_numel:{base_model.tok_emb.weight.numel()}"
-        )
-    token_embed_audit_updates = 0
-    token_embed_audit_max_relative_update_rms = 0.0
-    token_embed_audit_max_relative_update_step = 0
-    token_embed_audit_max_abs_rms_ratio_drift = 0.0
-    token_embed_audit_max_abs_rms_ratio_drift_step = 0
-
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1418,39 +1390,8 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        token_embed_weight_before = None
-        token_embed_param_rms_before = None
-        if step < args.token_embed_init_audit_steps:
-            token_embed_weight_before = base_model.tok_emb.weight.detach().clone()
-            token_embed_param_rms_before = float(token_embed_weight_before.float().square().mean().sqrt().item())
         for opt in optimizers:
             opt.step()
-        if token_embed_weight_before is not None and token_embed_param_rms_before is not None:
-            token_embed_weight_after = base_model.tok_emb.weight.detach()
-            token_embed_param_rms = float(token_embed_weight_after.float().square().mean().sqrt().item())
-            token_embed_update_rms = float(
-                (token_embed_weight_after.float() - token_embed_weight_before.float()).square().mean().sqrt().item()
-            )
-            token_embed_relative_update_rms = token_embed_update_rms / max(token_embed_param_rms_before, 1e-12)
-            applied_update = step + 1
-            token_embed_audit_updates = applied_update
-            if token_embed_relative_update_rms >= token_embed_audit_max_relative_update_rms:
-                token_embed_audit_max_relative_update_rms = token_embed_relative_update_rms
-                token_embed_audit_max_relative_update_step = applied_update
-            rms_ratio_to_init = token_embed_param_rms / max(token_embed_audit_initial_param_rms, 1e-12)
-            abs_rms_ratio_drift = abs(rms_ratio_to_init - 1.0)
-            if abs_rms_ratio_drift >= token_embed_audit_max_abs_rms_ratio_drift:
-                token_embed_audit_max_abs_rms_ratio_drift = abs_rms_ratio_drift
-                token_embed_audit_max_abs_rms_ratio_drift_step = applied_update
-            if applied_update in token_embed_audit_trace_steps:
-                log0(
-                    "token_embed_init_audit_trace: "
-                    f"update:{applied_update} "
-                    f"param_rms:{token_embed_param_rms:.8f} "
-                    f"rms_ratio_to_init:{rms_ratio_to_init:.8f} "
-                    f"update_rms:{token_embed_update_rms:.8f} "
-                    f"relative_update_rms:{token_embed_relative_update_rms:.8f}"
-                )
         zero_grad_all()
 
         step += 1
@@ -1478,16 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.token_embed_init_audit_steps > 0:
-        log0(
-            "token_embed_init_audit_summary: "
-            f"configured_steps:{args.token_embed_init_audit_steps} "
-            f"audited_updates:{token_embed_audit_updates} "
-            f"max_relative_update_rms:{token_embed_audit_max_relative_update_rms:.8f} "
-            f"max_relative_update_step:{token_embed_audit_max_relative_update_step} "
-            f"max_abs_rms_ratio_drift:{token_embed_audit_max_abs_rms_ratio_drift:.8f} "
-            f"max_abs_rms_ratio_drift_step:{token_embed_audit_max_abs_rms_ratio_drift_step}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
