@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    token_beta1 = float(os.environ.get("TOKEN_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1172,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not (0.0 <= args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not (0.0 <= args.token_beta1 < 1.0):
-        raise ValueError(f"TOKEN_BETA1 must be in [0, 1), got {args.token_beta1}")
-    if not (0.0 <= args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if args.token_beta1 != args.beta1 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA1 requires TIE_EMBEDDINGS=1 when it differs from BETA1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1233,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.token_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1261,14 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    named_params_by_id = {id(param): name for name, param in base_model.named_parameters()}
-    optimizer_tok_param_names = [
-        named_params_by_id.get(id(param), "<unknown>")
-        for group in optimizer_tok.param_groups
-        for param in group["params"]
-    ]
-    optimizer_head_betas = optimizer_head.defaults["betas"] if base_model.lm_head is not None else None
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1284,30 +1267,6 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    log0(
-        "optimizer_beta_scope: "
-        f"optimizer_tok_beta1:{optimizer_tok.defaults['betas'][0]:.5f} "
-        f"optimizer_tok_beta2:{optimizer_tok.defaults['betas'][1]:.5f} "
-        f"optimizer_scalar_beta1:{optimizer_scalar.defaults['betas'][0]:.5f} "
-        f"optimizer_scalar_beta2:{optimizer_scalar.defaults['betas'][1]:.5f} "
-        f"optimizer_head_beta1:{optimizer_head_betas[0]:.5f} "
-        f"optimizer_head_beta2:{optimizer_head_betas[1]:.5f}"
-        if optimizer_head_betas is not None
-        else "optimizer_beta_scope: "
-        f"optimizer_tok_beta1:{optimizer_tok.defaults['betas'][0]:.5f} "
-        f"optimizer_tok_beta2:{optimizer_tok.defaults['betas'][1]:.5f} "
-        f"optimizer_scalar_beta1:{optimizer_scalar.defaults['betas'][0]:.5f} "
-        f"optimizer_scalar_beta2:{optimizer_scalar.defaults['betas'][1]:.5f} "
-        "optimizer_head_beta1:inactive optimizer_head_beta2:inactive"
-    )
-    log0(
-        "optimizer_tok_scope_audit: "
-        f"tie_embeddings:{args.tie_embeddings} "
-        "scope:tied_only "
-        f"optimizer_head_exists:{base_model.lm_head is not None} "
-        f"param_count:{len(optimizer_tok_param_names)} "
-        f"params:{','.join(optimizer_tok_param_names)}"
     )
     log0(f"seed:{args.seed}")
 
