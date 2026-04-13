@@ -83,9 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_momentum_tail_start_step = int(os.environ.get("MUON_MOMENTUM_TAIL_START_STEP", 0))
-    muon_momentum_tail_steps = int(os.environ.get("MUON_MOMENTUM_TAIL_STEPS", 0))
-    muon_momentum_tail_target = float(os.environ.get("MUON_MOMENTUM_TAIL_TARGET", 0.90))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1087,41 +1084,11 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
-def muon_baseline_momentum(args: Hyperparameters, applied_step: int) -> float:
-    frac = min(applied_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-
-def muon_assigned_momentum(args: Hyperparameters, applied_step: int) -> float:
-    baseline = muon_baseline_momentum(args, applied_step)
-    if args.muon_momentum_tail_steps <= 0 or applied_step < args.muon_momentum_tail_start_step:
-        return baseline
-    tail_start_baseline = muon_baseline_momentum(args, args.muon_momentum_tail_start_step)
-    if args.muon_momentum_tail_steps == 1:
-        tail_frac = 1.0
-    else:
-        tail_frac = min(
-            max(applied_step - args.muon_momentum_tail_start_step, 0) / (args.muon_momentum_tail_steps - 1),
-            1.0,
-        )
-    return (1 - tail_frac) * tail_start_baseline + tail_frac * args.muon_momentum_tail_target
-
-
 def main() -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.muon_momentum_tail_start_step < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_TAIL_START_STEP must be non-negative, got {args.muon_momentum_tail_start_step}"
-        )
-    if args.muon_momentum_tail_steps < 0:
-        raise ValueError(f"MUON_MOMENTUM_TAIL_STEPS must be non-negative, got {args.muon_momentum_tail_steps}")
-    if not 0.0 <= args.muon_momentum_tail_target < 1.0:
-        raise ValueError(
-            f"MUON_MOMENTUM_TAIL_TARGET must be in [0, 1), got {args.muon_momentum_tail_target}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1295,41 +1262,12 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    tail_midpoint_step = args.muon_momentum_tail_start_step + args.muon_momentum_tail_steps // 2
-    tail_last_step = args.muon_momentum_tail_start_step + args.muon_momentum_tail_steps - 1
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    if args.muon_momentum_tail_steps > 0:
-        planned_tail_points = (
-            args.muon_momentum_tail_start_step,
-            tail_midpoint_step,
-            tail_last_step,
-        )
-        planned_tail_summary = []
-        for planned_step in planned_tail_points:
-            baseline_momentum = muon_baseline_momentum(args, planned_step)
-            assigned_momentum = muon_assigned_momentum(args, planned_step)
-            planned_tail_summary.append(
-                f"step:{planned_step}|baseline:{baseline_momentum:.5f}|assigned:{assigned_momentum:.5f}|"
-                f"delta:{assigned_momentum - baseline_momentum:+.5f}"
-            )
-        log0(
-            "optimizer_muon_schedule: "
-            f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-            f"warmup_target:{args.muon_momentum:.5f} "
-            f"warmup_steps:{args.muon_momentum_warmup_steps} "
-            f"tail_mode:coupled_warmup_plus_tail "
-            f"tail_start_step:{args.muon_momentum_tail_start_step} "
-            f"tail_steps:{args.muon_momentum_tail_steps} "
-            f"tail_target:{args.muon_momentum_tail_target:.5f} "
-            f"tail_midpoint_step:{tail_midpoint_step} "
-            f"tail_last_step:{tail_last_step}"
-        )
-        log0(f"optimizer_muon_tail_plan: {','.join(planned_tail_summary)}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1389,12 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    muon_tail_audit_steps = (
-        args.muon_momentum_tail_start_step,
-        tail_midpoint_step,
-        tail_last_step,
-    )
-    muon_tail_audit_reached: set[int] = set()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1447,8 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        baseline_muon_momentum = muon_baseline_momentum(args, step)
-        muon_momentum = muon_assigned_momentum(args, step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1473,15 +1405,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-        if args.muon_momentum_tail_steps > 0 and step - 1 in muon_tail_audit_steps and step - 1 not in muon_tail_audit_reached:
-            muon_tail_audit_reached.add(step - 1)
-            log0(
-                "optimizer_muon_tail_checkpoint: "
-                f"applied_step:{step - 1} "
-                f"baseline_momentum:{baseline_muon_momentum:.5f} "
-                f"assigned_momentum:{muon_momentum:.5f} "
-                f"delta:{muon_momentum - baseline_muon_momentum:+.5f}"
-            )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1496,23 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.muon_momentum_tail_steps > 0:
-        final_applied_step = max(step - 1, -1)
-        final_baseline_muon_momentum = muon_baseline_momentum(args, final_applied_step) if final_applied_step >= 0 else 0.0
-        final_assigned_muon_momentum = muon_assigned_momentum(args, final_applied_step) if final_applied_step >= 0 else 0.0
-        reached_summary = ",".join(str(audit_step) for audit_step in sorted(muon_tail_audit_reached)) or "none"
-        log0(
-            "optimizer_muon_tail_audit: "
-            f"mode:coupled_warmup_plus_tail "
-            f"tail_start_step:{args.muon_momentum_tail_start_step} "
-            f"tail_midpoint_step:{tail_midpoint_step} "
-            f"tail_last_step:{tail_last_step} "
-            f"reached_checkpoints:{reached_summary} "
-            f"final_applied_step:{final_applied_step} "
-            f"final_baseline_momentum:{final_baseline_muon_momentum:.5f} "
-            f"final_assigned_momentum:{final_assigned_muon_momentum:.5f} "
-            f"final_delta:{final_assigned_muon_momentum - final_baseline_muon_momentum:+.5f}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
