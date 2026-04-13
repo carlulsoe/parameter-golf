@@ -1214,19 +1214,11 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [p for _, p in scalar_named_params]
-    scalar_control_named_params = [
-        (name, p) for name, p in scalar_named_params if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_other_named_params = [
-        (name, p) for name, p in scalar_named_params if not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_skip_param = base_model.skip_weights if base_model.skip_weights.numel() > 0 else None
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1269,20 +1261,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    scalar_control_numel = sum(int(p.numel()) for _, p in scalar_control_named_params)
-    scalar_other_numel = sum(int(p.numel()) for _, p in scalar_other_named_params)
-    scalar_skip_numel = int(scalar_skip_param.numel()) if scalar_skip_param is not None else 0
-    scalar_family_counts = ",".join(
-        f"{family}:{sum(1 for name, _ in scalar_control_named_params if family in name)}"
-        for family in ("q_gain", "attn_scale", "mlp_scale", "resid_mix")
-    )
-    log0(
-        f"optimizer_scalar_scope:total_tensors:{len(scalar_params)} total_numel:{sum(int(p.numel()) for p in scalar_params)} "
-        f"control_tensors:{len(scalar_control_named_params)} control_numel:{scalar_control_numel} "
-        f"skip_tensors:{1 if scalar_skip_param is not None else 0} skip_numel:{scalar_skip_numel} "
-        f"other_scalar_tensors:{len(scalar_other_named_params)} other_scalar_numel:{scalar_other_numel} "
-        f"control_families:{scalar_family_counts}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
