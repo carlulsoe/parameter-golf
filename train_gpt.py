@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    token_grad_clip_norm = float(os.environ.get("TOKEN_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.grad_clip_norm > 0 and args.token_grad_clip_norm > 0:
-        raise ValueError("GRAD_CLIP_NORM and TOKEN_GRAD_CLIP_NORM are mutually exclusive")
-    if args.token_grad_clip_norm > 0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1267,12 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if args.token_grad_clip_norm > 0:
-        log0(
-            "token_grad_clip_config: "
-            f"enabled:True scope:tied_only tie_embeddings:{args.tie_embeddings} "
-            f"max_norm:{args.token_grad_clip_norm:.8f}"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1342,9 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    token_grad_clip_steps = 0
-    token_grad_clip_last_coef = 1.0
-    token_grad_clip_last_engaged = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1402,17 +1388,6 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        token_grad_clip_last_coef = 1.0
-        token_grad_clip_last_engaged = 0
-        if args.token_grad_clip_norm > 0:
-            token_grad_total_norm = torch.nn.utils.clip_grad_norm_(
-                [base_model.tok_emb.weight], args.token_grad_clip_norm
-            )
-            token_grad_total_norm_value = float(token_grad_total_norm.item())
-            if math.isfinite(token_grad_total_norm_value) and token_grad_total_norm_value > args.token_grad_clip_norm:
-                token_grad_clip_last_engaged = 1
-                token_grad_clip_steps += 1
-                token_grad_clip_last_coef = args.token_grad_clip_norm / (token_grad_total_norm_value + 1e-12)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1426,17 +1401,10 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            train_log = (
+            log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if args.token_grad_clip_norm > 0:
-                train_log += (
-                    f" token_grad_clipped:{token_grad_clip_last_engaged}"
-                    f" token_grad_clip_coef:{token_grad_clip_last_coef:.8f}"
-                    f" token_grad_clipped_steps:{token_grad_clip_steps}"
-                )
-            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1451,13 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.token_grad_clip_norm > 0:
-        log0(
-            "token_grad_clip_audit: "
-            f"enabled:True scope:tied_only tie_embeddings:{args.tie_embeddings} "
-            f"max_norm:{args.token_grad_clip_norm:.8f} clipped_steps:{token_grad_clip_steps} "
-            f"last_clip_coef:{token_grad_clip_last_coef:.8f}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
