@@ -55,7 +55,6 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    resume_train_loader_after_warmup = bool(int(os.environ.get("RESUME_TRAIN_LOADER_AFTER_WARMUP", "0")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -789,7 +788,6 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.tokens_taken = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -807,22 +805,8 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.tokens_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def state_dict(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "tokens_taken": self.tokens_taken,
-        }
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self.file_idx = int(state["file_idx"])
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = int(state["pos"])
-        self.tokens_taken = int(state["tokens_taken"])
 
 
 class DistributedTokenLoader:
@@ -833,11 +817,6 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
-
-    def raw_tokens_per_micro_batch(self, global_tokens: int, grad_accum_steps: int) -> int:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        return per_rank_span * self.world_size
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1289,7 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"resume_train_loader_after_warmup:{args.resume_train_loader_after_warmup}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1320,7 +1298,6 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        warmup_cursor_before = train_loader.stream.state_dict()
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -1342,29 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        warmup_cursor_after = train_loader.stream.state_dict()
-        raw_tokens_per_micro_batch = train_loader.raw_tokens_per_micro_batch(args.train_batch_tokens, grad_accum_steps)
-        expected_tokens_taken = warmup_cursor_before["tokens_taken"] + (
-            args.warmup_steps * grad_accum_steps * raw_tokens_per_micro_batch
-        )
-        cursor_mode = "resume" if args.resume_train_loader_after_warmup else "reset"
-        log0(
-            "train_loader_post_warmup: "
-            f"mode:{cursor_mode} "
-            f"expected_tokens_taken:{expected_tokens_taken} "
-            f"actual_tokens_taken:{warmup_cursor_after['tokens_taken']} "
-            f"file_idx:{warmup_cursor_after['file_idx']} "
-            f"pos:{warmup_cursor_after['pos']}"
-        )
-        if not args.resume_train_loader_after_warmup:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-            reset_cursor = train_loader.stream.state_dict()
-            log0(
-                "train_loader_reset_cursor: "
-                f"tokens_taken:{reset_cursor['tokens_taken']} "
-                f"file_idx:{reset_cursor['file_idx']} "
-                f"pos:{reset_cursor['pos']}"
-            )
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
