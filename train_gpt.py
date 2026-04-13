@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1091,12 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not math.isfinite(args.adam_eps) or args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be finite and strictly positive, got {args.adam_eps}")
-    if not math.isfinite(args.token_adam_eps) or args.token_adam_eps <= 0.0:
-        raise ValueError(f"TOKEN_ADAM_EPS must be finite and strictly positive, got {args.token_adam_eps}")
-    if args.token_adam_eps != args.adam_eps and not args.tie_embeddings:
-        raise ValueError("TOKEN_ADAM_EPS != ADAM_EPS requires TIE_EMBEDDINGS=1 because optimizer_tok scopes only tok_emb.weight")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1232,7 +1225,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.token_adam_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1260,15 +1253,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
-    optimizer_tok_param_names = sorted(
-        param_name_by_id.get(id(param), "<unnamed>")
-        for group in optimizer_tok.param_groups
-        for param in group["params"]
-    )
-    optimizer_head_eps_status = (
-        f"{float(optimizer_head.defaults['eps']):.8f}" if base_model.lm_head is not None else "inactive"
-    )
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1283,21 +1267,6 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    log0(
-        "optimizer_eps_audit "
-        f"optimizer_tok:{float(optimizer_tok.defaults['eps']):.8f} "
-        f"optimizer_scalar:{float(optimizer_scalar.defaults['eps']):.8f} "
-        f"optimizer_head:{optimizer_head_eps_status} "
-        "optimizer_muon:none"
-    )
-    log0(
-        "optimizer_tok_scope_audit "
-        f"tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_only' if args.tie_embeddings else 'token_only'} "
-        f"optimizer_head_exists:{base_model.lm_head is not None} "
-        f"param_count:{len(optimizer_tok_param_names)} "
-        f"params:{','.join(optimizer_tok_param_names)}"
     )
     log0(f"seed:{args.seed}")
 
