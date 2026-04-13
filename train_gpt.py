@@ -1281,7 +1281,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    global_lr_schedule_mode = "wallclock" if max_wallclock_ms is not None else "fixed_iterations"
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1293,17 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    log0(
-        "global_lr_schedule: "
-        f"mode:{global_lr_schedule_mode} "
-        f"warmdown_iters:{args.warmdown_iters} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    global_lr_trace_steps = frozenset((1, 2, 4, 8, 16, 32, 64, 128, 200))
-    global_lr_trace_values: dict[int, float] = {}
-    global_lr_min = 1.0
-    global_lr_last = 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1379,16 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        global_lr_min = min(global_lr_min, scale)
-        global_lr_last = scale
-        next_step = step + 1
-        if next_step in global_lr_trace_steps and next_step not in global_lr_trace_values:
-            global_lr_trace_values[next_step] = float(scale)
-            est_step_ms = elapsed_ms / max(step, 1)
-            log0(
-                f"global_lr_trace step:{next_step} lr_mul:{scale:.5f} "
-                f"elapsed_ms:{elapsed_ms:.0f}ms est_step_ms:{est_step_ms:.2f}ms"
-            )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1440,18 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "global_lr_audit: "
-        f"mode:{global_lr_schedule_mode} "
-        f"completed_updates:{step} "
-        f"warmdown_iters:{args.warmdown_iters} "
-        f"step2_reached:{int(2 in global_lr_trace_values)} "
-        f"step2_lr_mul:{global_lr_trace_values.get(2, 0.0):.5f} "
-        f"step200_reached:{int(200 in global_lr_trace_values)} "
-        f"step200_lr_mul:{global_lr_trace_values.get(200, 0.0):.5f} "
-        f"min_lr_mul:{global_lr_min:.5f} "
-        f"last_lr_mul:{global_lr_last:.5f}"
     )
 
     # -----------------------------
