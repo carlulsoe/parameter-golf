@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    global_lr_floor_mult = float(os.environ.get("GLOBAL_LR_FLOOR_MULT", 0.0))
+    global_lr_floor_start_step = int(os.environ.get("GLOBAL_LR_FLOOR_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1269,6 +1271,20 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if not 0.0 <= args.global_lr_floor_mult <= 1.0:
+        raise ValueError(
+            f"GLOBAL_LR_FLOOR_MULT must be in [0, 1], got {args.global_lr_floor_mult}"
+        )
+    if args.global_lr_floor_start_step < 0:
+        raise ValueError(
+            f"GLOBAL_LR_FLOOR_START_STEP must be non-negative, got {args.global_lr_floor_start_step}"
+        )
+    global_lr_floor_enabled = args.global_lr_floor_mult > 0.0
+    log0(
+        f"global_lr_floor enabled:{global_lr_floor_enabled} "
+        f"start_step:{args.global_lr_floor_start_step} floor_mult:{args.global_lr_floor_mult:.5f} "
+        f"step_semantics:applied_step_one_based scope:shared"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1327,6 +1343,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    global_lr_floor_first_activation_step: int | None = None
+    global_lr_floor_active_steps = 0
+    last_unfloored_scale = 1.0
+    last_effective_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1366,7 +1386,20 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
+        unfloored_scale = lr_mul(step, elapsed_ms)
+        effective_scale = unfloored_scale
+        if global_lr_floor_enabled and (step + 1) >= args.global_lr_floor_start_step:
+            effective_scale = max(effective_scale, args.global_lr_floor_mult)
+            if effective_scale > unfloored_scale:
+                global_lr_floor_active_steps += 1
+                if global_lr_floor_first_activation_step is None:
+                    global_lr_floor_first_activation_step = step + 1
+                    log0(
+                        f"global_lr_floor_activation first_step:{global_lr_floor_first_activation_step} "
+                        f"unfloored_mult:{unfloored_scale:.5f} floored_mult:{effective_scale:.5f}"
+                    )
+        last_unfloored_scale = unfloored_scale
+        last_effective_scale = effective_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1386,7 +1419,7 @@ def main() -> None:
 
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+                group["lr"] = group["base_lr"] * effective_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1418,6 +1451,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"global_lr_floor_audit enabled:{global_lr_floor_enabled} "
+        f"configured_start_step:{args.global_lr_floor_start_step} floor_mult:{args.global_lr_floor_mult:.5f} "
+        f"first_activation_step:{global_lr_floor_first_activation_step if global_lr_floor_first_activation_step is not None else 'none'} "
+        f"active_steps:{global_lr_floor_active_steps} completed_updates:{step} "
+        f"last_unfloored_mult:{last_unfloored_scale:.5f} last_effective_mult:{last_effective_scale:.5f}"
     )
 
     # -----------------------------
