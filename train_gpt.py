@@ -58,6 +58,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    eval_max_context = int(os.environ.get("EVAL_MAX_CONTEXT", os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024))))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -235,40 +236,102 @@ def eval_val(
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.eval_seq_len:
+    if args.eval_max_context < args.eval_seq_len:
         raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
+            f"EVAL_MAX_CONTEXT={args.eval_max_context} must be at least EVAL_SEQ_LEN={args.eval_seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.eval_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    eval_model = model.module if isinstance(model, DDP) else model
+    forward_logits = getattr(eval_model, "forward_logits", None)
+    if forward_logits is None and hasattr(eval_model, "_orig_mod"):
+        forward_logits = getattr(eval_model._orig_mod, "forward_logits", None)
+    if args.eval_max_context != args.eval_seq_len and forward_logits is None:
+        raise RuntimeError("long-context evaluation requires forward_logits on the wrapped model")
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.eval_seq_len
-            raw_end = batch_seq_end * args.eval_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.eval_seq_len)
-            y = local[1:].reshape(-1, args.eval_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+        if args.eval_max_context == args.eval_seq_len:
+            local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+            if local_batch_tokens < args.eval_seq_len:
+                raise ValueError(
+                    "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+                    f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+                    f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
+                )
+            local_batch_seqs = local_batch_tokens // args.eval_seq_len
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * args.eval_seq_len
+                raw_end = batch_seq_end * args.eval_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, args.eval_seq_len)
+                y = local[1:].reshape(-1, args.eval_seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                batch_token_count = float(y.numel())
+                val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                val_token_count += batch_token_count
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+        else:
+            left_context = args.eval_max_context - args.eval_seq_len
+            # Long-context eval materializes scored logits explicitly, so use smaller batches than the
+            # training-shaped standard path to keep peak memory in-family on the proxy.
+            local_batch_seqs = max(args.val_batch_size // max(world_size * args.eval_max_context * 8, 1), 1)
+            prefix_blocks = min((left_context + args.eval_seq_len - 1) // args.eval_seq_len, total_seqs)
+            for block_idx in range(seq_start, seq_end):
+                target_start = block_idx * args.eval_seq_len
+                target_end = target_start + args.eval_seq_len
+                if block_idx < prefix_blocks:
+                    window_start = 0
+                    score_start = target_start
+                else:
+                    window_start = target_start - left_context
+                    score_start = left_context
+                window = val_tokens[window_start : target_end + 1]
+                if block_idx >= prefix_blocks and window.numel() != args.eval_max_context + 1:
+                    raise ValueError(
+                        f"expected long-context eval window of {args.eval_max_context + 1} tokens, got {window.numel()}"
+                    )
+                if block_idx == seq_start or (block_idx - seq_start) % local_batch_seqs == 0:
+                    batch_windows: list[Tensor] = []
+                    batch_score_starts: list[int] = []
+                batch_windows.append(window)
+                batch_score_starts.append(score_start)
+                is_last_in_batch = len(batch_windows) == local_batch_seqs or block_idx + 1 == seq_end
+                next_is_full = block_idx + 1 < seq_end and (block_idx + 1) >= prefix_blocks and block_idx < prefix_blocks
+                if not is_last_in_batch and not next_is_full:
+                    continue
+
+                x = torch.stack([w[:-1] for w in batch_windows]).to(device=device, dtype=torch.int64, non_blocking=True)
+                y = torch.stack([w[1:] for w in batch_windows]).to(device=device, dtype=torch.int64, non_blocking=True)
+                if any(score != batch_score_starts[0] for score in batch_score_starts):
+                    raise ValueError("mixed score offsets in long-context eval batch are unsupported")
+                score_start = batch_score_starts[0]
+                score_end = score_start + args.eval_seq_len
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = forward_logits(x)[:, score_start:score_end, :]
+                scored_targets = y[:, score_start:score_end]
+                batch_loss_sum = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    scored_targets.reshape(-1),
+                    reduction="sum",
+                )
+                val_loss_sum += batch_loss_sum.to(torch.float64)
+                val_token_count += float(scored_targets.numel())
+                prev_ids = x[:, score_start:score_end].reshape(-1)
+                tgt_ids = scored_targets.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1053,7 +1116,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1068,15 +1131,18 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1171,11 +1237,26 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.eval_max_context <= 0:
+        raise ValueError(f"EVAL_MAX_CONTEXT must be positive, got {args.eval_max_context}")
+    if args.eval_max_context < args.eval_seq_len:
+        raise ValueError(
+            f"EVAL_MAX_CONTEXT={args.eval_max_context} must be at least EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    if args.eval_max_context > 2 * args.eval_seq_len:
+        raise ValueError(
+            f"EVAL_MAX_CONTEXT={args.eval_max_context} is unsupported; this path currently supports at most "
+            f"2 * EVAL_SEQ_LEN={2 * args.eval_seq_len}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(
+        f"eval_context: seq_len:{args.eval_seq_len} max_context:{args.eval_max_context} "
+        f"mode:{'standard' if args.eval_max_context == args.eval_seq_len else 'fixed_window_overlap'}"
+    )
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
