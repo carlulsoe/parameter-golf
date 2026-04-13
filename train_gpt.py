@@ -81,6 +81,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_nesterov = int(os.environ.get("MUON_NESTEROV", "1"))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.muon_nesterov not in (0, 1):
+        raise ValueError(f"MUON_NESTEROV must be 0 or 1, got {args.muon_nesterov}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1208,6 +1211,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1233,6 +1237,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        nesterov=bool(args.muon_nesterov),
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1260,8 +1265,23 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"muon_nesterov:{bool(args.muon_nesterov)}"
     )
+    for group_idx, group in enumerate(optimizer_muon.param_groups):
+        group_param_names = []
+        group_numel = 0
+        for param in group["params"]:
+            param_name = param_name_by_id.get(id(param))
+            if param_name is None:
+                raise ValueError("optimizer_muon param_groups contain an unmapped parameter object")
+            group_param_names.append(param_name)
+            group_numel += int(param.numel())
+        log0(
+            f"optimizer_muon_scope group:{group_idx} tensors:{len(group_param_names)} "
+            f"numel:{group_numel} nesterov:{group['nesterov']} "
+            f"params:{','.join(group_param_names)}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
