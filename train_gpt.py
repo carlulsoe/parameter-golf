@@ -1293,13 +1293,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    def muon_momentum_for_step(step: int) -> tuple[float, float]:
-        warmup_fraction = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        momentum = (
-            (1 - warmup_fraction) * args.muon_momentum_warmup_start + warmup_fraction * args.muon_momentum
-        )
-        return momentum, warmup_fraction
-
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1334,18 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    muon_trace_steps = {0, 1, 9, 199}
-    muon_trace_steps_reached: list[int] = []
-    last_applied_step: int | None = None
-    last_muon_momentum: float | None = None
-    last_muon_warmup_fraction: float = 0.0
-    log0(
-        "muon_momentum_audit_setup: "
-        "step_semantics:applied_step_zero_based "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps}"
-    )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1398,25 +1379,14 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum, muon_warmup_fraction = muon_momentum_for_step(step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-        last_applied_step = step
-        last_muon_momentum = muon_momentum
-        last_muon_warmup_fraction = muon_warmup_fraction
 
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-
-        if step in muon_trace_steps:
-            muon_trace_steps_reached.append(step)
-            log0(
-                "muon_momentum_trace: "
-                f"applied_step:{step} "
-                f"momentum:{muon_momentum:.5f} "
-                f"warmup_fraction:{muon_warmup_fraction:.5f}"
-            )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1445,15 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    trace_steps_summary = ",".join(str(trace_step) for trace_step in muon_trace_steps_reached) if muon_trace_steps_reached else "none"
-    log0(
-        "muon_momentum_audit: "
-        f"measured_stop_step:{step} "
-        f"last_applied_step:{last_applied_step if last_applied_step is not None else 'none'} "
-        f"last_muon_momentum:{last_muon_momentum if last_muon_momentum is not None else 'none'} "
-        f"warmup_fraction_completed:{last_muon_warmup_fraction:.5f} "
-        f"trace_steps_reached:{trace_steps_summary}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
