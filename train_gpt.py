@@ -78,6 +78,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    muon_matrix_lr_floor = float(os.environ.get("MUON_MATRIX_LR_FLOOR", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.muon_matrix_lr_floor < 0.0:
+        raise ValueError(f"MUON_MATRIX_LR_FLOOR must be non-negative, got {args.muon_matrix_lr_floor}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1260,13 +1263,18 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} muon_matrix_lr_floor:{args.muon_matrix_lr_floor} "
+        f"scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"muon_matrix_lr_schedule base_lr:{args.matrix_lr:.5f} floor:{args.muon_matrix_lr_floor:.5f} "
+        f"warmdown_iters:{args.warmdown_iters}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1331,6 +1339,16 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    muon_lr_trace_steps = {1, 2, 4, 8, 16, 32, 64, 128, 200}
+    muon_floor_active_steps = 0
+    muon_min_nominal_lr = float("inf")
+    muon_min_effective_lr = float("inf")
+    muon_max_effective_lr = 0.0
+    muon_last_nominal_lr = 0.0
+    muon_last_effective_lr = 0.0
+    muon_last_global_lr_mul = 1.0
+    muon_last_effective_lr_mul = 1.0
+    muon_prev_floor_active = False
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1384,9 +1402,24 @@ def main() -> None:
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
+        muon_nominal_lr = args.matrix_lr * scale
+        muon_effective_lr = max(muon_nominal_lr, args.muon_matrix_lr_floor)
+        muon_floor_active = muon_effective_lr > muon_nominal_lr + 1e-12
+        if muon_floor_active:
+            muon_floor_active_steps += 1
+        muon_min_nominal_lr = min(muon_min_nominal_lr, muon_nominal_lr)
+        muon_min_effective_lr = min(muon_min_effective_lr, muon_effective_lr)
+        muon_max_effective_lr = max(muon_max_effective_lr, muon_effective_lr)
+        muon_last_nominal_lr = muon_nominal_lr
+        muon_last_effective_lr = muon_effective_lr
+        muon_last_global_lr_mul = scale
+        muon_last_effective_lr_mul = muon_effective_lr / max(args.matrix_lr, 1e-12)
+
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_muon.param_groups:
+            group["lr"] = max(group["base_lr"] * scale, args.muon_matrix_lr_floor)
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1396,6 +1429,13 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if step in muon_lr_trace_steps or muon_floor_active != muon_prev_floor_active:
+            log0(
+                f"muon_matrix_lr_trace step:{step} global_lr_mul:{scale:.5f} "
+                f"nominal_lr:{muon_nominal_lr:.5f} effective_lr:{muon_effective_lr:.5f} "
+                f"effective_lr_mul:{muon_last_effective_lr_mul:.5f} floor_active:{int(muon_floor_active)}"
+            )
+        muon_prev_floor_active = muon_floor_active
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1414,6 +1454,18 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if step == 0:
+        muon_min_nominal_lr = 0.0
+        muon_min_effective_lr = 0.0
+    log0(
+        f"muon_matrix_lr_audit completed_updates:{step} floor:{args.muon_matrix_lr_floor:.5f} "
+        f"floor_active_steps:{muon_floor_active_steps} floor_active_fraction:{muon_floor_active_steps / max(step, 1):.5f} "
+        f"min_nominal_lr:{muon_min_nominal_lr:.5f} min_effective_lr:{muon_min_effective_lr:.5f} "
+        f"max_effective_lr:{muon_max_effective_lr:.5f} last_nominal_lr:{muon_last_nominal_lr:.5f} "
+        f"last_effective_lr:{muon_last_effective_lr:.5f} last_global_lr_mul:{muon_last_global_lr_mul:.5f} "
+        f"last_effective_lr_mul:{muon_last_effective_lr_mul:.5f}"
+    )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
