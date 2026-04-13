@@ -54,7 +54,6 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    matrix_warmdown_iters = int(os.environ.get("MATRIX_WARMDOWN_ITERS", 0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1267,8 +1266,6 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"warmdown_iters:{args.warmdown_iters} "
-        f"matrix_warmdown_iters:{args.matrix_warmdown_iters if args.matrix_warmdown_iters > 0 else 'shared'} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1285,14 +1282,14 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    def lr_mul(step: int, elapsed_ms: float, warmdown_iters: int) -> float:
-        if warmdown_iters <= 0:
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - warmdown_iters, 0)
-            return max((args.iterations - step) / max(warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = warmdown_iters * step_ms
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
@@ -1369,12 +1366,7 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms, args.warmdown_iters)
-        matrix_scale = lr_mul(
-            step,
-            elapsed_ms,
-            args.matrix_warmdown_iters if args.matrix_warmdown_iters > 0 else args.warmdown_iters,
-        )
+        scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1393,9 +1385,8 @@ def main() -> None:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
-            opt_scale = matrix_scale if opt is optimizer_muon else scale
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * opt_scale
+                group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
