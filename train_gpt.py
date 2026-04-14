@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1172,16 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not (0.0 <= args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not (0.0 <= args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not (0.0 <= args.token_beta2 < 1.0):
-        raise ValueError(f"TOKEN_BETA2 must be in [0, 1), got {args.token_beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 requires TIE_EMBEDDINGS=1 so the override stays on the shared embedding/logit path")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1235,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1263,30 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_optimizer_beta_audit(stage: str) -> None:
-        tok_betas = optimizer_tok.param_groups[0]["betas"]
-        scalar_betas = optimizer_scalar.param_groups[0]["betas"]
-        head_betas = "inactive"
-        if base_model.lm_head is not None:
-            head_group = next(
-                (group for group in optimizers[1].param_groups if any(p is base_model.lm_head.weight for p in group["params"])),
-                None,
-            )
-            if head_group is not None:
-                head_betas = f"({head_group['betas'][0]:.5f},{head_group['betas'][1]:.5f})"
-        tok_tensor_count = sum(len(group["params"]) for group in optimizer_tok.param_groups)
-        tok_numel = sum(int(p.numel()) for group in optimizer_tok.param_groups for p in group["params"])
-        log0(
-            f"optimizer_betas stage:{stage} "
-            f"tok:({tok_betas[0]:.5f},{tok_betas[1]:.5f}) "
-            f"scalar:({scalar_betas[0]:.5f},{scalar_betas[1]:.5f}) "
-            f"head:{head_betas}"
-        )
-        log0(
-            f"optimizer_tok_scope stage:{stage} tensors:{tok_tensor_count} numel:{tok_numel} "
-            f"tie_embeddings:{args.tie_embeddings} scope:{'tied_only' if args.tie_embeddings else 'input_only'}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1304,11 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"optimizer_beta_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"token_beta2:{args.token_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log_optimizer_beta_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1359,7 +1319,6 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        log_optimizer_beta_audit("post_restore_startup")
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1460,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_beta_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
