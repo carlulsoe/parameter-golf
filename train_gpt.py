@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    resid_mix_beta2 = float(os.environ.get("RESID_MIX_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,17 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-
-    for name, value in (
-        ("BETA1", args.beta1),
-        ("BETA2", args.beta2),
-        ("RESID_MIX_BETA2", args.resid_mix_beta2),
-    ):
-        if not (0.0 <= value < 1.0):
-            raise ValueError(f"{name} must be in [0, 1), got {value}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1220,24 +1208,19 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters(prefix="blocks"))
-    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith(".resid_mix")]
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and not name.endswith(".resid_mix")
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [p for _, p in scalar_named_params]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    resid_mix_names = [name for name, _ in resid_mix_named_params]
-    resid_mix_params = [p for _, p in resid_mix_named_params]
-    split_resid_mix_beta2 = args.resid_mix_beta2 != args.beta2
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1253,23 +1236,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_resid_mix = None
-    if split_resid_mix_beta2:
-        optimizer_resid_mix = torch.optim.Adam(
-            [{"params": resid_mix_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.resid_mix_beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-    else:
-        scalar_params.extend(resid_mix_params)
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    named_optimizers: list[tuple[str, torch.optim.Optimizer]] = [("optimizer_tok", optimizer_tok)]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1277,32 +1250,7 @@ def main() -> None:
             eps=args.adam_eps,
             fused=True,
         )
-        named_optimizers.append(("optimizer_head", optimizer_head))
-    named_optimizers.append(("optimizer_muon", optimizer_muon))
-    if optimizer_resid_mix is not None:
-        named_optimizers.append(("optimizer_resid_mix", optimizer_resid_mix))
-    named_optimizers.append(("optimizer_scalar", optimizer_scalar))
-    optimizers: list[torch.optim.Optimizer] = [opt for _, opt in named_optimizers]
-
-    def format_beta_tuple(group: dict[str, object]) -> str:
-        betas = group.get("betas")
-        if betas is None:
-            return "none"
-        beta1, beta2 = betas
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def log_optimizer_beta_audit(stage: str) -> None:
-        summary = []
-        for opt_name, opt in named_optimizers:
-            group_summaries = []
-            for idx, group in enumerate(opt.param_groups):
-                group_tensors = len(group["params"])
-                group_numel = sum(int(p.numel()) for p in group["params"])
-                group_summaries.append(
-                    f"group{idx}:betas:{format_beta_tuple(group)} tensors:{group_tensors} numel:{group_numel}"
-                )
-            summary.append(f"{opt_name}[groups:{len(opt.param_groups)} {' '.join(group_summaries)}]")
-        log0(f"optimizer_betas stage:{stage} {' '.join(summary)}")
+        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1321,17 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"optimizer_beta_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"resid_mix_beta2:{args.resid_mix_beta2:.5f} adam_eps:{args.adam_eps:.8f} "
-        f"resid_mix_split:{int(split_resid_mix_beta2)}"
-    )
-    log0(
-        f"optimizer_resid_mix_scope matched_tensors:{len(resid_mix_names)} "
-        f"matched_numel:{sum(int(p.numel()) for p in resid_mix_params)} "
-        f"matched_names:{','.join(resid_mix_names) if resid_mix_names else 'none'}"
-    )
-    log_optimizer_beta_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1383,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_optimizer_beta_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1483,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_beta_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
