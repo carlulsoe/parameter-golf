@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    attn_scale_lr_mult = float(os.environ.get("ATTN_SCALE_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -856,6 +857,75 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def build_named_param_lookup(module: nn.Module) -> tuple[dict[int, str], dict[int, int]]:
+    name_by_id: dict[int, str] = {}
+    numel_by_id: dict[int, int] = {}
+    for name, param in module.named_parameters():
+        name_by_id[id(param)] = name
+        numel_by_id[id(param)] = int(param.numel())
+    return name_by_id, numel_by_id
+
+
+def audit_optimizer_param_groups(
+    optimizer: torch.optim.Optimizer,
+    stage: str,
+    split_active: bool,
+    param_name_by_id: dict[int, str],
+    param_numel_by_id: dict[int, int],
+    intended_name_groups: tuple[frozenset[str], ...],
+    log0,
+) -> None:
+    live_name_groups: list[set[str]] = []
+    live_numel_groups: list[int] = []
+    unknown_name_groups: list[list[str]] = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        live_names: list[str] = []
+        live_numel = 0
+        unknown_names: list[str] = []
+        for param in group["params"]:
+            param_name = param_name_by_id.get(id(param))
+            if param_name is None:
+                unknown_names.append(f"<unknown_{group_idx}_{len(unknown_names)}>")
+                continue
+            live_names.append(param_name)
+            live_numel += param_numel_by_id[id(param)]
+        live_name_groups.append(set(live_names))
+        live_numel_groups.append(live_numel)
+        unknown_name_groups.append(unknown_names)
+
+    union_names = set().union(*live_name_groups) if live_name_groups else set()
+    total_names = sum(len(group_names) for group_names in live_name_groups)
+    disjoint = len(union_names) == total_names
+    exact_group_count = len(live_name_groups) == len(intended_name_groups)
+    exact_names = exact_group_count and all(
+        live_name_groups[group_idx] == set(intended_name_groups[group_idx]) for group_idx in range(len(intended_name_groups))
+    )
+    has_unknown = any(unknown_names for unknown_names in unknown_name_groups)
+    exact_match = disjoint and exact_names and not has_unknown
+    log0(
+        "optimizer_scalar_groups: "
+        f"stage:{stage} split_active:{split_active} group_count:{len(live_name_groups)} "
+        f"disjoint:{disjoint} exact_match:{exact_match}"
+    )
+    for group_idx, group in enumerate(optimizer.param_groups):
+        intended_names = intended_name_groups[group_idx] if group_idx < len(intended_name_groups) else frozenset()
+        live_names = live_name_groups[group_idx]
+        missing_names = sorted(intended_names - live_names)
+        extra_names = sorted(live_names - set(intended_names))
+        unknown_names = unknown_name_groups[group_idx]
+        log0(
+            "optimizer_scalar_group: "
+            f"stage:{stage} group:{group_idx} lr:{float(group['lr']):.8f} base_lr:{float(group['base_lr']):.8f} "
+            f"tensors:{len(live_names)} numel:{live_numel_groups[group_idx]} "
+            f"names:{','.join(sorted(live_names)) or 'none'} "
+            f"missing:{','.join(missing_names) or 'none'} "
+            f"extra:{','.join(extra_names) or 'none'} "
+            f"unknown:{','.join(unknown_names) or 'none'}"
+        )
+    if split_active and not exact_match:
+        raise RuntimeError(f"optimizer_scalar param-group audit failed at stage={stage}")
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1171,6 +1241,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.attn_scale_lr_mult <= 0.0:
+        raise ValueError(f"ATTN_SCALE_LR_MULT must be positive, got {args.attn_scale_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1208,19 +1280,27 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    param_name_by_id, param_numel_by_id = build_named_param_lookup(base_model)
+    block_named_params = list(base_model.blocks.named_parameters(prefix="blocks"))
+    attn_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith("attn_scale")]
+    attn_scale_param_ids = {id(p) for _, p in attn_scale_named_params}
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    split_attn_scale = args.attn_scale_lr_mult != 1.0
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if split_attn_scale:
+        scalar_named_params = [(name, p) for name, p in scalar_named_params if id(p) not in attn_scale_param_ids]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [p for _, p in scalar_named_params]
+    attn_scale_params = [p for _, p in attn_scale_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1316,17 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    optimizer_scalar_group_specs = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    if split_attn_scale:
+        optimizer_scalar_group_specs.append(
+            {
+                "params": attn_scale_params,
+                "lr": args.scalar_lr * args.attn_scale_lr_mult,
+                "base_lr": args.scalar_lr * args.attn_scale_lr_mult,
+            }
+        )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        optimizer_scalar_group_specs,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,7 +1349,21 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"attn_scale_lr_mult:{args.attn_scale_lr_mult}"
+    )
+    intended_scalar_name_groups = (
+        frozenset(name for name, _ in scalar_named_params),
+        frozenset(name for name, _ in attn_scale_named_params),
+    ) if split_attn_scale else (frozenset(name for name, _ in scalar_named_params),)
+    audit_optimizer_param_groups(
+        optimizer_scalar,
+        stage="startup",
+        split_active=split_attn_scale,
+        param_name_by_id=param_name_by_id,
+        param_numel_by_id=param_numel_by_id,
+        intended_name_groups=intended_scalar_name_groups,
+        log0=log0,
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1320,6 +1423,15 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    audit_optimizer_param_groups(
+        optimizer_scalar,
+        stage="post_restore_startup",
+        split_active=split_attn_scale,
+        param_name_by_id=param_name_by_id,
+        param_numel_by_id=param_numel_by_id,
+        intended_name_groups=intended_scalar_name_groups,
+        log0=log0,
+    )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1353,6 +1465,12 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                + (
+                    f" scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
+                    f"attn_scale_lr:{float(optimizer_scalar.param_groups[1]['lr']):.8f}"
+                    if split_attn_scale
+                    else ""
+                )
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1404,6 +1522,12 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                + (
+                    f" scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
+                    f"attn_scale_lr:{float(optimizer_scalar.param_groups[1]['lr']):.8f}"
+                    if split_attn_scale
+                    else ""
+                )
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1542,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    audit_optimizer_param_groups(
+        optimizer_scalar,
+        stage="final",
+        split_active=split_attn_scale,
+        param_name_by_id=param_name_by_id,
+        param_numel_by_id=param_numel_by_id,
+        intended_name_groups=intended_scalar_name_groups,
+        log0=log0,
     )
 
     # -----------------------------
