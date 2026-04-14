@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    resid_mix_lr_mult = float(os.environ.get("RESID_MIX_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -216,6 +217,124 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+def build_scalar_group_audit(
+    optimizer_scalar: torch.optim.Optimizer,
+    param_name_by_id: dict[int, str],
+    scalar_name_to_numel: dict[str, int],
+    target_resid_mix_names: tuple[str, ...],
+) -> dict[str, object]:
+    target_set = set(target_resid_mix_names)
+    all_scalar_names = set(scalar_name_to_numel)
+    seen_names: set[str] = set()
+    unknown_names: list[str] = []
+    groups: list[dict[str, object]] = []
+    disjoint = True
+    resid_mix_group_exact = False
+    default_group_exact = False
+    expected_default_names = all_scalar_names - target_set
+
+    for group_idx, group in enumerate(optimizer_scalar.param_groups):
+        group_names: list[str] = []
+        group_numel = 0
+        for param_idx, param in enumerate(group["params"]):
+            name = param_name_by_id.get(id(param))
+            if name is None:
+                name = f"<unknown_group{group_idx}_param{param_idx}>"
+                unknown_names.append(name)
+            group_names.append(name)
+            group_numel += int(param.numel())
+        group_set = set(group_names)
+        if seen_names & group_set:
+            disjoint = False
+        seen_names.update(group_set)
+        role = "other"
+        if group_set == target_set:
+            role = "resid_mix"
+            resid_mix_group_exact = True
+        elif group_set == expected_default_names:
+            role = "default"
+            default_group_exact = True
+        groups.append(
+            {
+                "index": group_idx,
+                "role": role,
+                "base_lr": float(group.get("base_lr", group.get("lr", 0.0))),
+                "lr": float(group.get("lr", 0.0)),
+                "tensors": len(group_names),
+                "numel": group_numel,
+                "names": group_names,
+            }
+        )
+
+    missing_names = sorted(all_scalar_names - seen_names)
+    unexpected_names = sorted(name for name in seen_names - all_scalar_names if not name.startswith("<unknown_"))
+    exact_match = (
+        disjoint
+        and not unknown_names
+        and not missing_names
+        and not unexpected_names
+        and resid_mix_group_exact
+        and default_group_exact
+        and len(groups) == 2
+    )
+    return {
+        "group_count": len(groups),
+        "disjoint": disjoint,
+        "exact_match": exact_match,
+        "resid_mix_group_exact": resid_mix_group_exact,
+        "default_group_exact": default_group_exact,
+        "missing_names": missing_names,
+        "unexpected_names": unexpected_names,
+        "unknown_names": unknown_names,
+        "groups": groups,
+    }
+
+
+def log_scalar_group_audit(
+    log0,
+    stage: str,
+    optimizer_scalar: torch.optim.Optimizer,
+    param_name_by_id: dict[int, str],
+    scalar_name_to_numel: dict[str, int],
+    target_resid_mix_names: tuple[str, ...],
+    split_active: bool,
+) -> None:
+    audit = build_scalar_group_audit(
+        optimizer_scalar=optimizer_scalar,
+        param_name_by_id=param_name_by_id,
+        scalar_name_to_numel=scalar_name_to_numel,
+        target_resid_mix_names=target_resid_mix_names,
+    )
+    missing = ",".join(audit["missing_names"]) if audit["missing_names"] else "none"
+    unexpected = ",".join(audit["unexpected_names"]) if audit["unexpected_names"] else "none"
+    unknown = ",".join(audit["unknown_names"]) if audit["unknown_names"] else "none"
+    log0(
+        "optimizer_scalar_groups: "
+        f"stage:{stage} "
+        f"split_active:{split_active} "
+        f"group_count:{audit['group_count']} "
+        f"disjoint:{audit['disjoint']} "
+        f"exact_match:{audit['exact_match']} "
+        f"resid_mix_group_exact:{audit['resid_mix_group_exact']} "
+        f"default_group_exact:{audit['default_group_exact']} "
+        f"missing:{missing} "
+        f"unexpected:{unexpected} "
+        f"unknown:{unknown}"
+    )
+    for group in audit["groups"]:
+        names = ",".join(group["names"]) if group["names"] else "none"
+        log0(
+            "optimizer_scalar_group: "
+            f"stage:{stage} "
+            f"role:{group['role']} "
+            f"base_lr:{group['base_lr']:.8f} "
+            f"lr:{group['lr']:.8f} "
+            f"tensors:{group['tensors']} "
+            f"numel:{group['numel']} "
+            f"names:{names}"
+        )
 
 
 def eval_val(
@@ -1089,6 +1208,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.resid_mix_lr_mult <= 0.0:
+        raise ValueError(f"RESID_MIX_LR_MULT must be positive, got {args.resid_mix_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1208,19 +1329,34 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters(prefix="blocks"))
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    target_resid_mix_names = tuple(f"blocks.{layer_idx}.resid_mix" for layer_idx in range(args.num_layers))
+    target_resid_mix_name_set = set(target_resid_mix_names)
+    resid_mix_named_params = [(name, p) for name, p in scalar_named_params if name in target_resid_mix_name_set]
+    default_scalar_named_params = [(name, p) for name, p in scalar_named_params if name not in target_resid_mix_name_set]
+    if len(resid_mix_named_params) != len(target_resid_mix_names):
+        found_resid_mix_names = sorted(name for name, _ in resid_mix_named_params)
+        raise ValueError(
+            "Expected one resid_mix tensor per block in optimizer_scalar split; "
+            f"expected:{','.join(target_resid_mix_names)} found:{','.join(found_resid_mix_names)}"
+        )
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        default_scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_name_to_numel = {
+        name: int(param.numel())
+        for name, param in default_scalar_named_params + resid_mix_named_params
+    }
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1372,26 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    optimizer_scalar_groups = [
+        {
+            "params": [param for _, param in default_scalar_named_params],
+            "lr": args.scalar_lr,
+            "base_lr": args.scalar_lr,
+        }
+    ]
+    resid_mix_split_active = args.resid_mix_lr_mult != 1.0
+    if resid_mix_split_active:
+        optimizer_scalar_groups.append(
+            {
+                "params": [param for _, param in resid_mix_named_params],
+                "lr": args.scalar_lr * args.resid_mix_lr_mult,
+                "base_lr": args.scalar_lr * args.resid_mix_lr_mult,
+            }
+        )
+    else:
+        optimizer_scalar_groups[0]["params"].extend(param for _, param in resid_mix_named_params)
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        optimizer_scalar_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,7 +1414,17 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"resid_mix_lr_mult:{args.resid_mix_lr_mult}"
+    )
+    log_scalar_group_audit(
+        log0=log0,
+        stage="startup",
+        optimizer_scalar=optimizer_scalar,
+        param_name_by_id=param_name_by_id,
+        scalar_name_to_numel=scalar_name_to_numel,
+        target_resid_mix_names=target_resid_mix_names,
+        split_active=resid_mix_split_active,
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1317,6 +1481,15 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        log_scalar_group_audit(
+            log0=log0,
+            stage="post_restore_startup",
+            optimizer_scalar=optimizer_scalar,
+            param_name_by_id=param_name_by_id,
+            scalar_name_to_numel=scalar_name_to_numel,
+            target_resid_mix_names=target_resid_mix_names,
+            split_active=resid_mix_split_active,
+        )
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1418,6 +1591,15 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log_scalar_group_audit(
+        log0=log0,
+        stage="final",
+        optimizer_scalar=optimizer_scalar,
+        param_name_by_id=param_name_by_id,
+        scalar_name_to_numel=scalar_name_to_numel,
+        target_resid_mix_names=target_resid_mix_names,
+        split_active=resid_mix_split_active,
     )
 
     # -----------------------------
