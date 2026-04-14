@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1197,9 +1196,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    for name, value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("SCALAR_BETA2", args.scalar_beta2)):
-        if not (0.0 <= value < 1.0):
-            raise ValueError(f"{name} must be in [0, 1), got {value}")
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1223,14 +1219,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_param_names = [
-        f"blocks.{name}"
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-        scalar_param_names.append("skip_weights")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1248,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.scalar_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1268,10 +1258,6 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"scalar_beta2:{args.scalar_beta2:.5f} adam_eps:{args.adam_eps:.0e}"
-    )
-    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1283,26 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"optimizer_scalar_scope tensors:{len(scalar_params)} numel:{sum(p.numel() for p in scalar_params)} "
-        f"names:{','.join(scalar_param_names)}"
-    )
-
-    def log_adam_group_betas(stage: str) -> None:
-        tok_betas = optimizer_tok.param_groups[0]["betas"]
-        scalar_betas = optimizer_scalar.param_groups[0]["betas"]
-        head_beta_summary = "inactive"
-        if base_model.lm_head is not None:
-            head_betas = optimizer_head.param_groups[0]["betas"]
-            head_beta_summary = f"({head_betas[0]:.5f},{head_betas[1]:.5f})"
-        log0(
-            f"optimizer_adam_betas stage:{stage} "
-            f"tok:({tok_betas[0]:.5f},{tok_betas[1]:.5f}) "
-            f"scalar:({scalar_betas[0]:.5f},{scalar_betas[1]:.5f}) "
-            f"head:{head_beta_summary}"
-        )
-
-    log_adam_group_betas("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1354,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_adam_group_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1454,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_adam_group_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
