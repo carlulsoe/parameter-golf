@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -757,6 +758,38 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def init_ema_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {name: tensor.detach().clone() for name, tensor in state_dict.items()}
+
+
+@torch.no_grad()
+def update_ema_state_dict(ema_state_dict: dict[str, Tensor], state_dict: dict[str, Tensor], decay: float) -> None:
+    one_minus_decay = 1.0 - decay
+    for name, tensor in state_dict.items():
+        ema_tensor = ema_state_dict[name]
+        src = tensor.detach()
+        if src.is_floating_point():
+            ema_tensor.lerp_(src, one_minus_decay)
+        else:
+            ema_tensor.copy_(src)
+
+
+@torch.no_grad()
+def summarize_ema_delta(ema_state_dict: dict[str, Tensor], state_dict: dict[str, Tensor]) -> tuple[float, float, int]:
+    delta_sq_sum = 0.0
+    raw_sq_sum = 0.0
+    float_tensor_count = 0
+    for name, tensor in state_dict.items():
+        src = tensor.detach()
+        if not src.is_floating_point():
+            continue
+        ema_tensor = ema_state_dict[name]
+        delta_sq_sum += float((ema_tensor.float() - src.float()).square().sum().item())
+        raw_sq_sum += float(src.float().square().sum().item())
+        float_tensor_count += 1
+    return delta_sq_sum**0.5, raw_sq_sum**0.5, float_tensor_count
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1090,6 +1123,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must satisfy 0 <= EMA_DECAY < 1, got {args.ema_decay}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1268,6 +1303,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"ema_decay:{args.ema_decay:.6f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1320,6 +1356,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    ema_state_dict = init_ema_state_dict(base_model.state_dict()) if args.ema_decay > 0.0 else None
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1392,6 +1430,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state_dict is not None:
+            update_ema_state_dict(ema_state_dict, base_model.state_dict(), args.ema_decay)
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1459,16 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    export_state_dict = ema_state_dict if ema_state_dict is not None else base_model.state_dict()
+    if ema_state_dict is not None:
+        ema_delta_l2, raw_l2, ema_float_tensors = summarize_ema_delta(ema_state_dict, base_model.state_dict())
+        log0(
+            "ema_export: "
+            f"enabled:True decay:{args.ema_decay:.6f} "
+            f"float_tensors:{ema_float_tensors} "
+            f"delta_l2:{ema_delta_l2:.8f} raw_l2:{raw_l2:.8f} "
+            f"delta_to_raw_ratio:{ema_delta_l2 / max(raw_l2, 1e-12):.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1427,14 +1477,14 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
