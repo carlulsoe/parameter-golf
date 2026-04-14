@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    scalar_eps = float(os.environ.get("SCALAR_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1158,10 +1157,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.scalar_eps <= 0.0:
-        raise ValueError(f"SCALAR_EPS must be positive, got {args.scalar_eps}")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1244,7 +1239,7 @@ def main() -> None:
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.scalar_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1258,39 +1253,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-
-    def scalar_group_counts() -> tuple[int, int]:
-        return len(scalar_params), sum(int(p.numel()) for p in scalar_params)
-
-    expected_scalar_tensors, expected_scalar_numel = scalar_group_counts()
-
-    def log_optimizer_beta_eps(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        scalar_group = optimizer_scalar.param_groups[0]
-        head_group = optimizer_head.param_groups[0] if base_model.lm_head is not None else None
-        log0(
-            "optimizer_beta_eps_audit "
-            f"stage:{stage} "
-            f"tok:({tok_group['betas'][0]:.5f},{tok_group['betas'][1]:.5f}) "
-            f"tok_eps:{tok_group['eps']:.8f} "
-            f"scalar:({scalar_group['betas'][0]:.5f},{scalar_group['betas'][1]:.5f}) "
-            f"scalar_eps:{scalar_group['eps']:.8f} "
-            f"head:({'inactive' if head_group is None else f'({head_group['betas'][0]:.5f},{head_group['betas'][1]:.5f})'}) "
-            f"head_eps:{0.0 if head_group is None else head_group['eps']:.8f}"
-        )
-
-    def log_scalar_group(stage: str) -> None:
-        live_scalar_params = list(optimizer_scalar.param_groups[0]["params"])
-        live_tensor_count = len(live_scalar_params)
-        live_numel = sum(int(p.numel()) for p in live_scalar_params)
-        log0(
-            "optimizer_scalar_group "
-            f"stage:{stage} "
-            f"tensors:{live_tensor_count} "
-            f"numel:{live_numel} "
-            f"exact_match:{live_tensor_count == expected_scalar_tensors and live_numel == expected_scalar_numel}"
-        )
-
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1306,12 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"optimizer_eps_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"adam_eps:{args.adam_eps:.8f} scalar_eps:{args.scalar_eps:.8f}"
-    )
-    log_optimizer_beta_eps(stage="startup")
-    log_scalar_group(stage="startup")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1364,8 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_beta_eps(stage="post_restore_startup")
-        log_scalar_group(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1465,8 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_beta_eps(stage="final")
-    log_scalar_group(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
