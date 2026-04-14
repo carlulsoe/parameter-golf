@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1084,11 +1085,82 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+def validate_adam_hyperparameters(beta1: float, beta2: float, adam_eps: float, scalar_beta1: float) -> None:
+    for name, value in (("BETA1", beta1), ("BETA2", beta2), ("SCALAR_BETA1", scalar_beta1)):
+        if not math.isfinite(value) or not (0.0 <= value < 1.0):
+            raise ValueError(f"{name} must be finite and in [0, 1), got {value}")
+    if not math.isfinite(adam_eps) or adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be finite and > 0, got {adam_eps}")
+
+
+def build_named_parameter_lookup(module: nn.Module) -> dict[int, str]:
+    return {id(param): name for name, param in module.named_parameters()}
+
+
+def audit_optimizer_scope(
+    optimizer: torch.optim.Optimizer,
+    named_param_lookup: dict[int, str],
+) -> dict[str, object]:
+    group_names: list[str] = []
+    beta1_values: list[float] = []
+    beta2_values: list[float] = []
+    tensor_count = 0
+    numel_count = 0
+    contains_skip_weights = False
+    missing_name_tensors = 0
+    for group in optimizer.param_groups:
+        beta1, beta2 = group["betas"]
+        beta1_values.append(float(beta1))
+        beta2_values.append(float(beta2))
+        for param in group["params"]:
+            tensor_count += 1
+            numel_count += int(param.numel())
+            name = named_param_lookup.get(id(param))
+            if name is None:
+                missing_name_tensors += 1
+                continue
+            if name == "skip_weights":
+                contains_skip_weights = True
+            group_names.append(name)
+    return {
+        "groups": len(optimizer.param_groups),
+        "tensors": tensor_count,
+        "numel": numel_count,
+        "contains_skip_weights": contains_skip_weights,
+        "missing_name_tensors": missing_name_tensors,
+        "names": ",".join(group_names),
+        "beta1_min": min(beta1_values) if beta1_values else 0.0,
+        "beta1_max": max(beta1_values) if beta1_values else 0.0,
+        "beta2_min": min(beta2_values) if beta2_values else 0.0,
+        "beta2_max": max(beta2_values) if beta2_values else 0.0,
+    }
+
+
+def log_optimizer_scalar_audit(
+    log0,
+    optimizer_scalar: torch.optim.Optimizer,
+    named_param_lookup: dict[int, str],
+    stage: str,
+) -> None:
+    audit = audit_optimizer_scope(optimizer_scalar, named_param_lookup)
+    log0(
+        "optimizer_scalar_audit: "
+        f"stage:{stage} optimizer:Adam scope:block_scalar_control_params "
+        f"groups:{audit['groups']} tensors:{audit['tensors']} numel:{audit['numel']} "
+        f"contains_skip_weights:{audit['contains_skip_weights']} "
+        f"missing_name_tensors:{audit['missing_name_tensors']} "
+        f"beta1_min:{audit['beta1_min']:.5f} beta1_max:{audit['beta1_max']:.5f} "
+        f"beta2_min:{audit['beta2_min']:.5f} beta2_max:{audit['beta2_max']:.5f}"
+    )
+    if audit["names"]:
+        log0(f"optimizer_scalar_names: stage:{stage} names:{audit['names']}", console=False)
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    validate_adam_hyperparameters(args.beta1, args.beta2, args.adam_eps, args.scalar_beta1)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1238,7 +1310,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.scalar_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1253,10 +1325,15 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    named_param_lookup = build_named_parameter_lookup(base_model)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"optimizer_adam_config: beta1:{args.beta1:.5f} scalar_beta1:{args.scalar_beta1:.5f} "
+        f"beta2:{args.beta2:.5f} adam_eps:{args.adam_eps:.8f}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1269,6 +1346,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_scalar_audit(log0, optimizer_scalar, named_param_lookup, stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1398,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_scalar_audit(log0, optimizer_scalar, named_param_lookup, stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1498,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_scalar_audit(log0, optimizer_scalar, named_param_lookup, stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
