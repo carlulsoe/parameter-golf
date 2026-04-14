@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+DEFAULT_TIED_EMBED_LR = 0.05
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -75,7 +77,7 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", DEFAULT_TIED_EMBED_LR))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1090,6 +1092,13 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not math.isfinite(args.tied_embed_lr) or args.tied_embed_lr <= 0.0:
+        raise ValueError(f"TIED_EMBED_LR must be positive and finite, got {args.tied_embed_lr}")
+    if not args.tie_embeddings and args.tied_embed_lr != DEFAULT_TIED_EMBED_LR:
+        raise ValueError(
+            "Non-default TIED_EMBED_LR requires TIE_EMBEDDINGS=1 because optimizer_tok "
+            "only owns the shared token/logit matrix in the tied regime"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
