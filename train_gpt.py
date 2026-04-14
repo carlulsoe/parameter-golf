@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", "0.95")))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1154,25 +1153,6 @@ def main() -> None:
     # TOKENIZER + VALIDATION METRIC SETUP
     # -----------------------------
 
-    for name, value in (
-        ("BETA1", args.beta1),
-        ("BETA2", args.beta2),
-        ("TOKEN_BETA2", args.token_beta2),
-        ("ADAM_EPS", args.adam_eps),
-    ):
-        if not math.isfinite(value):
-            raise ValueError(f"{name} must be finite, got {value}")
-    if not 0.0 <= args.beta1 < 1.0:
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not 0.0 <= args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not 0.0 <= args.token_beta2 < 1.0:
-        raise ValueError(f"TOKEN_BETA2 must be in [0, 1), got {args.token_beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 may differ from BETA2 only when TIE_EMBEDDINGS=1")
-
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1241,11 +1221,10 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1279,10 +1258,6 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"optimizer_adam_config: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"token_beta2:{args.token_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1294,38 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-
-    def log_optimizer_tok_audit(stage: str) -> None:
-        names: list[str] = []
-        missing_name_tensors = 0
-        tensor_count = 0
-        numel = 0
-        base_lrs: list[float] = []
-        lrs: list[float] = []
-        beta2s: list[float] = []
-        for group in optimizer_tok.param_groups:
-            base_lrs.append(float(group["base_lr"]))
-            lrs.append(float(group["lr"]))
-            beta2s.append(float(group["betas"][1]))
-            for param in group["params"]:
-                tensor_count += 1
-                numel += int(param.numel())
-                name = param_name_by_id.get(id(param))
-                if name is None:
-                    missing_name_tensors += 1
-                else:
-                    names.append(name)
-        log0(
-            f"optimizer_tok_audit: stage:{stage} optimizer:Adam scope:tied_shared_tok_emb_logit_group "
-            f"groups:{len(optimizer_tok.param_groups)} tensors:{tensor_count} numel:{numel} "
-            f"missing_name_tensors:{missing_name_tensors} "
-            f"names:{','.join(sorted(names)) if names else 'none'} "
-            f"base_lr_min:{min(base_lrs):.8f} base_lr_max:{max(base_lrs):.8f} "
-            f"lr_min:{min(lrs):.8f} lr_max:{max(lrs):.8f} "
-            f"beta2_min:{min(beta2s):.5f} beta2_max:{max(beta2s):.5f}"
-        )
-
-    log_optimizer_tok_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1377,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_tok_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1473,7 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log_optimizer_tok_audit("final")
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
