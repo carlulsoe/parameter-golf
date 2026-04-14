@@ -87,8 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    export_avg_every = int(os.environ.get("EXPORT_AVG_EVERY", 0))
-    export_avg_max_checkpoints = int(os.environ.get("EXPORT_AVG_MAX_CHECKPOINTS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -759,28 +757,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-def snapshot_state_dict_cpu(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    return {name: tensor.detach().to("cpu").contiguous().clone() for name, tensor in state_dict.items()}
-
-
-def average_state_dicts(state_dicts: list[dict[str, Tensor]]) -> dict[str, Tensor]:
-    if not state_dicts:
-        raise ValueError("average_state_dicts requires at least one checkpoint")
-    if len(state_dicts) == 1:
-        return snapshot_state_dict_cpu(state_dicts[0])
-
-    averaged: dict[str, Tensor] = {}
-    for name, ref in state_dicts[0].items():
-        if ref.is_floating_point():
-            acc = torch.zeros_like(ref, dtype=torch.float32)
-            for state in state_dicts:
-                acc.add_(state[name].to(dtype=torch.float32))
-            averaged[name] = acc.div_(len(state_dicts)).to(dtype=ref.dtype).contiguous()
-        else:
-            averaged[name] = ref.detach().clone()
-    return averaged
-
-
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1195,16 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.export_avg_every < 0:
-        raise ValueError(f"EXPORT_AVG_EVERY must be non-negative, got {args.export_avg_every}")
-    if args.export_avg_max_checkpoints < 0:
-        raise ValueError(
-            f"EXPORT_AVG_MAX_CHECKPOINTS must be non-negative, got {args.export_avg_max_checkpoints}"
-        )
-    if (args.export_avg_every > 0) != (args.export_avg_max_checkpoints > 0):
-        raise ValueError(
-            "EXPORT_AVG_EVERY and EXPORT_AVG_MAX_CHECKPOINTS must both be zero or both be positive"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1361,8 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    late_export_checkpoints: list[dict[str, Tensor]] = []
-    late_export_capture_steps: list[int] = []
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1431,12 +1395,6 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        if args.export_avg_every > 0 and step % args.export_avg_every == 0:
-            late_export_checkpoints.append(snapshot_state_dict_cpu(base_model.state_dict()))
-            late_export_capture_steps.append(step)
-            if len(late_export_checkpoints) > args.export_avg_max_checkpoints:
-                late_export_checkpoints.pop(0)
-                late_export_capture_steps.pop(0)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1461,12 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.export_avg_every > 0 and (not late_export_capture_steps or late_export_capture_steps[-1] != step):
-        late_export_checkpoints.append(snapshot_state_dict_cpu(base_model.state_dict()))
-        late_export_capture_steps.append(step)
-        if len(late_export_checkpoints) > args.export_avg_max_checkpoints:
-            late_export_checkpoints.pop(0)
-            late_export_capture_steps.pop(0)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1482,12 +1434,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    export_state_dict = snapshot_state_dict_cpu(base_model.state_dict())
-    export_mode = "raw"
-    if late_export_checkpoints:
-        export_state_dict = average_state_dicts(late_export_checkpoints)
-        export_mode = "late_avg"
-    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1577,16 +1524,6 @@ def main() -> None:
             f"used:{total_submission_bytes} "
             f"remaining:{size_headroom}"
         )
-        if args.export_avg_every > 0:
-            capture_steps = ",".join(str(capture_step) for capture_step in late_export_capture_steps) or "none"
-            log0(
-                "Export checkpoint averaging: "
-                f"mode:{export_mode} "
-                f"every:{args.export_avg_every} "
-                f"max_checkpoints:{args.export_avg_max_checkpoints} "
-                f"captured:{len(late_export_capture_steps)} "
-                f"steps:{capture_steps}"
-            )
 
     if distributed:
         dist.barrier()
