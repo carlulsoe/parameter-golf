@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    skip_beta1 = float(os.environ.get("SKIP_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1091,14 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not 0.0 <= args.beta1 < 1.0:
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not 0.0 <= args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not 0.0 <= args.skip_beta1 < 1.0:
-        raise ValueError(f"SKIP_BETA1 must be in [0, 1), got {args.skip_beta1}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1228,9 +1219,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    skip_param_names = ["skip_weights"] if base_model.skip_weights.numel() > 0 else []
-    split_skip_beta1 = bool(skip_param_names) and not math.isclose(args.skip_beta1, args.beta1)
-    if base_model.skip_weights.numel() > 0 and not split_skip_beta1:
+    if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1247,18 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
-    if split_skip_beta1:
-        scalar_param_groups.append(
-            {
-                "params": [base_model.skip_weights],
-                "lr": args.scalar_lr,
-                "base_lr": args.scalar_lr,
-                "betas": (args.skip_beta1, args.beta2),
-            }
-        )
     optimizer_scalar = torch.optim.Adam(
-        scalar_param_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1284,45 +1263,12 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"skip_beta1:{args.skip_beta1:.5f} adam_eps:{args.adam_eps:.2e}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-
-    def log_skip_beta1_audit(stage: str) -> None:
-        baseline_group = optimizer_scalar.param_groups[0]
-        baseline_tensors = len(baseline_group["params"])
-        baseline_numel = sum(int(p.numel()) for p in baseline_group["params"])
-        log0(
-            f"optimizer_scalar_groups stage:{stage} groups:{len(optimizer_scalar.param_groups)} "
-            f"baseline_betas:({baseline_group['betas'][0]:.5f},{baseline_group['betas'][1]:.5f}) "
-            f"baseline_tensors:{baseline_tensors} baseline_numel:{baseline_numel}"
-        )
-        if split_skip_beta1:
-            skip_group = optimizer_scalar.param_groups[1]
-            skip_numel = sum(int(p.numel()) for p in skip_group["params"])
-            log0(
-                f"optimizer_skip_scope stage:{stage} split_active:True "
-                f"skip_betas:({skip_group['betas'][0]:.5f},{skip_group['betas'][1]:.5f}) "
-                f"skip_tensors:{len(skip_group['params'])} skip_numel:{skip_numel} "
-                f"names:{','.join(skip_param_names)}"
-            )
-        else:
-            skip_numel = int(base_model.skip_weights.numel())
-            log0(
-                f"optimizer_skip_scope stage:{stage} split_active:False "
-                f"skip_betas:({args.beta1:.5f},{args.beta2:.5f}) "
-                f"skip_tensors:{len(skip_param_names)} skip_numel:{skip_numel} "
-                f"names:{','.join(skip_param_names)}"
-            )
-
-    log_skip_beta1_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1374,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_skip_beta1_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1474,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_skip_beta1_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
