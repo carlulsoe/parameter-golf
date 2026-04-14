@@ -612,3 +612,4 @@ iteration	timestamp	model	run_id	decision	commit	summary	findings
 611	2026-04-14T10:24:44+00:00	gpt-5.4	pgolf_0611	error	1464c48f3111c65332c631579b771a3dce30710e	experiment failed	remote training failed for run_id=pgolf_0611 with exit code 255
 612	2026-04-14T10:24:52+00:00	gpt-5.4	pgolf_0612	error	9ebc3ccfc235b497aa02f1dd89b8154b4f084b9e	experiment failed	remote training failed for run_id=pgolf_0612 with exit code 255
 613	2026-04-14T10:27:46+00:00	gpt-5.4	pgolf_0613	error	7fc1fc96039d9597b73464ca7ca454fb36308014	experiment failed	remote training failed for run_id=pgolf_0613 with exit code 255
+614	2026-04-14T10:29:20+00:00	gpt-5.4	pgolf_0614	error	46cb66f3b36aa735969aa2abb8983d0fe1de5f81	experiment failed	remote training failed for run_id=pgolf_0614 with exit code 255
