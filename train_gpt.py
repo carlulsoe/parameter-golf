@@ -58,6 +58,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    final_eval_audit_sliding_stride = int(os.environ.get("FINAL_EVAL_AUDIT_SLIDING_STRIDE", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -280,6 +281,158 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_partial_context_audit(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> dict[str, float]:
+    token_stride = args.final_eval_audit_sliding_stride
+    if token_stride <= 0:
+        raise ValueError(f"FINAL_EVAL_AUDIT_SLIDING_STRIDE must be positive, got {token_stride}")
+    if token_stride > args.eval_seq_len:
+        raise ValueError(
+            "FINAL_EVAL_AUDIT_SLIDING_STRIDE must be <= EVAL_SEQ_LEN, got "
+            f"{token_stride} > {args.eval_seq_len}"
+        )
+    if args.eval_seq_len % token_stride != 0:
+        raise ValueError(
+            "FINAL_EVAL_AUDIT_SLIDING_STRIDE must divide EVAL_SEQ_LEN for exact same-target "
+            f"chunk accounting, got FINAL_EVAL_AUDIT_SLIDING_STRIDE={token_stride}, EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.eval_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // args.eval_seq_len
+    total_target_tokens = val_tokens.numel() - 1
+    total_chunks = (total_target_tokens - args.eval_seq_len) // token_stride + 1
+    if total_chunks <= 0:
+        raise ValueError(
+            f"Validation split is too short for EVAL_SEQ_LEN={args.eval_seq_len} and "
+            f"FINAL_EVAL_AUDIT_SLIDING_STRIDE={token_stride}"
+        )
+    chunk_start = (total_chunks * rank) // world_size
+    chunk_end = (total_chunks * (rank + 1)) // world_size
+    audit_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    audit_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    audit_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    canonical_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    canonical_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    canonical_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    positions = torch.arange(args.eval_seq_len, device=device)
+
+    def accumulate_batch(
+        window_starts: list[int],
+        score_starts: list[int],
+        score_ends: list[int],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        local = torch.stack(
+            [
+                val_tokens[start : start + args.eval_seq_len + 1].to(
+                    device=device, dtype=torch.int64, non_blocking=True
+                )
+                for start in window_starts
+            ]
+        )
+        x = local[:, :-1]
+        y = local[:, 1:]
+        score_start_tensor = torch.tensor(score_starts, device=device, dtype=torch.int64)
+        score_end_tensor = torch.tensor(score_ends, device=device, dtype=torch.int64)
+        score_mask = (positions.unsqueeze(0) >= score_start_tensor.unsqueeze(1)) & (
+            positions.unsqueeze(0) < score_end_tensor.unsqueeze(1)
+        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            token_losses = model(x, y, reduction="none").detach().reshape(-1, args.eval_seq_len)
+        selected_losses = token_losses.masked_select(score_mask)
+        selected_prev_ids = x.masked_select(score_mask)
+        selected_tgt_ids = y.masked_select(score_mask)
+        token_bytes = base_bytes_lut[selected_tgt_ids].to(dtype=torch.int16)
+        token_bytes += (
+            has_leading_space_lut[selected_tgt_ids] & ~is_boundary_token_lut[selected_prev_ids]
+        ).to(dtype=torch.int16)
+        return (
+            selected_losses.to(torch.float64).sum(),
+            torch.tensor(float(selected_losses.numel()), device=device, dtype=torch.float64),
+            token_bytes.to(torch.float64).sum(),
+        )
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_chunk_start in range(chunk_start, chunk_end, local_batch_seqs):
+            batch_chunk_end = min(batch_chunk_start + local_batch_seqs, chunk_end)
+            chunk_ids = range(batch_chunk_start, batch_chunk_end)
+            chunk_ends = [args.eval_seq_len + chunk_id * token_stride for chunk_id in chunk_ids]
+
+            audit_starts = [chunk_end_pos - args.eval_seq_len for chunk_end_pos in chunk_ends]
+            batch_audit_loss, batch_audit_tokens, batch_audit_bytes = accumulate_batch(
+                audit_starts,
+                [args.eval_seq_len - token_stride] * len(chunk_ends),
+                [args.eval_seq_len] * len(chunk_ends),
+            )
+            audit_loss_sum += batch_audit_loss
+            audit_token_count += batch_audit_tokens
+            audit_byte_count += batch_audit_bytes
+
+            canonical_starts = [((chunk_end_pos - 1) // args.eval_seq_len) * args.eval_seq_len for chunk_end_pos in chunk_ends]
+            canonical_score_starts = [
+                chunk_end_pos - token_stride - block_start
+                for chunk_end_pos, block_start in zip(chunk_ends, canonical_starts, strict=True)
+            ]
+            canonical_score_ends = [
+                chunk_end_pos - block_start for chunk_end_pos, block_start in zip(chunk_ends, canonical_starts, strict=True)
+            ]
+            batch_canonical_loss, batch_canonical_tokens, batch_canonical_bytes = accumulate_batch(
+                canonical_starts,
+                canonical_score_starts,
+                canonical_score_ends,
+            )
+            canonical_loss_sum += batch_canonical_loss
+            canonical_token_count += batch_canonical_tokens
+            canonical_byte_count += batch_canonical_bytes
+
+    if dist.is_available() and dist.is_initialized():
+        for tensor in (
+            audit_loss_sum,
+            audit_token_count,
+            audit_byte_count,
+            canonical_loss_sum,
+            canonical_token_count,
+            canonical_byte_count,
+        ):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    audit_val_loss = audit_loss_sum / audit_token_count
+    audit_bits_per_token = audit_val_loss.item() / math.log(2.0)
+    audit_tokens_per_byte = audit_token_count.item() / audit_byte_count.item()
+    canonical_val_loss = canonical_loss_sum / canonical_token_count
+    canonical_bits_per_token = canonical_val_loss.item() / math.log(2.0)
+    canonical_tokens_per_byte = canonical_token_count.item() / canonical_byte_count.item()
+    model.train()
+    return {
+        "stride": float(token_stride),
+        "seq_len": float(args.eval_seq_len),
+        "scored_tokens": float(audit_token_count.item()),
+        "scored_bytes": float(audit_byte_count.item()),
+        "scored_fraction": float(audit_token_count.item() / total_target_tokens),
+        "subset_prefix_tokens_dropped": float(args.eval_seq_len - token_stride),
+        "calibration_mode": float(token_stride == args.eval_seq_len),
+        "canonical_subset_val_loss": float(canonical_val_loss.item()),
+        "canonical_subset_val_bpb": float(canonical_bits_per_token * canonical_tokens_per_byte),
+        "audit_partial_context_val_loss": float(audit_val_loss.item()),
+        "audit_partial_context_val_bpb": float(audit_bits_per_token * audit_tokens_per_byte),
+    }
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1053,7 +1206,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1077,7 +1230,9 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction={reduction}")
+        return F.cross_entropy(logits.float(), targets, reduction=reduction)
 
 
 # -----------------------------
@@ -1171,6 +1326,11 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.final_eval_audit_sliding_stride < 0:
+        raise ValueError(
+            "FINAL_EVAL_AUDIT_SLIDING_STRIDE must be non-negative, got "
+            f"{args.final_eval_audit_sliding_stride}"
+        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1268,6 +1428,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.final_eval_audit_sliding_stride > 0:
+        log0(
+            "final_eval_audit_mode:partial_context_same_target_suffix "
+            f"final_eval_audit_sliding_stride:{args.final_eval_audit_sliding_stride}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1551,6 +1716,35 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.final_eval_audit_sliding_stride > 0:
+        audit_metrics = eval_val_partial_context_audit(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0(
+            "final_int8_zlib_roundtrip_partial_context_audit: "
+            f"stride:{int(audit_metrics['stride'])} "
+            f"seq_len:{int(audit_metrics['seq_len'])} "
+            f"calibration_mode:{bool(int(audit_metrics['calibration_mode']))} "
+            f"scored_tokens:{int(audit_metrics['scored_tokens'])} "
+            f"scored_bytes:{int(audit_metrics['scored_bytes'])} "
+            f"scored_fraction:{audit_metrics['scored_fraction']:.8f} "
+            f"subset_prefix_tokens_dropped:{int(audit_metrics['subset_prefix_tokens_dropped'])} "
+            f"canonical_subset_val_loss:{audit_metrics['canonical_subset_val_loss']:.8f} "
+            f"canonical_subset_val_bpb:{audit_metrics['canonical_subset_val_bpb']:.8f} "
+            f"audit_partial_context_val_loss:{audit_metrics['audit_partial_context_val_loss']:.8f} "
+            f"audit_partial_context_val_bpb:{audit_metrics['audit_partial_context_val_bpb']:.8f} "
+            f"delta_val_loss:{audit_metrics['audit_partial_context_val_loss'] - audit_metrics['canonical_subset_val_loss']:.8f} "
+            f"delta_val_bpb:{audit_metrics['audit_partial_context_val_bpb'] - audit_metrics['canonical_subset_val_bpb']:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
