@@ -83,9 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_momentum_tail_start_step = int(os.environ.get("MUON_MOMENTUM_TAIL_START_STEP", -1))
-    muon_momentum_tail_steps = int(os.environ.get("MUON_MOMENTUM_TAIL_STEPS", 0))
-    muon_momentum_tail_target = float(os.environ.get("MUON_MOMENTUM_TAIL_TARGET", 0.95))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -541,19 +538,6 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "extra_raw_bytes": sum(int(item["extra_raw_bytes"]) for item in results),
         "candidate_summary": candidate_summary,
     }
-
-def muon_baseline_momentum_for_step(args: Hyperparameters, applied_step: int) -> float:
-    frac = min(applied_step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-def muon_momentum_for_step(args: Hyperparameters, applied_step: int) -> tuple[float, float, bool]:
-    baseline = muon_baseline_momentum_for_step(args, applied_step)
-    if args.muon_momentum_tail_steps <= 0 or args.muon_momentum_tail_start_step < 0:
-        return baseline, baseline, False
-    tail_end_step = args.muon_momentum_tail_start_step + args.muon_momentum_tail_steps
-    if args.muon_momentum_tail_start_step <= applied_step < tail_end_step:
-        return args.muon_momentum_tail_target, baseline, True
-    return baseline, baseline, False
 
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
@@ -1285,28 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.muon_momentum_tail_steps < 0:
-        raise ValueError(f"MUON_MOMENTUM_TAIL_STEPS must be non-negative, got {args.muon_momentum_tail_steps}")
-    if args.muon_momentum_tail_steps > 0 and args.muon_momentum_tail_start_step < 0:
-        raise ValueError(
-            "MUON_MOMENTUM_TAIL_START_STEP must be non-negative when MUON_MOMENTUM_TAIL_STEPS is positive"
-        )
-    if not 0.0 <= args.muon_momentum_tail_target < 1.0:
-        raise ValueError(f"MUON_MOMENTUM_TAIL_TARGET must be in [0, 1), got {args.muon_momentum_tail_target}")
-    if args.muon_momentum_tail_steps > 0:
-        tail_end_step = args.muon_momentum_tail_start_step + args.muon_momentum_tail_steps
-        tail_start_baseline = muon_baseline_momentum_for_step(args, args.muon_momentum_tail_start_step)
-        tail_exit_baseline = muon_baseline_momentum_for_step(args, tail_end_step)
-        log0(
-            "muon_momentum_tail_schedule: "
-            "step_semantics:applied_step_zero_based "
-            f"start_step:{args.muon_momentum_tail_start_step} "
-            f"tail_steps:{args.muon_momentum_tail_steps} "
-            f"end_step_exclusive:{tail_end_step} "
-            f"target:{args.muon_momentum_tail_target:.5f} "
-            f"tail_start_baseline:{tail_start_baseline:.5f} "
-            f"tail_exit_baseline:{tail_exit_baseline:.5f}"
-        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1417,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum, baseline_muon_momentum, muon_tail_active = muon_momentum_for_step(args, step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1440,9 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"muon_momentum:{muon_momentum:.5f} baseline_muon_momentum:{baseline_muon_momentum:.5f} "
-                f"muon_tail_active:{muon_tail_active}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1458,28 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    completed_updates = step
-    tail_updates_completed = 0
-    last_applied_muon_momentum = 0.0
-    if completed_updates > 0:
-        last_applied_muon_momentum = muon_momentum_for_step(args, completed_updates - 1)[0]
-    if args.muon_momentum_tail_steps > 0:
-        tail_end_step = args.muon_momentum_tail_start_step + args.muon_momentum_tail_steps
-        tail_updates_completed = max(
-            min(completed_updates, tail_end_step)
-            - args.muon_momentum_tail_start_step,
-            0,
-        )
-        log0(
-            "muon_momentum_tail_audit: "
-            "step_semantics:applied_step_zero_based "
-            f"completed_updates:{completed_updates} "
-            f"start_step:{args.muon_momentum_tail_start_step} "
-            f"tail_steps:{args.muon_momentum_tail_steps} "
-            f"tail_updates_completed:{tail_updates_completed} "
-            f"tail_end_step_exclusive:{tail_end_step} "
-            f"last_applied_muon_momentum:{last_applied_muon_momentum:.5f}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
