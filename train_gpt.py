@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_lr_mult = float(os.environ.get("SCALAR_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.scalar_lr_mult <= 0.0:
+        raise ValueError(f"SCALAR_LR_MULT must be positive, got {args.scalar_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1221,6 +1224,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    param_name_lookup = {id(param): name for name, param in base_model.named_parameters()}
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,13 +1240,15 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_lr = args.scalar_lr * args.scalar_lr_mult
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [{"params": scalar_params, "lr": scalar_lr, "base_lr": scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_head: torch.optim.Optimizer | None = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1269,6 +1275,42 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+
+    def optimizer_group_lr(optimizer: torch.optim.Optimizer | None) -> tuple[float, float]:
+        if optimizer is None or not optimizer.param_groups:
+            return 0.0, 0.0
+        group = optimizer.param_groups[0]
+        return float(group.get("base_lr", group["lr"])), float(group["lr"])
+
+    def log_optimizer_lrs(stage: str) -> None:
+        tok_base_lr, tok_lr = optimizer_group_lr(optimizer_tok)
+        head_base_lr, head_lr = optimizer_group_lr(optimizer_head)
+        matrix_base_lr, matrix_lr_live = optimizer_group_lr(optimizer_muon)
+        scalar_base_lr, scalar_lr_live = optimizer_group_lr(optimizer_scalar)
+        log0(
+            "optimizer_lr_groups "
+            f"stage:{stage} "
+            f"scalar_lr_mult:{args.scalar_lr_mult:.5f} "
+            f"tok_base_lr:{tok_base_lr:.8f} tok_lr:{tok_lr:.8f} "
+            f"head_base_lr:{head_base_lr:.8f} head_lr:{head_lr:.8f} "
+            f"matrix_base_lr:{matrix_base_lr:.8f} matrix_lr:{matrix_lr_live:.8f} "
+            f"scalar_base_lr:{scalar_base_lr:.8f} scalar_lr:{scalar_lr_live:.8f}"
+        )
+
+    def log_scalar_scope(stage: str) -> None:
+        scalar_group = optimizer_scalar.param_groups[0] if optimizer_scalar.param_groups else {"params": []}
+        scalar_names = [param_name_lookup.get(id(param), "<unknown>") for param in scalar_group["params"]]
+        scalar_numel = sum(int(param.numel()) for param in scalar_group["params"])
+        log0(
+            "optimizer_scalar_scope "
+            f"stage:{stage} "
+            f"tensors:{len(scalar_names)} "
+            f"numel:{scalar_numel} "
+            f"names:{','.join(scalar_names)}"
+        )
+
+    log_optimizer_lrs("startup")
+    log_scalar_scope("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1362,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_lrs("post_restore_startup")
+        log_scalar_scope("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1352,7 +1396,10 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1403,7 +1450,10 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1469,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_lrs("final")
+    log_scalar_scope("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
