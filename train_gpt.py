@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -539,6 +540,57 @@ def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, obj
         "candidate_summary": candidate_summary,
     }
 
+def init_ema_state_dict(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], int]:
+    ema_state: dict[str, Tensor] = {}
+    float_param_count = 0
+    for name, tensor in state_dict.items():
+        if tensor.is_floating_point():
+            ema_state[name] = tensor.detach().float().clone()
+            float_param_count += int(tensor.numel())
+    return ema_state, float_param_count
+
+@torch.no_grad()
+def update_ema_state_dict(ema_state: dict[str, Tensor], state_dict: dict[str, Tensor], decay: float) -> None:
+    one_minus_decay = 1.0 - decay
+    for name, tensor in state_dict.items():
+        if tensor.is_floating_point():
+            ema_state[name].lerp_(tensor.detach().float(), one_minus_decay)
+
+def export_state_dict_with_ema(state_dict: dict[str, Tensor], ema_state: dict[str, Tensor]) -> dict[str, Tensor]:
+    export_state: dict[str, Tensor] = {}
+    for name, tensor in state_dict.items():
+        out = tensor.detach().clone()
+        if tensor.is_floating_point():
+            out = ema_state[name].to(device=tensor.device, dtype=tensor.dtype).contiguous()
+        export_state[name] = out
+    return export_state
+
+def ema_audit_stats(ema_state: dict[str, Tensor], state_dict: dict[str, Tensor]) -> dict[str, object]:
+    float_tensors = 0
+    float_params = 0
+    sum_abs_delta = 0.0
+    max_tensor_mean_abs_delta = 0.0
+    max_tensor_name = ""
+    for name, tensor in state_dict.items():
+        if not tensor.is_floating_point():
+            continue
+        delta = (ema_state[name] - tensor.detach().float()).abs()
+        tensor_mean_abs_delta = float(delta.mean().item())
+        sum_abs_delta += float(delta.sum().item())
+        float_tensors += 1
+        float_params += int(tensor.numel())
+        if tensor_mean_abs_delta >= max_tensor_mean_abs_delta:
+            max_tensor_mean_abs_delta = tensor_mean_abs_delta
+            max_tensor_name = name
+    mean_abs_delta = sum_abs_delta / max(float_params, 1)
+    return {
+        "float_tensors": float_tensors,
+        "float_params": float_params,
+        "mean_abs_delta": mean_abs_delta,
+        "max_tensor_mean_abs_delta": max_tensor_mean_abs_delta,
+        "max_tensor_name": max_tensor_name,
+    }
+
 def score_keep_float_candidate(name: str, t: Tensor) -> dict[str, object]:
     # Keep selector scoring on the baseline fp16-scale quantized path so export
     # ablations on still-quantized tensors do not also change the selector.
@@ -608,7 +660,7 @@ def select_auto_keep_float_tensor(state_dict: dict[str, Tensor]) -> dict[str, ob
     )
     return best
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], selector_state_dict: dict[str, Tensor] | None = None):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -620,7 +672,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
-    auto_keep = select_auto_keep_float_tensor(state_dict)
+    selector_source = selector_state_dict if selector_state_dict is not None else state_dict
+    auto_keep = select_auto_keep_float_tensor(selector_source)
     keep_float_fp32_audit = audit_keep_float_fp32_family(state_dict)
     selected_auto_keep_name = ""
     if auto_keep is not None:
@@ -1157,6 +1210,8 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1327,6 +1382,15 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_state: dict[str, Tensor] | None = None
+    ema_float_param_count = 0
+    if args.ema_decay > 0.0:
+        ema_state, ema_float_param_count = init_ema_state_dict(base_model.state_dict())
+        log0(
+            f"ema_export:enabled decay:{args.ema_decay:.8f} "
+            f"float_tensors:{len(ema_state)} float_params:{ema_float_param_count} "
+            f"selector_source:raw_weights export_source:ema_weights"
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1392,6 +1456,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state is not None:
+            update_ema_state_dict(ema_state, base_model.state_dict(), args.ema_decay)
         zero_grad_all()
 
         step += 1
@@ -1427,14 +1493,30 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        raw_state_dict = base_model.state_dict()
+        export_state_dict = export_state_dict_with_ema(raw_state_dict, ema_state) if ema_state is not None else raw_state_dict
+        torch.save(export_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+    else:
+        raw_state_dict = base_model.state_dict()
+        export_state_dict = export_state_dict_with_ema(raw_state_dict, ema_state) if ema_state is not None else raw_state_dict
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    if ema_state is not None:
+        ema_stats = ema_audit_stats(ema_state, raw_state_dict)
+        log0(
+            "ema_export_audit: "
+            f"decay:{args.ema_decay:.8f} updates:{step} "
+            f"float_tensors:{ema_stats['float_tensors']} float_params:{ema_stats['float_params']} "
+            f"mean_abs_delta:{ema_stats['mean_abs_delta']:.8e} "
+            f"max_tensor:{ema_stats['max_tensor_name'] or 'none'} "
+            f"max_tensor_mean_abs_delta:{ema_stats['max_tensor_mean_abs_delta']:.8e}"
+        )
+
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict, selector_state_dict=raw_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
