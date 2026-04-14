@@ -58,8 +58,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
-    train_shard_shuffle = bool(int(os.environ.get("TRAIN_SHARD_SHUFFLE", "0")))
-    train_shard_shuffle_seed = int(os.environ.get("TRAIN_SHARD_SHUFFLE_SEED", seed))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -783,22 +781,16 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str, shuffle_files: bool = False, shuffle_seed: int = 0):
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.shuffle_files = shuffle_files
-        self.rng = random.Random(shuffle_seed)
-        if self.shuffle_files and len(self.files) > 1:
-            self.rng.shuffle(self.files)
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0 and self.shuffle_files and len(self.files) > 1:
-            self.rng.shuffle(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -820,19 +812,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(
-        self,
-        pattern: str,
-        rank: int,
-        world_size: int,
-        device: torch.device,
-        shuffle_files: bool = False,
-        shuffle_seed: int = 0,
-    ):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, shuffle_files=shuffle_files, shuffle_seed=shuffle_seed)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1192,16 +1176,7 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    train_loader_preview = [Path(p) for p in sorted(glob.glob(args.train_files))]
-    if args.train_shard_shuffle and len(train_loader_preview) > 1:
-        preview_rng = random.Random(args.train_shard_shuffle_seed)
-        preview_rng.shuffle(train_loader_preview)
-    shard_preview = ",".join(path.name for path in train_loader_preview[: min(3, len(train_loader_preview))])
-    log0(
-        f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files} "
-        f"shard_shuffle:{args.train_shard_shuffle} shard_shuffle_seed:{args.train_shard_shuffle_seed} "
-        f"shard_preview:{shard_preview}"
-    )
+    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
@@ -1299,14 +1274,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(
-        args.train_files,
-        rank,
-        world_size,
-        device,
-        shuffle_files=args.train_shard_shuffle,
-        shuffle_seed=args.train_shard_shuffle_seed,
-    )
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1351,14 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(
-            args.train_files,
-            rank,
-            world_size,
-            device,
-            shuffle_files=args.train_shard_shuffle,
-            shuffle_seed=args.train_shard_shuffle_seed,
-        )
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
