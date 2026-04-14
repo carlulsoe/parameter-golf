@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    control_beta2 = float(os.environ.get("CONTROL_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -856,6 +857,68 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def is_control_param_name(name: str) -> bool:
+    return any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+
+
+def named_param_group_summary(named_params: list[tuple[str, nn.Parameter]]) -> dict[str, object]:
+    names = [name for name, _ in named_params]
+    return {
+        "tensor_count": len(named_params),
+        "numel": sum(int(param.numel()) for _, param in named_params),
+        "names": ",".join(names) if names else "none",
+    }
+
+
+def log_scalar_optimizer_audit(
+    log0,
+    optimizer_scalar: torch.optim.Optimizer,
+    stage: str,
+    scalar_optimizer_mode: str,
+    control_named_params: list[tuple[str, nn.Parameter]],
+    low_dim_named_params: list[tuple[str, nn.Parameter]],
+    configured_control_beta2: float,
+    configured_low_dim_beta2: float,
+) -> None:
+    param_beta2_by_id: dict[int, float] = {}
+    for group in optimizer_scalar.param_groups:
+        beta2 = float(group["betas"][1])
+        for param in group["params"]:
+            param_beta2_by_id[id(param)] = beta2
+
+    control_summary = named_param_group_summary(control_named_params)
+    low_dim_summary = named_param_group_summary(low_dim_named_params)
+
+    def live_beta2(named_params: list[tuple[str, nn.Parameter]], fallback: float) -> float:
+        if not named_params:
+            return fallback
+        values = {param_beta2_by_id[id(param)] for _, param in named_params}
+        if len(values) != 1:
+            raise RuntimeError(f"Expected one beta2 value for scalar audit stage={stage}, got {sorted(values)}")
+        return float(next(iter(values)))
+
+    control_beta2 = live_beta2(control_named_params, configured_control_beta2)
+    low_dim_beta2 = live_beta2(low_dim_named_params, configured_low_dim_beta2)
+    log0(
+        "optimizer_scalar_audit "
+        f"stage:{stage} "
+        f"mode:{scalar_optimizer_mode} "
+        f"param_groups:{len(optimizer_scalar.param_groups)} "
+        f"control_beta2:{control_beta2:.5f} "
+        f"control_tensors:{control_summary['tensor_count']} "
+        f"control_numel:{control_summary['numel']} "
+        f"low_dim_beta2:{low_dim_beta2:.5f} "
+        f"low_dim_tensors:{low_dim_summary['tensor_count']} "
+        f"low_dim_numel:{low_dim_summary['numel']}"
+    )
+    log0(
+        "optimizer_scalar_names "
+        f"stage:{stage} "
+        f"control:{control_summary['names']} "
+        f"low_dim:{low_dim_summary['names']}"
+    )
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1089,6 +1152,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not 0.0 <= args.control_beta2 < 1.0:
+        raise ValueError(f"CONTROL_BETA2 must be in [0, 1), got {args.control_beta2}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1212,15 +1277,19 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and not is_control_param_name(name)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or is_control_param_name(name)
     ]
+    control_named_params = [(name, p) for name, p in scalar_named_params if is_control_param_name(name)]
+    low_dim_named_params = [(name, p) for name, p in scalar_named_params if not is_control_param_name(name)]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        control_named_params.append(("skip_weights", base_model.skip_weights))
+        scalar_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_optimizer_mode = "combined" if args.control_beta2 == args.beta2 else "split_control_beta2"
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1305,39 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_param_groups = []
+    if scalar_optimizer_mode == "combined":
+        scalar_param_groups.append(
+            {
+                "params": [param for _, param in scalar_named_params],
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "group_name": "scalar_combined",
+            }
+        )
+    else:
+        if control_named_params:
+            scalar_param_groups.append(
+                {
+                    "params": [param for _, param in control_named_params],
+                    "lr": args.scalar_lr,
+                    "base_lr": args.scalar_lr,
+                    "group_name": "scalar_control",
+                    "betas": (args.beta1, args.control_beta2),
+                }
+            )
+        if low_dim_named_params:
+            scalar_param_groups.append(
+                {
+                    "params": [param for _, param in low_dim_named_params],
+                    "lr": args.scalar_lr,
+                    "base_lr": args.scalar_lr,
+                    "group_name": "scalar_low_dim",
+                    "betas": (args.beta1, args.beta2),
+                }
+            )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1261,6 +1361,16 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log_scalar_optimizer_audit(
+        log0,
+        optimizer_scalar,
+        stage="startup",
+        scalar_optimizer_mode=scalar_optimizer_mode,
+        control_named_params=control_named_params,
+        low_dim_named_params=low_dim_named_params,
+        configured_control_beta2=args.control_beta2,
+        configured_low_dim_beta2=args.beta2,
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1320,6 +1430,16 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_scalar_optimizer_audit(
+            log0,
+            optimizer_scalar,
+            stage="post_warmup_restore",
+            scalar_optimizer_mode=scalar_optimizer_mode,
+            control_named_params=control_named_params,
+            low_dim_named_params=low_dim_named_params,
+            configured_control_beta2=args.control_beta2,
+            configured_low_dim_beta2=args.beta2,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1538,16 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log_scalar_optimizer_audit(
+        log0,
+        optimizer_scalar,
+        stage="final",
+        scalar_optimizer_mode=scalar_optimizer_mode,
+        control_named_params=control_named_params,
+        low_dim_named_params=low_dim_named_params,
+        configured_control_beta2=args.control_beta2,
+        configured_low_dim_beta2=args.beta2,
     )
 
     # -----------------------------
