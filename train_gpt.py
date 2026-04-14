@@ -325,16 +325,6 @@ INT8_MIN_CLIP_NAME_VALUE_OVERRIDES = tuple(
     for entry in os.environ.get("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES", "").split(",")
     if entry.strip()
 )
-INT8_MIN_CLIP_AUDIT_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get("INT8_MIN_CLIP_AUDIT_NAME_PATTERNS", "").split(",")
-    if pattern
-)
-INT8_MIN_CLIP_AUDIT_VALUES = tuple(
-    entry.strip()
-    for entry in os.environ.get("INT8_MIN_CLIP_AUDIT_VALUES", "").split(",")
-    if entry.strip()
-)
 INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS", "").split(",")
@@ -346,7 +336,6 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     if pattern
 )
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
-INT8_MIN_CLIP_AUDIT_LOG_TOPK = int(os.environ.get("INT8_MIN_CLIP_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
@@ -355,18 +344,6 @@ INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT8_BASELINE_MIN_CLIP = 1.0
 SUBMISSION_SIZE_CAP_BYTES = int(os.environ.get("SUBMISSION_SIZE_CAP_BYTES", 16_000_000))
-INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN = float(
-    os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN", 0.0)
-)
-INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS = int(
-    os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS", 1)
-)
-INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN = float(
-    os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN", 0.0)
-)
-INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN = float(
-    os.environ.get("INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN", 0.0)
-)
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_TENSOR_GAIN", 0.0)
 )
@@ -392,22 +369,6 @@ for pattern, value in INT8_MIN_CLIP_NAME_VALUE_PAIRS:
         raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES entries must use non-empty pattern:value pairs")
     if value <= 0.0:
         raise ValueError("INT8_MIN_CLIP_NAME_VALUE_OVERRIDES values must be strictly positive")
-
-int8_min_clip_audit_values: list[float] = []
-for entry in INT8_MIN_CLIP_AUDIT_VALUES:
-    value = float(entry)
-    if value <= 0.0:
-        raise ValueError("INT8_MIN_CLIP_AUDIT_VALUES entries must be strictly positive")
-    int8_min_clip_audit_values.append(value)
-INT8_MIN_CLIP_AUDIT_VALUE_LIST: tuple[float, ...] = tuple(int8_min_clip_audit_values)
-if INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN < 0.0:
-    raise ValueError("INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN must be non-negative")
-if INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS < 0:
-    raise ValueError("INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS must be non-negative")
-if INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN < 0.0:
-    raise ValueError("INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN must be non-negative")
-if INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN < 0.0:
-    raise ValueError("INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN must be non-negative")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -505,121 +466,6 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
-
-def audit_min_clip_candidates(
-    state_dict: dict[str, Tensor],
-    selected_auto_keep_name: str,
-) -> dict[str, object] | None:
-    if not INT8_MIN_CLIP_AUDIT_NAME_PATTERNS or not INT8_MIN_CLIP_AUDIT_VALUE_LIST:
-        return None
-    matched_tensors: list[dict[str, object]] = []
-    baseline_values: set[float] = set()
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        if (
-            not t.is_floating_point()
-            or t.ndim != 2
-            or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL
-            or matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
-            or name == selected_auto_keep_name
-            or not matches_name_patterns(name, INT8_MIN_CLIP_AUDIT_NAME_PATTERNS)
-        ):
-            continue
-        scale_dtype = int8_scale_dtype_for_tensor(name, t)
-        baseline_min_clip_value = int8_min_clip_value_for_tensor(name, t)
-        q_base, s_base = quantize_float_tensor(
-            name,
-            t,
-            scale_dtype=scale_dtype,
-            min_clip_value=baseline_min_clip_value,
-        )
-        baseline_values.add(float(baseline_min_clip_value))
-        matched_tensors.append(
-            {
-                "name": name,
-                "tensor": t,
-                "scale_dtype": scale_dtype,
-                "baseline_min_clip_value": float(baseline_min_clip_value),
-                "baseline_error": normalized_mae(t, dequantize_quantized_tensor(q_base, s_base, dtype=t.dtype)),
-            }
-        )
-    if not matched_tensors:
-        return {
-            "tensor_count": 0,
-            "candidate_count": 0,
-            "baseline_label": "none",
-            "selected": "none",
-            "selected_improved_tensor_count": 0,
-            "selected_mean_gain": 0.0,
-            "selected_median_gain": 0.0,
-            "candidate_summary": "",
-        }
-    candidate_results: list[dict[str, object]] = []
-    for min_clip_value in INT8_MIN_CLIP_AUDIT_VALUE_LIST:
-        gains: list[float] = []
-        improved_tensor_count = 0
-        for item in matched_tensors:
-            t = item["tensor"]
-            q_alt, s_alt = quantize_float_tensor(
-                str(item["name"]),
-                t,
-                scale_dtype=item["scale_dtype"],
-                min_clip_value=min_clip_value,
-            )
-            alt_error = normalized_mae(t, dequantize_quantized_tensor(q_alt, s_alt, dtype=t.dtype))
-            gain = float(item["baseline_error"]) - alt_error
-            gains.append(gain)
-            if gain >= INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN:
-                improved_tensor_count += 1
-        mean_gain = float(sum(gains) / len(gains)) if gains else 0.0
-        median_gain = median_float(gains)
-        passes = (
-            improved_tensor_count >= INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS
-            and mean_gain >= INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN
-            and median_gain >= INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN
-        )
-        candidate_results.append(
-            {
-                "min_clip_value": float(min_clip_value),
-                "improved_tensor_count": improved_tensor_count,
-                "mean_gain": mean_gain,
-                "median_gain": median_gain,
-                "passes": passes,
-            }
-        )
-    ranked = sorted(
-        candidate_results,
-        key=lambda item: (
-            int(bool(item["passes"])),
-            int(item["improved_tensor_count"]),
-            float(item["mean_gain"]),
-            float(item["median_gain"]),
-            float(item["min_clip_value"]),
-        ),
-        reverse=True,
-    )
-    passing = [item for item in ranked if bool(item["passes"])]
-    selected = passing[0] if passing else None
-    baseline_label = "mixed:" + ",".join(f"{value:.5f}" for value in sorted(baseline_values))
-    if len(baseline_values) == 1:
-        baseline_label = f"{next(iter(baseline_values)):.5f}"
-    return {
-        "tensor_count": len(matched_tensors),
-        "candidate_count": len(candidate_results),
-        "baseline_label": baseline_label,
-        "selected": f"{float(selected['min_clip_value']):.5f}" if selected is not None else "none",
-        "selected_improved_tensor_count": int(selected["improved_tensor_count"]) if selected is not None else 0,
-        "selected_mean_gain": float(selected["mean_gain"]) if selected is not None else 0.0,
-        "selected_median_gain": float(selected["median_gain"]) if selected is not None else 0.0,
-        "candidate_summary": ",".join(
-            (
-                f"{float(item['min_clip_value']):.5f}|improved={int(item['improved_tensor_count'])}|"
-                f"mean={float(item['mean_gain']):.8f}|median={float(item['median_gain']):.8f}|"
-                f"passes={int(bool(item['passes']))}"
-                for item in ranked[: max(INT8_MIN_CLIP_AUDIT_LOG_TOPK, 0)]
-            )
-        ),
-    }
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -775,11 +621,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
     auto_keep = select_auto_keep_float_tensor(state_dict)
+    keep_float_fp32_audit = audit_keep_float_fp32_family(state_dict)
     selected_auto_keep_name = ""
     if auto_keep is not None:
         selected_auto_keep_name = str(auto_keep["selected_name"])
-    min_clip_audit = audit_min_clip_candidates(state_dict, selected_auto_keep_name)
-    keep_float_fp32_audit = audit_keep_float_fp32_family(state_dict)
     stats = dict.fromkeys(
         (
             "param_count",
@@ -811,22 +656,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["auto_keep_keep_payload_bytes"] - stats["auto_keep_quantized_payload_bytes"]
     )
     stats["auto_keep_top_candidates_summary"] = str(auto_keep["top_candidates_summary"]) if auto_keep is not None else ""
-    stats["min_clip_audit_tensor_count"] = int(min_clip_audit["tensor_count"]) if min_clip_audit is not None else 0
-    stats["min_clip_audit_candidate_count"] = int(min_clip_audit["candidate_count"]) if min_clip_audit is not None else 0
-    stats["min_clip_audit_baseline_label"] = str(min_clip_audit["baseline_label"]) if min_clip_audit is not None else "none"
-    stats["min_clip_audit_selected"] = str(min_clip_audit["selected"]) if min_clip_audit is not None else "none"
-    stats["min_clip_audit_selected_improved_tensor_count"] = (
-        int(min_clip_audit["selected_improved_tensor_count"]) if min_clip_audit is not None else 0
-    )
-    stats["min_clip_audit_selected_mean_gain"] = (
-        float(min_clip_audit["selected_mean_gain"]) if min_clip_audit is not None else 0.0
-    )
-    stats["min_clip_audit_selected_median_gain"] = (
-        float(min_clip_audit["selected_median_gain"]) if min_clip_audit is not None else 0.0
-    )
-    stats["min_clip_audit_candidate_summary"] = (
-        str(min_clip_audit["candidate_summary"]) if min_clip_audit is not None else ""
-    )
     stats["keep_float_fp32_audit_matched_tensor_count"] = (
         int(keep_float_fp32_audit["matched_tensor_count"]) if keep_float_fp32_audit is not None else 0
     )
@@ -1653,30 +1482,6 @@ def main() -> None:
                 f"baseline:{INT8_BASELINE_MIN_CLIP:.5f} "
                 f"overrides:{override_summary}"
             )
-        if INT8_MIN_CLIP_AUDIT_NAME_PATTERNS:
-            audit_summary = ",".join(INT8_MIN_CLIP_AUDIT_NAME_PATTERNS)
-            candidate_values = ",".join(f"{value:.5f}" for value in INT8_MIN_CLIP_AUDIT_VALUE_LIST)
-            log0(
-                "Int8 min-clip audit: "
-                f"baseline:{quant_stats['min_clip_audit_baseline_label']} "
-                f"tensors:{quant_stats['min_clip_audit_tensor_count']} "
-                f"candidates:{quant_stats['min_clip_audit_candidate_count']} "
-                f"selected:{quant_stats['min_clip_audit_selected']} "
-                f"patterns:{audit_summary} "
-                f"values:{candidate_values}"
-            )
-            log0(
-                "Int8 min-clip thresholds: "
-                f"min_tensor_gain:{INT8_MIN_CLIP_AUDIT_MIN_TENSOR_GAIN:.8f} "
-                f"min_improved_tensors:{INT8_MIN_CLIP_AUDIT_MIN_IMPROVED_TENSORS} "
-                f"min_mean_gain:{INT8_MIN_CLIP_AUDIT_MIN_MEAN_GAIN:.8f} "
-                f"min_median_gain:{INT8_MIN_CLIP_AUDIT_MIN_MEDIAN_GAIN:.8f} "
-                f"selected_improved:{quant_stats['min_clip_audit_selected_improved_tensor_count']} "
-                f"selected_mean_gain:{quant_stats['min_clip_audit_selected_mean_gain']:.8f} "
-                f"selected_median_gain:{quant_stats['min_clip_audit_selected_median_gain']:.8f}"
-            )
-            if quant_stats["min_clip_audit_candidate_summary"]:
-                log0(f"Int8 min-clip candidates: {quant_stats['min_clip_audit_candidate_summary']}")
         if INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS:
             override_summary = ",".join(INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS)
             log0(
