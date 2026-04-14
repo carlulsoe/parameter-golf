@@ -1091,9 +1091,6 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    if not math.isfinite(args.matrix_lr) or args.matrix_lr <= 0.0:
-        raise ValueError(f"MATRIX_LR must be positive and finite, got {args.matrix_lr}")
-
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
@@ -1212,7 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1256,29 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_muon_audit(stage: str) -> None:
-        tensors = 0
-        numel = 0
-        ordered_names: list[str] = []
-        for group in optimizer_muon.param_groups:
-            for param in group["params"]:
-                tensors += 1
-                numel += int(param.numel())
-                ordered_names.append(param_name_by_id.get(id(param), "<unknown>"))
-        names_summary = ",".join(ordered_names)
-        if len(names_summary) > 512:
-            names_summary = names_summary[:509] + "..."
-        log0(
-            "optimizer_muon audit: "
-            f"stage:{stage} optimizer:Muon groups:{len(optimizer_muon.param_groups)} "
-            f"scope:block_matrix_params tensors:{tensors} numel:{numel} "
-            f"base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
-            f"lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
-            f"momentum:{optimizer_muon.param_groups[0]['momentum']:.8f} "
-            f"backend_steps:{optimizer_muon.param_groups[0]['backend_steps']} "
-            f"group0_names:{names_summary}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1289,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log_muon_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1347,7 +1319,6 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        log_muon_audit("post_restore_startup")
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1448,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_muon_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
