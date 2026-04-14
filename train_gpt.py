@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    control_grad_clip_norm = float(os.environ.get("CONTROL_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,14 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.control_grad_clip_norm < 0:
+        raise ValueError(
+            f"CONTROL_GRAD_CLIP_NORM must be non-negative, got {args.control_grad_clip_norm}"
+        )
+    if args.grad_clip_norm > 0 and args.control_grad_clip_norm > 0:
+        raise ValueError("GRAD_CLIP_NORM and CONTROL_GRAD_CLIP_NORM are mutually exclusive")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1209,6 +1218,11 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    control_named_params = [
+        (f"blocks.{name}", p)
+        for name, p in block_named_params
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1219,8 +1233,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    control_params = [p for _, p in control_named_params]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        control_named_params.append(("skip_weights", base_model.skip_weights))
+        control_params.append(base_model.skip_weights)
+    if args.control_grad_clip_norm > 0 and not control_params:
+        raise ValueError("CONTROL_GRAD_CLIP_NORM requires at least one matched control tensor")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1262,6 +1281,17 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_clipping: grad_clip_norm:{args.grad_clip_norm:.8f} "
+        f"control_grad_clip_norm:{args.control_grad_clip_norm:.8f}"
+    )
+    if control_named_params:
+        control_param_numel = sum(int(p.numel()) for _, p in control_named_params)
+        control_param_names = ",".join(name for name, _ in control_named_params)
+        log0(
+            f"optimizer_control_scope stage:startup tensors:{len(control_named_params)} "
+            f"numel:{control_param_numel} names:{control_param_names}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1350,13 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if control_named_params:
+            control_param_numel = sum(int(p.numel()) for _, p in control_named_params)
+            control_param_names = ",".join(name for name, _ in control_named_params)
+            log0(
+                f"optimizer_control_scope stage:post_restore_startup tensors:{len(control_named_params)} "
+                f"numel:{control_param_numel} names:{control_param_names}"
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1331,6 +1368,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    control_grad_clip_steps = 0
+    control_grad_norm: Tensor | None = None
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1390,6 +1429,11 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        elif args.control_grad_clip_norm > 0:
+            control_grad_norm = torch.nn.utils.clip_grad_norm_(control_params, args.control_grad_clip_norm)
+            control_grad_clip_steps += 1
+        else:
+            control_grad_norm = None
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1401,10 +1445,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_log = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if control_grad_norm is not None:
+                train_log += f" control_grad_norm:{float(control_grad_norm.item()):.8f}"
+            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1466,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if control_named_params:
+        control_param_numel = sum(int(p.numel()) for _, p in control_named_params)
+        control_param_names = ",".join(name for name, _ in control_named_params)
+        log0(
+            f"optimizer_control_scope stage:final tensors:{len(control_named_params)} "
+            f"numel:{control_param_numel} clip_steps:{control_grad_clip_steps} "
+            f"names:{control_param_names}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
