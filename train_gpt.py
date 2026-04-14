@@ -60,8 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    train_shard_audit = bool(int(os.environ.get("TRAIN_SHARD_AUDIT", "0")))
-    train_shard_audit_offsets = os.environ.get("TRAIN_SHARD_AUDIT_OFFSETS", "")
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -780,78 +778,19 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def get_data_shard_num_tokens(file: Path) -> int:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    return num_tokens
-
-
-def parse_int_csv(value: str) -> tuple[int, ...]:
-    items: list[int] = []
-    for raw_part in value.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        item = int(part)
-        if item < 0:
-            raise ValueError(f"Expected non-negative shard offset, got {item}")
-        items.append(item)
-    return tuple(items)
-
-
-def cyclic_interval_overlap(total: int, start_a: int, len_a: int, start_b: int, len_b: int) -> int:
-    if total <= 0:
-        raise ValueError(f"Expected positive total cycle length, got {total}")
-    if len_a < 0 or len_b < 0:
-        raise ValueError(f"Interval lengths must be non-negative, got {len_a} and {len_b}")
-
-    def unwrap(start: int, length: int) -> list[tuple[int, int]]:
-        if length == 0:
-            return []
-        if length >= total:
-            return [(0, total)]
-        end = start + length
-        if end <= total:
-            return [(start, end)]
-        return [(start, total), (0, end - total)]
-
-    overlap = 0
-    for a0, a1 in unwrap(start_a % total, len_a):
-        for b0, b1 in unwrap(start_b % total, len_b):
-            overlap += max(0, min(a1, b1) - max(a0, b0))
-    return overlap
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str, audit: bool = False):
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_token_counts = [get_data_shard_num_tokens(file) for file in self.files] if audit else []
-        self.total_cycle_tokens = sum(self.file_token_counts) if audit else 0
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.audit = audit
-        self.audit_tokens_per_file = [0] * len(self.files)
-        self.audit_total_tokens = 0
-        self.audit_wraps = 0
-        self.audit_first_file_idx: int | None = None
-        self.audit_last_file_idx: int | None = None
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.audit_wraps += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -865,39 +804,19 @@ class TokenStream:
                 continue
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
-            if self.audit and k > 0:
-                if self.audit_first_file_idx is None:
-                    self.audit_first_file_idx = self.file_idx
-                self.audit_last_file_idx = self.file_idx
-                self.audit_tokens_per_file[self.file_idx] += k
-                self.audit_total_tokens += k
             self.pos += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def audit_state(self) -> dict[str, object]:
-        touched = [idx for idx, count in enumerate(self.audit_tokens_per_file) if count > 0]
-        return {
-            "total_cycle_tokens": self.total_cycle_tokens,
-            "total_tokens": self.audit_total_tokens,
-            "wraps": self.audit_wraps,
-            "distinct_shards": len(touched),
-            "first_shard_idx": -1 if self.audit_first_file_idx is None else self.audit_first_file_idx,
-            "last_shard_idx": -1 if self.audit_last_file_idx is None else self.audit_last_file_idx,
-            "current_shard_idx": self.file_idx,
-            "current_shard_pos": self.pos,
-            "touched_shards": tuple(touched),
-        }
 
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, audit: bool = False):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, audit=audit)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1252,7 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    train_shard_audit_offsets = parse_int_csv(args.train_shard_audit_offsets) if args.train_shard_audit else ()
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1260,11 +1178,6 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    if args.train_shard_audit:
-        log0(
-            f"train_shard_audit:enabled offsets:{','.join(str(x) for x in train_shard_audit_offsets) or 'none'} "
-            f"warmup_resets_measured_loader:{args.warmup_steps > 0}"
-        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1361,7 +1274,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, audit=args.train_shard_audit)
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1406,7 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, audit=args.train_shard_audit)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1506,48 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.train_shard_audit:
-        audit = train_loader.stream.audit_state()
-        measured_tokens = int(audit["total_tokens"])
-        total_cycle_tokens = int(audit["total_cycle_tokens"])
-        stream_tokens_per_batch = (
-            (args.train_batch_tokens // (world_size * grad_accum_steps)) + 1
-        ) * world_size
-        warmup_tokens = args.warmup_steps * grad_accum_steps * stream_tokens_per_batch
-        warmup_replay_tokens = min(warmup_tokens, measured_tokens)
-        touched_shards = audit["touched_shards"]
-        shard_list = ",".join(str(idx) for idx in touched_shards[:8])
-        if len(touched_shards) > 8:
-            shard_list += ",..."
-        prefix_fraction = measured_tokens / max(total_cycle_tokens, 1)
-        log0(
-            "train_shard_audit_summary: "
-            f"measured_tokens:{measured_tokens} total_cycle_tokens:{total_cycle_tokens} "
-            f"dataset_fraction:{prefix_fraction:.8f} distinct_shards:{audit['distinct_shards']} "
-            f"first_shard:{audit['first_shard_idx']} last_shard:{audit['last_shard_idx']} "
-            f"wraps:{audit['wraps']} current_shard:{audit['current_shard_idx']} current_pos:{audit['current_shard_pos']} "
-            f"touched_shards:{shard_list or 'none'}"
-        )
-        log0(
-            "train_shard_audit_warmup_overlap: "
-            f"warmup_tokens:{warmup_tokens} replayed_measured_tokens:{warmup_replay_tokens} "
-            f"replayed_fraction_of_measured:{(warmup_replay_tokens / max(measured_tokens, 1)):.8f}"
-        )
-        if train_shard_audit_offsets:
-            shard_token_counts = train_loader.stream.file_token_counts
-            shard_starts = [0]
-            for count in shard_token_counts[:-1]:
-                shard_starts.append(shard_starts[-1] + count)
-            counterfactual_parts = []
-            for offset in train_shard_audit_offsets:
-                start_shard = offset % len(shard_token_counts)
-                start_token = shard_starts[start_shard]
-                overlap_tokens = cyclic_interval_overlap(total_cycle_tokens, 0, measured_tokens, start_token, measured_tokens)
-                overlap_fraction = overlap_tokens / max(measured_tokens, 1)
-                counterfactual_parts.append(
-                    f"offset:{offset} start_shard:{start_shard} overlap_tokens:{overlap_tokens} overlap_fraction:{overlap_fraction:.8f}"
-                )
-            log0("train_shard_audit_counterfactuals: " + " | ".join(counterfactual_parts))
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
