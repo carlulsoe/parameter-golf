@@ -1090,8 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not math.isfinite(args.qk_gain_init) or args.qk_gain_init <= 0.0:
-        raise ValueError(f"QK_GAIN_INIT must be positive and finite, got {args.qk_gain_init}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1204,24 +1202,6 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-
-    def log_q_gain_audit(stage: str) -> None:
-        q_gain_tensors = [
-            param.detach().float().reshape(-1).cpu()
-            for name, param in base_model.named_parameters()
-            if name.endswith("q_gain")
-        ]
-        if not q_gain_tensors:
-            log0(f"q_gain_audit stage:{stage} configured_qk_gain_init:{args.qk_gain_init:.8f} tensors:0 params:0")
-            return
-        q_gain_flat = torch.cat(q_gain_tensors)
-        log0(
-            f"q_gain_audit stage:{stage} configured_qk_gain_init:{args.qk_gain_init:.8f} "
-            f"tensors:{len(q_gain_tensors)} params:{q_gain_flat.numel()} "
-            f"mean:{q_gain_flat.mean().item():.8f} min:{q_gain_flat.min().item():.8f} max:{q_gain_flat.max().item():.8f}"
-        )
-
-    log_q_gain_audit(stage="startup")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1341,8 +1321,6 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    log_q_gain_audit(stage="post_restore_startup")
-
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1441,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_q_gain_audit(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
