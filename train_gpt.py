@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    resid_mix_beta1 = float(os.environ.get("RESID_MIX_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1171,6 +1172,15 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    for beta_name, beta_value in (
+        ("BETA1", args.beta1),
+        ("BETA2", args.beta2),
+        ("RESID_MIX_BETA1", args.resid_mix_beta1),
+    ):
+        if not (0.0 <= beta_value < 1.0):
+            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1209,16 +1219,24 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    resid_mix_beta1_active = args.resid_mix_beta1 != args.beta1
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    scalar_params: list[nn.Parameter] = []
+    resid_mix_params: list[nn.Parameter] = []
+    resid_mix_names: list[str] = []
+    for name, p in block_named_params:
+        is_scalar_param = p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if not is_scalar_param:
+            continue
+        if resid_mix_beta1_active and name.endswith("resid_mix"):
+            resid_mix_params.append(p)
+            resid_mix_names.append(f"blocks.{name}")
+            continue
+        scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1242,7 +1260,18 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_resid_mix = None
+    optimizer_head = None
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
+    if resid_mix_params:
+        optimizer_resid_mix = torch.optim.Adam(
+            [{"params": resid_mix_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.resid_mix_beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_resid_mix)
+    optimizers.append(optimizer_scalar)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1251,6 +1280,35 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    def optimizer_betas_string(opt: torch.optim.Optimizer | None) -> str:
+        if opt is None:
+            return "inactive"
+        if not opt.param_groups:
+            return "empty"
+        beta1, beta2 = opt.param_groups[0]["betas"]
+        return f"({beta1:.5f},{beta2:.5f})"
+
+    def log_optimizer_audits(stage: str) -> None:
+        log0(
+            "optimizer_betas "
+            f"stage:{stage} "
+            f"tok:{optimizer_betas_string(optimizer_tok)} "
+            f"head:{optimizer_betas_string(optimizer_head)} "
+            f"scalar:{optimizer_betas_string(optimizer_scalar)} "
+            f"resid_mix:{optimizer_betas_string(optimizer_resid_mix)}"
+        )
+        log0(
+            "optimizer_scalar_groups "
+            f"stage:{stage} "
+            f"resid_mix_split_active:{bool(resid_mix_params)} "
+            f"scalar_tensors:{len(scalar_params)} "
+            f"scalar_numel:{sum(int(p.numel()) for p in scalar_params)} "
+            f"resid_mix_tensors:{len(resid_mix_params)} "
+            f"resid_mix_numel:{sum(int(p.numel()) for p in resid_mix_params)}"
+        )
+        if resid_mix_names:
+            log0(f"optimizer_resid_mix_names stage:{stage} names:{','.join(resid_mix_names)}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1269,6 +1327,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        "optimizer_beta_config "
+        f"beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"resid_mix_beta1:{args.resid_mix_beta1:.5f} adam_eps:{args.adam_eps:.8f}"
+    )
+    log_optimizer_audits("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1384,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_audits("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1484,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_audits("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
