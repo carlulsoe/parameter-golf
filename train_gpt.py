@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,14 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not (0.0 < args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in (0, 1), got {args.beta1}")
-    if not (0.0 < args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in (0, 1), got {args.beta2}")
-    if not (0.0 < args.token_beta2 < 1.0):
-        raise ValueError(f"TOKEN_BETA2 must be in (0, 1), got {args.token_beta2}")
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 requires TIE_EMBEDDINGS=1 so the ablation stays on the shared token/logit path")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1147,37 +1138,6 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
-
-    def log_optimizer_adam_config(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        tok_beta1, tok_beta2 = tok_group["betas"]
-        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
-        head_beta1 = head_beta2 = 0.0
-        head_eps = 0.0
-        if base_model.lm_head is not None:
-            head_group = optimizer_head.param_groups[0]
-            head_beta1, head_beta2 = head_group["betas"]
-            head_eps = float(head_group["eps"])
-        log0(
-            "optimizer_adam_config "
-            f"stage:{stage} "
-            f"beta1:{tok_beta1:.5f} "
-            f"token_beta2:{tok_beta2:.5f} "
-            f"scalar_beta2:{scalar_beta2:.5f} "
-            f"head_beta2:{head_beta2:.5f} "
-            f"token_eps:{float(tok_group['eps']):.8f} "
-            f"scalar_eps:{float(optimizer_scalar.param_groups[0]['eps']):.8f} "
-            f"head_eps:{head_eps:.8f}"
-        )
-        log0(
-            "optimizer_tok_scope "
-            f"stage:{stage} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            "scope:tied_only "
-            f"tensors:{len(tok_group['params'])} "
-            f"numel:{sum(int(p.numel()) for p in tok_group['params'])} "
-            "names:tok_emb.weight"
-        )
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -1264,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1300,8 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"beta1:{args.beta1} beta2:{args.beta2} token_beta2:{args.token_beta2}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1310,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_optimizer_adam_config(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1362,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_adam_config(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1462,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_adam_config(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
