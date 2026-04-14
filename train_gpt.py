@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    token_adam_eps = float(os.environ.get("TOKEN_ADAM_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1172,12 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.token_adam_eps <= 0.0:
-        raise ValueError(f"TOKEN_ADAM_EPS must be positive, got {args.token_adam_eps}")
-    if args.token_adam_eps != args.adam_eps and not args.tie_embeddings:
-        raise ValueError("TOKEN_ADAM_EPS override requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1232,7 +1225,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.token_adam_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1259,29 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_optimizer_adam_state(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        scalar_group = optimizer_scalar.param_groups[0]
-        head_group = optimizer_head.param_groups[0] if base_model.lm_head is not None else None
-        head_eps = f"{head_group['eps']:.8g}" if head_group is not None else "inactive"
-        head_betas = (
-            f"({head_group['betas'][0]:.5f},{head_group['betas'][1]:.5f})" if head_group is not None else "inactive"
-        )
-        log0(
-            "optimizer_adam_eps "
-            f"stage:{stage} "
-            f"tok_eps:{tok_group['eps']:.8g} tok_betas:({tok_group['betas'][0]:.5f},{tok_group['betas'][1]:.5f}) "
-            f"scalar_eps:{scalar_group['eps']:.8g} scalar_betas:({scalar_group['betas'][0]:.5f},{scalar_group['betas'][1]:.5f}) "
-            f"head_eps:{head_eps} head_betas:{head_betas}"
-        )
-        log0(
-            "optimizer_tok_scope "
-            f"stage:{stage} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_only'} "
-            "tensors:1 names:tok_emb.weight"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1298,12 +1268,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"optimizer_adam_eps_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"adam_eps:{args.adam_eps:.8g} token_adam_eps:{args.token_adam_eps:.8g}"
-    )
     log0(f"seed:{args.seed}")
-    log_optimizer_adam_state("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1355,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_adam_state("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1455,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_adam_state("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
