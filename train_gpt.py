@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    attn_scale_beta2 = float(os.environ.get("ATTN_SCALE_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1172,12 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    for beta_name in ("beta1", "beta2", "attn_scale_beta2"):
-        beta_value = getattr(args, beta_name)
-        if not math.isfinite(beta_value) or not (0.0 <= beta_value < 1.0):
-            raise ValueError(f"{beta_name.upper()} must be finite and in [0, 1), got {beta_value}")
-    if not math.isfinite(args.adam_eps) or args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be finite and positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1215,24 +1208,19 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    attn_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith(".attn_scale")]
-    attn_scale_params = [p for _, p in attn_scale_named_params]
-    split_attn_scale_beta2 = args.attn_scale_beta2 != args.beta2
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and (not split_attn_scale_beta2 or not name.endswith(".attn_scale"))
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    scalar_params = [p for _, p in scalar_named_params]
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1254,17 +1242,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_attn_scale = None
-    if split_attn_scale_beta2:
-        optimizer_attn_scale = torch.optim.Adam(
-            [{"params": attn_scale_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.attn_scale_beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_attn_scale is not None:
-        optimizers.append(optimizer_attn_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1273,50 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    def count_numel(params: list[Tensor]) -> int:
-        return sum(int(p.numel()) for p in params)
-
-    def format_betas(opt: torch.optim.Optimizer | None, inactive_label: str = "(inactive)") -> str:
-        if opt is None:
-            return inactive_label
-        betas = opt.param_groups[0].get("betas")
-        if betas is None:
-            return "(none)"
-        beta1, beta2 = betas
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def log_optimizer_audits(stage: str) -> None:
-        scalar_group = optimizer_scalar.param_groups[0]
-        attn_scale_group = optimizer_attn_scale.param_groups[0] if optimizer_attn_scale is not None else None
-        attn_scale_lr = float(attn_scale_group["lr"]) if attn_scale_group is not None else 0.0
-        attn_scale_base_lr = float(attn_scale_group["base_lr"]) if attn_scale_group is not None else 0.0
-        log0(
-            "optimizer_betas "
-            f"stage:{stage} "
-            f"tok:{format_betas(optimizer_tok)} "
-            f"scalar:{format_betas(optimizer_scalar)} "
-            f"attn_scale:{format_betas(optimizer_attn_scale, inactive_label='(merged)')} "
-            f"head:{format_betas(optimizer_head if base_model.lm_head is not None else None)}"
-        )
-        log0(
-            "optimizer_scalar_groups "
-            f"stage:{stage} "
-            f"attn_scale_split_active:{split_attn_scale_beta2} "
-            f"scalar_tensors:{len(scalar_named_params)} "
-            f"scalar_numel:{count_numel(scalar_params)} "
-            f"attn_scale_tensors:{len(attn_scale_named_params)} "
-            f"attn_scale_numel:{count_numel(attn_scale_params)} "
-            f"scalar_lr:{float(scalar_group['lr']):.8f} "
-            f"scalar_base_lr:{float(scalar_group['base_lr']):.8f} "
-            f"attn_scale_lr:{attn_scale_lr:.8f} "
-            f"attn_scale_base_lr:{attn_scale_base_lr:.8f}"
-        )
-        if split_attn_scale_beta2:
-            log0(
-                "optimizer_attn_scale_names "
-                + " ".join(name for name, _ in attn_scale_named_params)
-            )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1329,18 +1263,12 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        "optimizer_beta_config "
-        f"beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"attn_scale_beta2:{args.attn_scale_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_optimizer_audits("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1392,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_audits("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1492,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_audits("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
