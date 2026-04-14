@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1265,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(f"ema:enabled={args.ema_decay > 0.0} decay:{args.ema_decay:.5f}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1283,17 +1279,6 @@ def main() -> None:
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-    ema_state: dict[str, Tensor] | None = None
-    ema_named_params: list[tuple[str, nn.Parameter]] = []
-    ema_updates = 0
-    ema_param_l1_delta = 0.0
-    if args.ema_decay > 0.0:
-        ema_named_params = [(name, param) for name, param in base_model.named_parameters() if param.is_floating_point()]
-        ema_state = {
-            name: param.detach().float().clone()
-            for name, param in ema_named_params
-        }
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1409,14 +1394,6 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        if ema_state is not None:
-            with torch.no_grad():
-                one_minus_decay = 1.0 - args.ema_decay
-                for name, param in ema_named_params:
-                    ema_tensor = ema_state[name]
-                    ema_tensor.lerp_(param.detach().float(), one_minus_decay)
-                ema_updates += 1
-
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1456,19 +1433,6 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
-
-    if ema_state is not None:
-        with torch.no_grad():
-            for name, param in ema_named_params:
-                ema_tensor = ema_state[name]
-                ema_param_l1_delta += float((param.detach().float() - ema_tensor).abs().mean().item())
-                param.copy_(ema_tensor.to(device=param.device, dtype=param.dtype))
-        log0(
-            f"ema_audit: decay:{args.ema_decay:.5f} "
-            f"updates:{ema_updates} "
-            f"float_tensors:{len(ema_state)} "
-            f"mean_abs_param_delta_sum:{ema_param_l1_delta:.8f}"
-        )
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
