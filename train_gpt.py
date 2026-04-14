@@ -1171,6 +1171,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1253,6 +1255,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    grad_clip_tensor_count = sum(1 for _ in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1267,6 +1270,14 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        "optimizer_clipping: "
+        f"grad_clip_norm:{args.grad_clip_norm:.5f} "
+        f"scope:global_measured_training_only "
+        f"tensors:{grad_clip_tensor_count} "
+        f"numel:{n_params} "
+        f"norm_logging:{'existing_train_logs_only' if args.grad_clip_norm > 0 else 'disabled'}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1331,6 +1342,9 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    clip_last_grad_norm = torch.zeros((), device=device)
+    clip_max_grad_norm = torch.zeros((), device=device)
+    clip_trigger_count = torch.zeros((), device=device, dtype=torch.int32)
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1388,8 +1402,12 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        clip_grad_norm_value: Tensor | None = None
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            clip_grad_norm_value = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm).detach()
+            clip_last_grad_norm.copy_(clip_grad_norm_value)
+            clip_max_grad_norm.copy_(torch.maximum(clip_max_grad_norm, clip_grad_norm_value))
+            clip_trigger_count.add_((clip_grad_norm_value > args.grad_clip_norm).to(torch.int32))
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1401,10 +1419,17 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_log = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if clip_grad_norm_value is not None:
+                clip_grad_norm_scalar = float(clip_grad_norm_value.item())
+                train_log += (
+                    f" grad_norm:{clip_grad_norm_scalar:.5f} "
+                    f"clipped:{int(clip_grad_norm_scalar > args.grad_clip_norm)}"
+                )
+            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1444,21 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.grad_clip_norm > 0:
+        clip_trigger_count_value = int(clip_trigger_count.item())
+        log0(
+            "grad_clip_audit: "
+            f"threshold:{args.grad_clip_norm:.5f} "
+            f"scope:global_measured_training_only "
+            f"tensors:{grad_clip_tensor_count} "
+            f"numel:{n_params} "
+            f"completed_updates:{step} "
+            f"clipped_steps:{clip_trigger_count_value} "
+            f"clipped_fraction:{(clip_trigger_count_value / max(step, 1)):.5f} "
+            f"max_grad_norm:{clip_max_grad_norm.item():.5f} "
+            f"last_grad_norm:{clip_last_grad_norm.item():.5f} "
+            f"norm_logging:existing_train_logs_only"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
