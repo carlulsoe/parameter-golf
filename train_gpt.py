@@ -757,26 +757,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-def build_runtime_metadata(args: Hyperparameters) -> dict[str, float]:
-    logit_softcap = float(args.logit_softcap)
-    if not math.isfinite(logit_softcap) or logit_softcap <= 0.0:
-        raise ValueError(f"LOGIT_SOFTCAP must be positive and finite, got {logit_softcap}")
-    return {"logit_softcap": logit_softcap}
-
-
-def load_runtime_metadata(obj: dict[str, object]) -> dict[str, float]:
-    raw_metadata = obj.get("runtime_metadata")
-    if not isinstance(raw_metadata, dict):
-        raise ValueError("Serialized int8 artifact is missing runtime_metadata")
-    raw_logit_softcap = raw_metadata.get("logit_softcap")
-    if not isinstance(raw_logit_softcap, (int, float)):
-        raise ValueError("Serialized int8 artifact runtime_metadata.logit_softcap must be numeric")
-    logit_softcap = float(raw_logit_softcap)
-    if not math.isfinite(logit_softcap) or logit_softcap <= 0.0:
-        raise ValueError(f"Serialized int8 artifact has invalid logit_softcap {logit_softcap}")
-    return {"logit_softcap": logit_softcap}
-
-
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1454,9 +1434,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    runtime_metadata = build_runtime_metadata(args)
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_obj["runtime_metadata"] = runtime_metadata
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1537,11 +1515,6 @@ def main() -> None:
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(
-            "Int8 runtime metadata: "
-            f"configured_logit_softcap:{args.logit_softcap:.8f} "
-            f"exported_logit_softcap:{runtime_metadata['logit_softcap']:.8f}"
-        )
         total_submission_bytes = quant_file_bytes + code_bytes
         size_headroom = SUBMISSION_SIZE_CAP_BYTES - total_submission_bytes
         log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
@@ -1557,36 +1530,12 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    restored_runtime_metadata = load_runtime_metadata(quant_state)
-    eval_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=restored_runtime_metadata["logit_softcap"],
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
-    for module in eval_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(eval_model)
-    eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    log0(
-        "Int8 runtime metadata restored: "
-        f"configured_logit_softcap:{args.logit_softcap:.8f} "
-        f"artifact_logit_softcap:{restored_runtime_metadata['logit_softcap']:.8f} "
-        f"fresh_model_logit_softcap:{eval_model.logit_softcap:.8f}"
-    )
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        eval_model,
+        model,
         rank,
         world_size,
         device,
