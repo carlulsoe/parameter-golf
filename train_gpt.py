@@ -856,6 +856,17 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def summarize_q_gain_params(module: nn.Module) -> tuple[int, int, float, float, float]:
+    values: list[Tensor] = []
+    for name, param in module.named_parameters():
+        if name.endswith("q_gain"):
+            values.append(param.detach().float().reshape(-1).cpu())
+    if not values:
+        return 0, 0, 0.0, 0.0, 0.0
+    merged = torch.cat(values)
+    return len(values), int(merged.numel()), float(merged.mean().item()), float(merged.min().item()), float(merged.max().item())
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1157,6 +1168,8 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    if not math.isfinite(args.qk_gain_init) or args.qk_gain_init <= 0.0:
+        raise ValueError(f"QK_GAIN_INIT must be positive and finite, got {args.qk_gain_init}")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1269,6 +1282,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    q_gain_tensor_count, q_gain_param_count, q_gain_mean, q_gain_min, q_gain_max = summarize_q_gain_params(base_model)
+    log0(
+        "q_gain_audit: "
+        f"stage:startup configured_qk_gain_init:{args.qk_gain_init:.8f} "
+        f"tensors:{q_gain_tensor_count} params:{q_gain_param_count} "
+        f"mean:{q_gain_mean:.8f} min:{q_gain_min:.8f} max:{q_gain_max:.8f}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1340,13 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        q_gain_tensor_count, q_gain_param_count, q_gain_mean, q_gain_min, q_gain_max = summarize_q_gain_params(base_model)
+        log0(
+            "q_gain_audit: "
+            f"stage:post_restore configured_qk_gain_init:{args.qk_gain_init:.8f} "
+            f"tensors:{q_gain_tensor_count} params:{q_gain_param_count} "
+            f"mean:{q_gain_mean:.8f} min:{q_gain_min:.8f} max:{q_gain_max:.8f}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1445,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    q_gain_tensor_count, q_gain_param_count, q_gain_mean, q_gain_min, q_gain_max = summarize_q_gain_params(base_model)
+    log0(
+        "q_gain_audit: "
+        f"stage:final configured_qk_gain_init:{args.qk_gain_init:.8f} "
+        f"tensors:{q_gain_tensor_count} params:{q_gain_param_count} "
+        f"mean:{q_gain_mean:.8f} min:{q_gain_min:.8f} max:{q_gain_max:.8f}"
     )
 
     # -----------------------------
