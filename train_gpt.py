@@ -856,6 +856,51 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def summarize_param_names(names: list[str], limit: int = 8) -> str:
+    ordered = sorted(names)
+    if len(ordered) <= limit:
+        return ",".join(ordered)
+    return ",".join(ordered[:limit]) + f",...(+{len(ordered) - limit})"
+
+
+def audit_optimizer_group(
+    optimizer: torch.optim.Optimizer,
+    param_name_map: dict[int, str],
+) -> dict[str, object]:
+    names: list[str] = []
+    tensor_count = 0
+    numel = 0
+    base_lrs: list[float] = []
+    lrs: list[float] = []
+    beta1 = 0.0
+    beta2 = 0.0
+    adam_eps = 0.0
+    for group in optimizer.param_groups:
+        base_lrs.append(float(group.get("base_lr", group["lr"])))
+        lrs.append(float(group["lr"]))
+        if "betas" in group:
+            beta1, beta2 = (float(group["betas"][0]), float(group["betas"][1]))
+        if "eps" in group:
+            adam_eps = float(group["eps"])
+        for param in group["params"]:
+            tensor_count += 1
+            numel += int(param.numel())
+            names.append(param_name_map.get(id(param), "<unknown>"))
+    return {
+        "tensor_count": tensor_count,
+        "numel": numel,
+        "base_lr_min": min(base_lrs) if base_lrs else 0.0,
+        "base_lr_max": max(base_lrs) if base_lrs else 0.0,
+        "lr_min": min(lrs) if lrs else 0.0,
+        "lr_max": max(lrs) if lrs else 0.0,
+        "beta1": beta1,
+        "beta2": beta2,
+        "adam_eps": adam_eps,
+        "sample_names": summarize_param_names(names),
+        "contains_skip_weights": "skip_weights" in names,
+    }
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1089,6 +1134,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not math.isfinite(args.scalar_lr) or args.scalar_lr <= 0.0:
+        raise ValueError(f"SCALAR_LR must be positive and finite, got {args.scalar_lr}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1208,6 +1255,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    param_name_map = {id(param): name for name, param in base_model.named_parameters()}
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1261,6 +1309,17 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    scalar_audit = audit_optimizer_group(optimizer_scalar, param_name_map)
+    log0(
+        "optimizer_scalar_audit: "
+        "stage:startup optimizer:Adam scope:block_scalar_control_params "
+        f"tensors:{scalar_audit['tensor_count']} numel:{scalar_audit['numel']} "
+        f"base_lr_min:{scalar_audit['base_lr_min']:.8f} base_lr_max:{scalar_audit['base_lr_max']:.8f} "
+        f"lr_min:{scalar_audit['lr_min']:.8f} lr_max:{scalar_audit['lr_max']:.8f} "
+        f"beta1:{scalar_audit['beta1']:.5f} beta2:{scalar_audit['beta2']:.5f} "
+        f"adam_eps:{scalar_audit['adam_eps']:.8f} contains_skip_weights:{scalar_audit['contains_skip_weights']} "
+        f"sample_names:{scalar_audit['sample_names']}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1320,6 +1379,17 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        scalar_audit = audit_optimizer_group(optimizer_scalar, param_name_map)
+        log0(
+            "optimizer_scalar_audit: "
+            "stage:post_restore_startup optimizer:Adam scope:block_scalar_control_params "
+            f"tensors:{scalar_audit['tensor_count']} numel:{scalar_audit['numel']} "
+            f"base_lr_min:{scalar_audit['base_lr_min']:.8f} base_lr_max:{scalar_audit['base_lr_max']:.8f} "
+            f"lr_min:{scalar_audit['lr_min']:.8f} lr_max:{scalar_audit['lr_max']:.8f} "
+            f"beta1:{scalar_audit['beta1']:.5f} beta2:{scalar_audit['beta2']:.5f} "
+            f"adam_eps:{scalar_audit['adam_eps']:.8f} contains_skip_weights:{scalar_audit['contains_skip_weights']} "
+            f"sample_names:{scalar_audit['sample_names']}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1488,17 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    scalar_audit = audit_optimizer_group(optimizer_scalar, param_name_map)
+    log0(
+        "optimizer_scalar_audit: "
+        "stage:final optimizer:Adam scope:block_scalar_control_params "
+        f"tensors:{scalar_audit['tensor_count']} numel:{scalar_audit['numel']} "
+        f"base_lr_min:{scalar_audit['base_lr_min']:.8f} base_lr_max:{scalar_audit['base_lr_max']:.8f} "
+        f"lr_min:{scalar_audit['lr_min']:.8f} lr_max:{scalar_audit['lr_max']:.8f} "
+        f"beta1:{scalar_audit['beta1']:.5f} beta2:{scalar_audit['beta2']:.5f} "
+        f"adam_eps:{scalar_audit['adam_eps']:.8f} contains_skip_weights:{scalar_audit['contains_skip_weights']} "
+        f"sample_names:{scalar_audit['sample_names']}"
     )
 
     # -----------------------------
