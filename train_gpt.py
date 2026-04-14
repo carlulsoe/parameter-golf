@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    mlp_scale_lr_mult = float(os.environ.get("MLP_SCALE_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1091,8 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if args.mlp_scale_lr_mult < 0.0:
-        raise ValueError(f"MLP_SCALE_LR_MULT must be non-negative, got {args.mlp_scale_lr_mult}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1212,25 +1209,18 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    block_named_params = [(f"blocks.{name}", p) for name, p in block_named_params]
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    scalar_param_names_by_id = {id(p): name for name, p in scalar_named_params}
-    mlp_scale_named_params = [(name, p) for name, p in scalar_named_params if name.endswith(".mlp_scale")]
-    default_scalar_named_params = [(name, p) for name, p in scalar_named_params if not name.endswith(".mlp_scale")]
-    mlp_scale_split_active = args.mlp_scale_lr_mult != 1.0
-    if mlp_scale_split_active and not mlp_scale_named_params:
-        raise RuntimeError("MLP_SCALE_LR_MULT is active but no blocks.*.mlp_scale tensors were found")
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1246,18 +1236,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar_groups = [{"params": [p for _, p in scalar_named_params], "lr": args.scalar_lr, "base_lr": args.scalar_lr, "role": "default"}]
-    if mlp_scale_split_active:
-        optimizer_scalar_groups = [
-            {"params": [p for _, p in default_scalar_named_params], "lr": args.scalar_lr, "base_lr": args.scalar_lr, "role": "default"},
-            {
-                "params": [p for _, p in mlp_scale_named_params],
-                "lr": args.scalar_lr * args.mlp_scale_lr_mult,
-                "base_lr": args.scalar_lr * args.mlp_scale_lr_mult,
-                "role": "mlp_scale",
-            },
-        ]
-    optimizer_scalar = torch.optim.Adam(optimizer_scalar_groups, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1276,8 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1299,66 +1282,6 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    expected_scalar_names = sorted(scalar_param_names_by_id.values())
-    expected_mlp_scale_names = sorted(name for name, _ in mlp_scale_named_params)
-    expected_default_scalar_names = sorted(name for name, _ in default_scalar_named_params)
-
-    def get_optimizer_scalar_group_lrs() -> tuple[float, float]:
-        scalar_lr = 0.0
-        mlp_scale_lr = 0.0
-        for group in optimizer_scalar.param_groups:
-            role = str(group.get("role", "default"))
-            if role == "mlp_scale":
-                mlp_scale_lr = float(group["lr"])
-            else:
-                scalar_lr = float(group["lr"])
-        if not mlp_scale_split_active:
-            mlp_scale_lr = scalar_lr
-        return scalar_lr, mlp_scale_lr
-
-    def audit_optimizer_scalar_groups(stage: str) -> None:
-        group_audits: list[dict[str, object]] = []
-        seen_ids: list[int] = []
-        for group in optimizer_scalar.param_groups:
-            params = [p for p in group["params"] if id(p) in scalar_param_names_by_id]
-            param_ids = [id(p) for p in params]
-            names = sorted(scalar_param_names_by_id[param_id] for param_id in param_ids)
-            seen_ids.extend(param_ids)
-            group_audits.append(
-                {
-                    "role": str(group.get("role", "default")),
-                    "base_lr": float(group.get("base_lr", group["lr"])),
-                    "lr": float(group["lr"]),
-                    "tensors": len(names),
-                    "numel": sum(int(p.numel()) for p in params),
-                    "names": names,
-                }
-            )
-        seen_names = sorted(scalar_param_names_by_id[param_id] for param_id in seen_ids)
-        disjoint = len(seen_ids) == len(set(seen_ids))
-        exact_match = seen_names == expected_scalar_names
-        split_active = mlp_scale_split_active and len(group_audits) == 2
-        mlp_group_names = next((group["names"] for group in group_audits if group["role"] == "mlp_scale"), [])
-        default_group_names = next((group["names"] for group in group_audits if group["role"] == "default"), [])
-        expected_roles_ok = (not mlp_scale_split_active and len(group_audits) == 1) or (
-            mlp_scale_split_active
-            and sorted(mlp_group_names) == expected_mlp_scale_names
-            and sorted(default_group_names) == expected_default_scalar_names
-        )
-        log0(
-            f"optimizer_scalar_groups: stage:{stage} split_active:{split_active} "
-            f"group_count:{len(group_audits)} disjoint:{disjoint} exact_match:{exact_match and expected_roles_ok}"
-        )
-        for group in group_audits:
-            log0(
-                f"optimizer_scalar_group: stage:{stage} role:{group['role']} "
-                f"base_lr:{group['base_lr']:.8f} lr:{group['lr']:.8f} "
-                f"tensors:{group['tensors']} numel:{group['numel']} "
-                f"names:{','.join(group['names']) or 'none'}"
-            )
-        if mlp_scale_split_active and (not disjoint or not exact_match or not expected_roles_ok):
-            raise RuntimeError(f"optimizer_scalar group audit failed at stage={stage}")
-
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -1372,7 +1295,6 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    audit_optimizer_scalar_groups("startup")
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1398,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        audit_optimizer_scalar_groups("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1431,9 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"scalar_lr:{get_optimizer_scalar_group_lrs()[0]:.8f} "
-                f"mlp_scale_lr:{get_optimizer_scalar_group_lrs()[1]:.8f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1484,9 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"scalar_lr:{get_optimizer_scalar_group_lrs()[0]:.8f} "
-                f"mlp_scale_lr:{get_optimizer_scalar_group_lrs()[1]:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1502,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    audit_optimizer_scalar_groups("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
