@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    skip_adam_eps = float(os.environ.get("SKIP_ADAM_EPS", adam_eps))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1171,6 +1172,10 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not math.isfinite(args.adam_eps) or args.adam_eps <= 0:
+        raise ValueError(f"ADAM_EPS must be finite and strictly positive, got {args.adam_eps}")
+    if not math.isfinite(args.skip_adam_eps) or args.skip_adam_eps <= 0:
+        raise ValueError(f"SKIP_ADAM_EPS must be finite and strictly positive, got {args.skip_adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1219,7 +1224,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
+    skip_eps_split_active = base_model.skip_weights.numel() > 0 and args.skip_adam_eps != args.adam_eps
+    if not skip_eps_split_active and base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1236,8 +1242,18 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    optimizer_scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    if skip_eps_split_active:
+        optimizer_scalar_param_groups.append(
+            {
+                "params": [base_model.skip_weights],
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "eps": args.skip_adam_eps,
+            }
+        )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        optimizer_scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1252,11 +1268,49 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    scalar_expected_ids = {id(p) for p in scalar_params}
+    if base_model.skip_weights.numel() > 0:
+        scalar_expected_ids.add(id(base_model.skip_weights))
+
+    def log_skip_adam_eps_scope(stage: str) -> None:
+        default_ids: set[int] = set()
+        skip_ids: set[int] = set()
+        default_numel = 0
+        skip_numel = 0
+        default_eps = None
+        skip_eps = None
+        for group in optimizer_scalar.param_groups:
+            group_ids = {id(p) for p in group["params"]}
+            group_numel = sum(int(p.numel()) for p in group["params"])
+            if id(base_model.skip_weights) in group_ids:
+                skip_ids |= group_ids
+                skip_numel += group_numel
+                skip_eps = group["eps"]
+            else:
+                default_ids |= group_ids
+                default_numel += group_numel
+                default_eps = group["eps"]
+        exact_match = scalar_expected_ids == (default_ids | skip_ids)
+        skip_names = "skip_weights" if skip_ids else "inactive"
+        log0(
+            "optimizer_skip_eps_scope: "
+            f"stage:{stage} split_active:{skip_eps_split_active} groups:{len(optimizer_scalar.param_groups)} "
+            f"default_tensors:{len(default_ids)} default_numel:{default_numel} default_eps:{default_eps:.8g} "
+            f"skip_tensors:{len(skip_ids)} skip_numel:{skip_numel} "
+            f"skip_eps:{(f'{skip_eps:.8g}' if skip_eps is not None else 'inactive')} "
+            f"skip_names:{skip_names} exact_match:{exact_match}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"optimizer_adam_config: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"adam_eps:{args.adam_eps:.8g} skip_adam_eps:{args.skip_adam_eps:.8g}"
+    )
+    log_skip_adam_eps_scope("startup")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1320,6 +1374,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_skip_adam_eps_scope("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1474,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_skip_adam_eps_scope("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
