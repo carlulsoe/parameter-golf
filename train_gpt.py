@@ -86,7 +86,6 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    token_eps = float(os.environ.get("TOKEN_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1162,16 +1161,6 @@ def main() -> None:
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if not (0.0 <= args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not (0.0 <= args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.token_eps <= 0.0:
-        raise ValueError(f"TOKEN_EPS must be positive, got {args.token_eps}")
-    if args.token_eps != args.adam_eps and not args.tie_embeddings:
-        raise ValueError("TOKEN_EPS override requires TIE_EMBEDDINGS=1 so optimizer_tok stays on the shared token/logit path")
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
@@ -1236,7 +1225,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.token_eps,
+        eps=args.adam_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1263,44 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    named_params = dict(base_model.named_parameters())
-    param_names_by_id = {id(param): name for name, param in named_params.items()}
-
-    def log_optimizer_adam_state(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        tok_betas = tok_group.get("betas", (float("nan"), float("nan")))
-        scalar_group = optimizer_scalar.param_groups[0]
-        scalar_betas = scalar_group.get("betas", (float("nan"), float("nan")))
-        head_active = base_model.lm_head is not None
-        head_eps = 0.0
-        head_betas = (0.0, 0.0)
-        if head_active:
-            head_group = optimizer_head.param_groups[0]
-            head_eps = float(head_group.get("eps", 0.0))
-            head_betas = head_group.get("betas", (float("nan"), float("nan")))
-        tok_names = [param_names_by_id.get(id(param), "<unknown>") for param in tok_group["params"]]
-        tok_numel = sum(int(param.numel()) for param in tok_group["params"])
-        log0(
-            f"optimizer_adam_config stage:{stage} "
-            f"beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-            f"token_eps:{float(tok_group.get('eps', 0.0)):.8f} "
-            f"scalar_eps:{float(scalar_group.get('eps', 0.0)):.8f} "
-            f"head_eps:{head_eps:.8f}"
-        )
-        log0(
-            f"optimizer_adam_betas stage:{stage} "
-            f"tok:({float(tok_betas[0]):.5f},{float(tok_betas[1]):.5f}) "
-            f"scalar:({float(scalar_betas[0]):.5f},{float(scalar_betas[1]):.5f}) "
-            f"head:({float(head_betas[0]):.5f},{float(head_betas[1]):.5f})"
-        )
-        log0(
-            f"optimizer_tok_scope stage:{stage} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{'tied_only' if args.tie_embeddings else 'token_only'} "
-            f"tensors:{len(tok_names)} numel:{tok_numel} "
-            f"names:{','.join(tok_names) if tok_names else 'none'}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1309,8 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"adam_eps:{args.adam_eps} token_eps:{args.token_eps}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1319,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_optimizer_adam_state("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1371,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_adam_state("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1471,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_adam_state("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
