@@ -83,7 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_momentum_warmup_power = float(os.environ.get("MUON_MOMENTUM_WARMUP_POWER", 1.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -110,19 +109,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
-
-def compute_muon_momentum_for_update(
-    step: int,
-    warmup_start: float,
-    target: float,
-    warmup_steps: int,
-    warmup_power: float,
-) -> tuple[float, float, float]:
-    baseline_fraction = min(step / warmup_steps, 1.0) if warmup_steps > 0 else 1.0
-    shaped_fraction = baseline_fraction ** warmup_power
-    momentum = (1 - shaped_fraction) * warmup_start + shaped_fraction * target
-    return momentum, baseline_fraction, shaped_fraction
 
 
 class Muon(torch.optim.Optimizer):
@@ -1185,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.muon_momentum_warmup_power <= 0.0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_POWER must be strictly positive, got {args.muon_momentum_warmup_power}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1285,27 +1267,6 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    update0_muon_momentum, update0_muon_baseline_fraction, update0_muon_shaped_fraction = (
-        compute_muon_momentum_for_update(
-            step=0,
-            warmup_start=args.muon_momentum_warmup_start,
-            target=args.muon_momentum,
-            warmup_steps=args.muon_momentum_warmup_steps,
-            warmup_power=args.muon_momentum_warmup_power,
-        )
-    )
-    target_reached_update = args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0
-    log0(
-        f"muon_momentum_schedule update_semantics:applied_update_zero_based "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"baseline_fraction:min(update/warmup_steps,1.0) "
-        f"warmup_power:{args.muon_momentum_warmup_power:.5f} "
-        f"target_reached_update:{target_reached_update} "
-        f"update0_baseline_fraction:{update0_muon_baseline_fraction:.5f} "
-        f"update0_shaped_fraction:{update0_muon_shaped_fraction:.5f} "
-        f"update0_momentum:{update0_muon_momentum:.5f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1418,13 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum, muon_baseline_fraction, muon_shaped_fraction = compute_muon_momentum_for_update(
-            step=step,
-            warmup_start=args.muon_momentum_warmup_start,
-            target=args.muon_momentum,
-            warmup_steps=args.muon_momentum_warmup_steps,
-            warmup_power=args.muon_momentum_warmup_power,
-        )
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1445,19 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            next_muon_momentum, _, _ = compute_muon_momentum_for_update(
-                step=step,
-                warmup_start=args.muon_momentum_warmup_start,
-                target=args.muon_momentum,
-                warmup_steps=args.muon_momentum_warmup_steps,
-                warmup_power=args.muon_momentum_warmup_power,
-            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"applied_muon_momentum:{muon_momentum:.5f} next_muon_momentum:{next_muon_momentum:.5f} "
-                f"applied_muon_baseline_fraction:{muon_baseline_fraction:.5f} "
-                f"applied_muon_shaped_fraction:{muon_shaped_fraction:.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1472,43 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    completed_updates = step
-    last_applied_update = completed_updates - 1 if completed_updates > 0 else None
-    audit_step = 0 if last_applied_update is None else last_applied_update
-    last_applied_muon_momentum, last_applied_muon_baseline_fraction, last_applied_muon_shaped_fraction = (
-        compute_muon_momentum_for_update(
-            step=audit_step,
-            warmup_start=args.muon_momentum_warmup_start,
-            target=args.muon_momentum,
-            warmup_steps=args.muon_momentum_warmup_steps,
-            warmup_power=args.muon_momentum_warmup_power,
-        )
-    )
-    next_update_muon_momentum, next_update_muon_baseline_fraction, next_update_muon_shaped_fraction = (
-        compute_muon_momentum_for_update(
-            step=completed_updates,
-            warmup_start=args.muon_momentum_warmup_start,
-            target=args.muon_momentum,
-            warmup_steps=args.muon_momentum_warmup_steps,
-            warmup_power=args.muon_momentum_warmup_power,
-        )
-    )
-    warmup_fraction_completed = (
-        min(completed_updates / args.muon_momentum_warmup_steps, 1.0)
-        if args.muon_momentum_warmup_steps > 0
-        else 1.0
-    )
-    log0(
-        f"muon_momentum_audit completed_updates:{completed_updates} "
-        f"last_applied_update:{last_applied_update if last_applied_update is not None else 'none'} "
-        f"last_applied_muon_momentum:{last_applied_muon_momentum:.5f} "
-        f"last_applied_baseline_fraction:{last_applied_muon_baseline_fraction:.5f} "
-        f"last_applied_shaped_fraction:{last_applied_muon_shaped_fraction:.5f} "
-        f"next_update_muon_momentum:{next_update_muon_momentum:.5f} "
-        f"next_update_baseline_fraction:{next_update_muon_baseline_fraction:.5f} "
-        f"next_update_shaped_fraction:{next_update_muon_shaped_fraction:.5f} "
-        f"warmup_fraction_completed:{warmup_fraction_completed:.5f}"
     )
 
     # -----------------------------
