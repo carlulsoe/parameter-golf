@@ -71,8 +71,6 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    logit_softcap_audit = bool(int(os.environ.get("LOGIT_SOFTCAP_AUDIT", "0")))
-    logit_softcap_audit_batch_tokens = int(os.environ.get("LOGIT_SOFTCAP_AUDIT_BATCH_TOKENS", 8192))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1055,7 +1053,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _forward_hidden(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1070,46 +1068,16 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        return self.final_norm(x).reshape(-1, x.size(-1))
-
-    def logits_pre_softcap(self, input_ids: Tensor) -> Tensor:
-        x = self._forward_hidden(input_ids)
-        if self.tie_embeddings:
-            return F.linear(x, self.tok_emb.weight)
-        if self.lm_head is None:
-            raise RuntimeError("lm_head is required when tie_embeddings=False")
-        return self.lm_head(x)
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits_proj = self.logits_pre_softcap(input_ids)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
-
-
-def summarize_logit_softcap_effect(model: GPT, input_ids: Tensor) -> dict[str, float]:
-    with torch.inference_mode():
-        logits_proj = model.logits_pre_softcap(input_ids)
-        softcap = float(model.logit_softcap)
-        logits = softcap * torch.tanh(logits_proj / softcap)
-        abs_pre = logits_proj.float().abs().reshape(-1)
-        abs_post = logits.float().abs().reshape(-1)
-        return {
-            "softcap": softcap,
-            "tokens": float(input_ids.numel()),
-            "mean_abs_pre": float(abs_pre.mean().item()),
-            "p95_abs_pre": float(torch.quantile(abs_pre, 0.95).item()),
-            "p99_abs_pre": float(torch.quantile(abs_pre, 0.99).item()),
-            "max_abs_pre": float(abs_pre.max().item()),
-            "mean_abs_post": float(abs_post.mean().item()),
-            "p95_abs_post": float(torch.quantile(abs_post, 0.95).item()),
-            "p99_abs_post": float(torch.quantile(abs_post, 0.99).item()),
-            "max_abs_post": float(abs_post.max().item()),
-            "pre_over_softcap_frac": float((abs_pre > softcap).float().mean().item()),
-            "post_near_softcap_frac": float((abs_post > (0.95 * softcap)).float().mean().item()),
-            "mean_abs_compression": float((abs_pre - abs_post).mean().item()),
-            "mean_abs_ratio": float((abs_post / abs_pre.clamp_min(1e-12)).mean().item()),
-        }
 
 
 # -----------------------------
@@ -1189,13 +1157,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    if not math.isfinite(args.logit_softcap) or args.logit_softcap <= 0.0:
-        raise ValueError(f"LOGIT_SOFTCAP must be finite and positive, got {args.logit_softcap}")
-    if args.logit_softcap_audit_batch_tokens <= 0:
-        raise ValueError(
-            "LOGIT_SOFTCAP_AUDIT_BATCH_TOKENS must be positive, "
-            f"got {args.logit_softcap_audit_batch_tokens}"
-        )
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1314,47 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    logit_softcap_audit_x: Tensor | None = None
-    if args.logit_softcap_audit and master_process:
-        audit_local_tokens_limit = args.train_batch_tokens // (world_size * grad_accum_steps)
-        audit_local_tokens = min(args.logit_softcap_audit_batch_tokens, audit_local_tokens_limit)
-        audit_local_tokens = max((audit_local_tokens // args.train_seq_len) * args.train_seq_len, args.train_seq_len)
-        audit_global_tokens = audit_local_tokens * world_size * grad_accum_steps
-        audit_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        logit_softcap_audit_x, _ = audit_loader.next_batch(audit_global_tokens, args.train_seq_len, grad_accum_steps)
-        log0(
-            "logit_softcap_audit_config: "
-            f"enabled:{args.logit_softcap_audit} "
-            f"batch_tokens:{int(logit_softcap_audit_x.numel())} "
-            f"batch_seqs:{int(logit_softcap_audit_x.shape[0])} "
-            "stages:startup,post_restore_startup,final"
-        )
-
-    def emit_logit_softcap_audit(stage: str) -> None:
-        if not (args.logit_softcap_audit and master_process and logit_softcap_audit_x is not None):
-            return
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            stats = summarize_logit_softcap_effect(base_model, logit_softcap_audit_x)
-        log0(
-            "logit_softcap_audit: "
-            f"stage:{stage} "
-            f"softcap:{stats['softcap']:.5f} "
-            f"tokens:{int(stats['tokens'])} "
-            f"mean_abs_pre:{stats['mean_abs_pre']:.5f} "
-            f"p95_abs_pre:{stats['p95_abs_pre']:.5f} "
-            f"p99_abs_pre:{stats['p99_abs_pre']:.5f} "
-            f"max_abs_pre:{stats['max_abs_pre']:.5f} "
-            f"mean_abs_post:{stats['mean_abs_post']:.5f} "
-            f"p95_abs_post:{stats['p95_abs_post']:.5f} "
-            f"p99_abs_post:{stats['p99_abs_post']:.5f} "
-            f"max_abs_post:{stats['max_abs_post']:.5f} "
-            f"pre_over_softcap_frac:{stats['pre_over_softcap_frac']:.7f} "
-            f"post_near_softcap_frac:{stats['post_near_softcap_frac']:.7f} "
-            f"mean_abs_compression:{stats['mean_abs_compression']:.7f} "
-            f"mean_abs_ratio:{stats['mean_abs_ratio']:.7f}"
-        )
-
-    emit_logit_softcap_audit("startup")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1400,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        emit_logit_softcap_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1500,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    emit_logit_softcap_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
