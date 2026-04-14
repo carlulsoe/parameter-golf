@@ -60,6 +60,8 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    train_start_shard_audit = bool(int(os.environ.get("TRAIN_START_SHARD_AUDIT", "0")))
+    train_start_shard_audit_offsets = os.environ.get("TRAIN_START_SHARD_AUDIT_OFFSETS", "1,4,8,16,32")
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -778,6 +780,62 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
+def load_data_shard_num_tokens(file: Path) -> int:
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    return int(header[2])
+
+
+def parse_audit_offsets(raw: str) -> tuple[int, ...]:
+    offsets: list[int] = []
+    seen: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        offset = int(item)
+        if offset <= 0:
+            raise ValueError(f"TRAIN_START_SHARD_AUDIT_OFFSETS entries must be positive, got {offset}")
+        if offset not in seen:
+            offsets.append(offset)
+            seen.add(offset)
+    return tuple(offsets)
+
+
+def circular_coverage_intervals(start_token: int, length: int, total_tokens: int) -> list[tuple[int, int]]:
+    if total_tokens <= 0:
+        raise ValueError(f"total_tokens must be positive, got {total_tokens}")
+    if length <= 0:
+        return []
+    if length >= total_tokens:
+        return [(0, total_tokens)]
+    start = start_token % total_tokens
+    end = start + length
+    if end <= total_tokens:
+        return [(start, end)]
+    return [(start, total_tokens), (0, end - total_tokens)]
+
+
+def coverage_overlap_tokens(
+    start_a: int,
+    len_a: int,
+    start_b: int,
+    len_b: int,
+    total_tokens: int,
+) -> tuple[int, int]:
+    intervals_a = circular_coverage_intervals(start_a, len_a, total_tokens)
+    intervals_b = circular_coverage_intervals(start_b, len_b, total_tokens)
+    covered_a = min(max(len_a, 0), total_tokens)
+    covered_b = min(max(len_b, 0), total_tokens)
+    overlap = 0
+    for lo_a, hi_a in intervals_a:
+        for lo_b, hi_b in intervals_b:
+            overlap += max(0, min(hi_a, hi_b) - max(lo_a, lo_b))
+    unique_union = covered_a + covered_b - overlap
+    return overlap, unique_union
+
+
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -788,9 +846,15 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.total_tokens_taken = 0
+        self.wrap_count = 0
+        self.file_advance_count = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_advance_count += 1
+        if self.file_idx == 0:
+            self.wrap_count += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -805,8 +869,19 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
+            self.total_tokens_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+    def audit_state(self) -> dict[str, int | str]:
+        return {
+            "file_idx": self.file_idx,
+            "pos": self.pos,
+            "total_tokens_taken": self.total_tokens_taken,
+            "wrap_count": self.wrap_count,
+            "file_advance_count": self.file_advance_count,
+            "current_file": self.files[self.file_idx].name,
+        }
 
 
 class DistributedTokenLoader:
@@ -817,16 +892,34 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.total_microbatches = 0
+        self.total_supervised_tokens = 0
+        self.total_target_shift_tokens = 0
+        self.total_stream_tokens = 0
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
+        self.total_microbatches += 1
+        self.total_supervised_tokens += local_tokens * self.world_size
+        self.total_target_shift_tokens += self.world_size
+        self.total_stream_tokens += per_rank_span * self.world_size
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def audit_state(self) -> dict[str, int | str]:
+        state: dict[str, int | str] = {
+            "microbatches": self.total_microbatches,
+            "supervised_tokens": self.total_supervised_tokens,
+            "target_shift_tokens": self.total_target_shift_tokens,
+            "stream_tokens": self.total_stream_tokens,
+        }
+        state.update(self.stream.audit_state())
+        return state
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1179,6 +1272,33 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
+    train_start_shard_audit_offsets = parse_audit_offsets(args.train_start_shard_audit_offsets)
+    train_shard_token_counts: list[int] = []
+    train_dataset_total_tokens = 0
+    train_shard_start_tokens: list[int] = []
+    if args.train_start_shard_audit:
+        train_shard_files = [Path(p) for p in sorted(glob.glob(args.train_files))]
+        train_shard_token_counts = [load_data_shard_num_tokens(file) for file in train_shard_files]
+        train_dataset_total_tokens = sum(train_shard_token_counts)
+        running_token_start = 0
+        for count in train_shard_token_counts:
+            train_shard_start_tokens.append(running_token_start)
+            running_token_start += count
+        local_tokens_per_microbatch = args.train_batch_tokens // (world_size * grad_accum_steps)
+        stream_tokens_per_microbatch = (local_tokens_per_microbatch + 1) * world_size
+        log0(
+            "train_start_shard_audit: "
+            f"enabled:{args.train_start_shard_audit} "
+            f"requested_global_tokens_arg:{args.train_batch_tokens} "
+            f"local_tokens_per_microbatch:{local_tokens_per_microbatch} "
+            f"supervised_tokens_per_microbatch:{local_tokens_per_microbatch * world_size} "
+            f"target_shift_tokens_per_microbatch:{world_size} "
+            f"stream_tokens_per_microbatch:{stream_tokens_per_microbatch} "
+            f"world_size:{world_size} grad_accum_steps:{grad_accum_steps} "
+            f"dataset_total_tokens:{train_dataset_total_tokens} train_shards:{len(train_shard_token_counts)} "
+            f"audited_offsets:{','.join(str(offset) for offset in train_start_shard_audit_offsets) or 'none'}"
+        )
+
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
@@ -1275,6 +1395,8 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    warmup_audit_state: dict[str, int | str] | None = None
+    measured_loader_start_state: dict[str, int | str] | None = None
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,6 +1435,18 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        if args.train_start_shard_audit:
+            warmup_audit_state = train_loader.audit_state()
+            log0(
+                "warmup_loader_audit: "
+                f"microbatches:{warmup_audit_state['microbatches']} "
+                f"warmup_supervised_tokens:{warmup_audit_state['supervised_tokens']} "
+                f"warmup_target_shift_tokens:{warmup_audit_state['target_shift_tokens']} "
+                f"warmup_stream_tokens:{warmup_audit_state['stream_tokens']} "
+                f"file_idx:{warmup_audit_state['file_idx']} pos:{warmup_audit_state['pos']} "
+                f"wraps:{warmup_audit_state['wrap_count']} file_advances:{warmup_audit_state['file_advance_count']} "
+                f"current_file:{warmup_audit_state['current_file']}"
+            )
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1320,6 +1454,21 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.train_start_shard_audit:
+            measured_loader_start_state = train_loader.audit_state()
+            rewound_after_warmup = (
+                measured_loader_start_state["file_idx"] == 0
+                and measured_loader_start_state["pos"] == 0
+                and measured_loader_start_state["stream_tokens"] == 0
+            )
+            log0(
+                "measured_loader_start: "
+                f"rewound_after_warmup:{rewound_after_warmup} "
+                f"file_idx:{measured_loader_start_state['file_idx']} pos:{measured_loader_start_state['pos']} "
+                f"stream_tokens:{measured_loader_start_state['stream_tokens']} "
+                f"wraps:{measured_loader_start_state['wrap_count']} "
+                f"current_file:{measured_loader_start_state['current_file']}"
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1568,58 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.train_start_shard_audit:
+        measured_audit_state = train_loader.audit_state()
+        warmup_stream_tokens = int((warmup_audit_state or {}).get("stream_tokens", 0))
+        measured_stream_tokens = int(measured_audit_state["stream_tokens"])
+        baseline_replay_tokens, baseline_unique_union_tokens = coverage_overlap_tokens(
+            0,
+            warmup_stream_tokens,
+            0,
+            measured_stream_tokens,
+            train_dataset_total_tokens,
+        )
+        continue_replay_tokens, continue_unique_union_tokens = coverage_overlap_tokens(
+            0,
+            warmup_stream_tokens,
+            warmup_stream_tokens,
+            measured_stream_tokens,
+            train_dataset_total_tokens,
+        )
+        log0(
+            "train_loader_final_audit: "
+            f"measured_microbatches:{measured_audit_state['microbatches']} "
+            f"measured_supervised_tokens:{measured_audit_state['supervised_tokens']} "
+            f"measured_target_shift_tokens:{measured_audit_state['target_shift_tokens']} "
+            f"measured_stream_tokens:{measured_stream_tokens} "
+            f"file_idx:{measured_audit_state['file_idx']} pos:{measured_audit_state['pos']} "
+            f"wraps:{measured_audit_state['wrap_count']} file_advances:{measured_audit_state['file_advance_count']} "
+            f"current_file:{measured_audit_state['current_file']} "
+            f"baseline_replay_tokens:{baseline_replay_tokens} "
+            f"baseline_unique_union_tokens:{baseline_unique_union_tokens} "
+            f"continue_replay_tokens:{continue_replay_tokens} "
+            f"continue_unique_union_tokens:{continue_unique_union_tokens} "
+            f"continue_avoided_replay_tokens:{baseline_replay_tokens - continue_replay_tokens}"
+        )
+        baseline_unique_coverage = min(warmup_stream_tokens, train_dataset_total_tokens)
+        for offset in train_start_shard_audit_offsets:
+            shard_idx = offset % len(train_shard_start_tokens)
+            measured_start_token = train_shard_start_tokens[shard_idx]
+            replay_tokens, unique_union_tokens = coverage_overlap_tokens(
+                0,
+                warmup_stream_tokens,
+                measured_start_token,
+                measured_stream_tokens,
+                train_dataset_total_tokens,
+            )
+            log0(
+                "train_start_shard_counterfactual: "
+                f"offset_shards:{offset} start_shard_idx:{shard_idx} start_token:{measured_start_token} "
+                f"replay_tokens:{replay_tokens} unique_union_tokens:{unique_union_tokens} "
+                f"warmup_unique_tokens:{baseline_unique_coverage} "
+                f"delta_replay_tokens_vs_offset0:{replay_tokens - baseline_replay_tokens} "
+                f"delta_unique_union_tokens_vs_offset0:{unique_union_tokens - baseline_unique_union_tokens}"
+            )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
