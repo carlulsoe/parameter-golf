@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    q_gain_lr_mult = float(os.environ.get("Q_GAIN_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1091,8 +1090,6 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-    if not math.isfinite(args.q_gain_lr_mult) or args.q_gain_lr_mult <= 0.0:
-        raise ValueError(f"Q_GAIN_LR_MULT must be finite and positive, got {args.q_gain_lr_mult}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1217,17 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    q_gain_named_params = [(name, p) for name, p in block_named_params if "q_gain" in name]
-    q_gain_param_ids = {id(p) for _, p in q_gain_named_params}
-    scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and id(p) not in q_gain_param_ids
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    scalar_params = [p for _, p in scalar_named_params]
-    q_gain_params = [p for _, p in q_gain_named_params]
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1243,17 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "scalar"}]
-    q_gain_split_active = args.q_gain_lr_mult != 1.0
-    if q_gain_split_active:
-        q_gain_lr = args.scalar_lr * args.q_gain_lr_mult
-        scalar_param_groups.append(
-            {"params": q_gain_params, "lr": q_gain_lr, "base_lr": q_gain_lr, "group_name": "q_gain"}
-        )
-    else:
-        scalar_param_groups[0]["params"].extend(q_gain_params)
     optimizer_scalar = torch.optim.Adam(
-        scalar_param_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1273,31 +1257,6 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"optimizer_q_gain_config: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"q_gain_lr_mult:{args.q_gain_lr_mult:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    if q_gain_split_active:
-        log0("optimizer_q_gain_names:" + ",".join(f"blocks.{name}" for name, _ in q_gain_named_params))
-
-    def log_scalar_group_lrs(stage: str) -> None:
-        scalar_group = next(group for group in optimizer_scalar.param_groups if group.get("group_name") == "scalar")
-        q_gain_group = next((group for group in optimizer_scalar.param_groups if group.get("group_name") == "q_gain"), None)
-        log0(
-            "optimizer_scalar_groups: "
-            f"stage:{stage} "
-            f"q_gain_split_active:{q_gain_split_active} "
-            f"scalar_tensors:{len(scalar_named_params)} "
-            f"scalar_numel:{sum(int(p.numel()) for _, p in scalar_named_params)} "
-            f"q_gain_tensors:{len(q_gain_named_params)} "
-            f"q_gain_numel:{sum(int(p.numel()) for _, p in q_gain_named_params)} "
-            f"scalar_lr:{scalar_group['lr']:.8f} "
-            f"scalar_base_lr:{scalar_group['base_lr']:.8f} "
-            f"q_gain_lr:{(q_gain_group['lr'] if q_gain_group is not None else scalar_group['lr']):.8f} "
-            f"q_gain_base_lr:{(q_gain_group['base_lr'] if q_gain_group is not None else scalar_group['base_lr']):.8f}"
-        )
-
-    log_scalar_group_lrs("startup")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1361,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_scalar_group_lrs("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1443,13 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            scalar_group = next(group for group in optimizer_scalar.param_groups if group.get("group_name") == "scalar")
-            q_gain_group = next((group for group in optimizer_scalar.param_groups if group.get("group_name") == "q_gain"), None)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"scalar_lr:{scalar_group['lr']:.8f} "
-                f"q_gain_lr:{(q_gain_group['lr'] if q_gain_group is not None else scalar_group['lr']):.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1465,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_group_lrs("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
