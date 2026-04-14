@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_grad_clip_norm = float(os.environ.get("TOKEN_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1157,6 +1158,14 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    if args.grad_clip_norm < 0.0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.token_grad_clip_norm < 0.0:
+        raise ValueError(f"TOKEN_GRAD_CLIP_NORM must be non-negative, got {args.token_grad_clip_norm}")
+    if args.grad_clip_norm > 0.0 and args.token_grad_clip_norm > 0.0:
+        raise ValueError("TOKEN_GRAD_CLIP_NORM cannot be enabled together with GRAD_CLIP_NORM")
+    if args.token_grad_clip_norm > 0.0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -1251,6 +1260,24 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    named_params_by_id = {id(param): name for name, param in base_model.named_parameters()}
+    optimizer_tok_names = [
+        named_params_by_id.get(id(param), "<unnamed>")
+        for group in optimizer_tok.param_groups
+        for param in group["params"]
+    ]
+    optimizer_tok_numel = sum(
+        int(param.numel()) for group in optimizer_tok.param_groups for param in group["params"]
+    )
+    optimizer_tok_scope = "tied_only" if args.tie_embeddings else "input_embedding_only"
+    token_grad_clipped_steps = torch.zeros((), device=device, dtype=torch.int32)
+    token_grad_last_clip_coef = torch.ones((), device=device, dtype=torch.float32)
+    token_grad_clip_enabled = args.token_grad_clip_norm > 0.0
+    token_grad_clip_max_norm_tensor = (
+        torch.tensor(args.token_grad_clip_norm, device=device, dtype=torch.float32)
+        if token_grad_clip_enabled
+        else None
+    )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1269,6 +1296,16 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"optimizer_clipping: grad_clip_norm:{args.grad_clip_norm:.5f} "
+        f"token_grad_clip_norm:{args.token_grad_clip_norm:.5f} "
+        f"norm_logging:{'existing_train_logs_only' if token_grad_clip_enabled else 'disabled'}"
+    )
+    log0(
+        f"optimizer_tok audit: stage:startup tie_embeddings:{args.tie_embeddings} scope:{optimizer_tok_scope} "
+        f"tensor_count:{len(optimizer_tok_names)} numel:{optimizer_tok_numel} "
+        f"names:{','.join(optimizer_tok_names)}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1388,6 +1425,17 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        if token_grad_clip_enabled:
+            token_grad_norm = torch.nn.utils.clip_grad_norm_(
+                [base_model.tok_emb.weight],
+                args.token_grad_clip_norm,
+            )
+            token_clip_coef = torch.clamp(
+                token_grad_clip_max_norm_tensor.to(dtype=token_grad_norm.dtype) / (token_grad_norm + 1e-6),
+                max=1.0,
+            )
+            token_grad_clipped_steps += (token_clip_coef < 1.0).to(dtype=torch.int32)
+            token_grad_last_clip_coef.copy_(token_clip_coef)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1401,10 +1449,17 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if token_grad_clip_enabled:
+                train_msg += (
+                    f" token_grad_clipped:{int((token_grad_last_clip_coef < 1.0).item())} "
+                    f"token_grad_clip_coef:{float(token_grad_last_clip_coef.item()):.8f} "
+                    f"token_grad_clipped_steps:{int(token_grad_clipped_steps.item())}"
+                )
+            log0(train_msg)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1474,18 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(
+        f"optimizer_tok audit: stage:final tie_embeddings:{args.tie_embeddings} scope:{optimizer_tok_scope} "
+        f"tensor_count:{len(optimizer_tok_names)} numel:{optimizer_tok_numel} "
+        f"names:{','.join(optimizer_tok_names)}"
+    )
+    if token_grad_clip_enabled:
+        log0(
+            f"token_grad_clip_audit: enabled:True scope:{optimizer_tok_scope} "
+            f"tie_embeddings:{args.tie_embeddings} max_norm:{args.token_grad_clip_norm:.8f} "
+            f"norm_logging:existing_train_logs_only clipped_steps:{int(token_grad_clipped_steps.item())} "
+            f"last_clip_coef:{float(token_grad_last_clip_coef.item()):.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
