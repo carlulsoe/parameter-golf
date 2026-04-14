@@ -83,11 +83,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_momentum_warmdown_start_step = int(os.environ.get("MUON_MOMENTUM_WARMDOWN_START_STEP", 0))
-    muon_momentum_warmdown_steps = int(os.environ.get("MUON_MOMENTUM_WARMDOWN_STEPS", 0))
-    muon_momentum_warmdown_target = float(
-        os.environ.get("MUON_MOMENTUM_WARMDOWN_TARGET", os.environ.get("MUON_MOMENTUM", 0.95))
-    )
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -1274,31 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if not (0.0 < args.muon_momentum_warmup_start < 1.0 and 0.0 < args.muon_momentum < 1.0):
-        raise ValueError(
-            "MUON_MOMENTUM_WARMUP_START and MUON_MOMENTUM must both lie in (0, 1), got "
-            f"{args.muon_momentum_warmup_start} and {args.muon_momentum}"
-        )
-    if args.muon_momentum_warmup_steps < 0:
-        raise ValueError(f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}")
-    if args.muon_momentum_warmdown_start_step < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMDOWN_START_STEP must be non-negative, got {args.muon_momentum_warmdown_start_step}"
-        )
-    if args.muon_momentum_warmdown_steps < 0:
-        raise ValueError(f"MUON_MOMENTUM_WARMDOWN_STEPS must be non-negative, got {args.muon_momentum_warmdown_steps}")
-    if args.muon_momentum_warmdown_steps > 0:
-        if not (0.0 < args.muon_momentum_warmdown_target < 1.0):
-            raise ValueError(
-                "MUON_MOMENTUM_WARMDOWN_TARGET must lie in (0, 1) when warmdown is enabled, got "
-                f"{args.muon_momentum_warmdown_target}"
-            )
-        if args.muon_momentum_warmdown_start_step < args.muon_momentum_warmup_steps:
-            raise ValueError(
-                "MUON_MOMENTUM_WARMDOWN_START_STEP must be >= MUON_MOMENTUM_WARMUP_STEPS to avoid "
-                f"overlapping schedules, got {args.muon_momentum_warmdown_start_step} and "
-                f"{args.muon_momentum_warmup_steps}"
-            )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1322,64 +1292,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    def muon_momentum_for_update(update_idx: int) -> float:
-        warmup_frac = min(update_idx / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        momentum = (1 - warmup_frac) * args.muon_momentum_warmup_start + warmup_frac * args.muon_momentum
-        if args.muon_momentum_warmdown_steps > 0 and update_idx >= args.muon_momentum_warmdown_start_step:
-            warmdown_frac = min(
-                (update_idx - args.muon_momentum_warmdown_start_step) / args.muon_momentum_warmdown_steps,
-                1.0,
-            )
-            momentum = (1 - warmdown_frac) * args.muon_momentum + warmdown_frac * args.muon_momentum_warmdown_target
-        return momentum
-
-    def format_muon_checkpoint_fields(completed_updates: int) -> str:
-        last_applied_update = completed_updates - 1
-        if last_applied_update < 0:
-            return (
-                "last_applied_update:none applied_muon_momentum:none "
-                f"next_update:0 next_muon_momentum:{muon_momentum_for_update(0):.5f} "
-                "warmdown_started_by_last_update:none target_reached_by_last_update:none"
-            )
-        warmdown_started = args.muon_momentum_warmdown_steps > 0 and last_applied_update >= args.muon_momentum_warmdown_start_step
-        warmdown_target_reached = args.muon_momentum_warmdown_steps > 0 and (
-            last_applied_update >= args.muon_momentum_warmdown_start_step + args.muon_momentum_warmdown_steps
-        )
-        return (
-            f"last_applied_update:{last_applied_update} "
-            f"applied_muon_momentum:{muon_momentum_for_update(last_applied_update):.5f} "
-            f"next_update:{completed_updates} next_muon_momentum:{muon_momentum_for_update(completed_updates):.5f} "
-            f"warmdown_started_by_last_update:{warmdown_started} "
-            f"target_reached_by_last_update:{warmdown_target_reached}"
-        )
-
-    warmup_last_subtarget_update = args.muon_momentum_warmup_steps - 1 if args.muon_momentum_warmup_steps > 0 else "none"
-    warmup_target_reached_update = args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0
-    warmdown_enabled = args.muon_momentum_warmdown_steps > 0
-    warmdown_last_subtarget_update = (
-        args.muon_momentum_warmdown_start_step + args.muon_momentum_warmdown_steps - 1 if warmdown_enabled else "none"
-    )
-    warmdown_target_reached_update = (
-        args.muon_momentum_warmdown_start_step + args.muon_momentum_warmdown_steps if warmdown_enabled else "none"
-    )
-    log0(
-        "muon_momentum_schedule: "
-        "update_semantics:applied_update_zero_based "
-        "checkpoint_semantics:last_applied_update "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_last_subtarget_update:{warmup_last_subtarget_update} "
-        f"warmup_target_reached_update:{warmup_target_reached_update} "
-        f"warmdown_enabled:{warmdown_enabled} "
-        f"warmdown_start_update:{args.muon_momentum_warmdown_start_step if warmdown_enabled else 'none'} "
-        f"warmdown_steps:{args.muon_momentum_warmdown_steps} "
-        f"warmdown_target:{args.muon_momentum_warmdown_target:.5f} "
-        f"warmdown_last_subtarget_update:{warmdown_last_subtarget_update} "
-        f"warmdown_target_reached_update:{warmdown_target_reached_update} "
-        f"update0_momentum:{muon_momentum_for_update(0):.5f}"
-    )
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1440,8 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"{format_muon_checkpoint_fields(step)}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1468,7 +1379,8 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_for_update(step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1491,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"{format_muon_checkpoint_fields(step)}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1507,11 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "muon_momentum_audit: "
-        f"completed_updates:{step} "
-        f"{format_muon_checkpoint_fields(step)}"
     )
 
     # -----------------------------
