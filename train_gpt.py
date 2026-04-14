@@ -60,12 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    train_shard_audit = bool(int(os.environ.get("TRAIN_SHARD_AUDIT", "0")))
-    train_shard_audit_offsets = tuple(
-        int(entry.strip())
-        for entry in os.environ.get("TRAIN_SHARD_AUDIT_OFFSETS", "1,2,4,8,16,32").split(",")
-        if entry.strip()
-    )
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -784,13 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=3)
-    if header.size != 3 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -801,7 +788,6 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_taken = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -819,17 +805,8 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.total_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def snapshot(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "total_taken": self.total_taken,
-            "file_tokens": int(self.tokens.numel()),
-        }
 
 
 class DistributedTokenLoader:
@@ -850,73 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def snapshot(self) -> dict[str, int]:
-        return self.stream.snapshot()
-
-
-def circular_window_segments(start: int, length: int, cycle_tokens: int) -> list[tuple[int, int]]:
-    if cycle_tokens <= 0:
-        raise ValueError(f"cycle_tokens must be positive, got {cycle_tokens}")
-    if length <= 0:
-        return []
-    if length >= cycle_tokens:
-        return [(0, cycle_tokens)]
-    start = start % cycle_tokens
-    end = start + length
-    if end <= cycle_tokens:
-        return [(start, end)]
-    return [(start, cycle_tokens), (0, end - cycle_tokens)]
-
-
-def circular_window_overlap(start_a: int, length_a: int, start_b: int, length_b: int, cycle_tokens: int) -> int:
-    overlap = 0
-    for a0, a1 in circular_window_segments(start_a, length_a, cycle_tokens):
-        for b0, b1 in circular_window_segments(start_b, length_b, cycle_tokens):
-            overlap += max(0, min(a1, b1) - max(a0, b0))
-    return overlap
-
-
-class TrainShardAudit:
-    def __init__(self, pattern: str, shard_offsets: tuple[int, ...]):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
-            raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.shard_offsets = shard_offsets
-        self.shard_token_counts = [load_data_shard_num_tokens(file) for file in self.files]
-        self.prefix_tokens = [0]
-        for count in self.shard_token_counts:
-            self.prefix_tokens.append(self.prefix_tokens[-1] + count)
-        self.total_cycle_tokens = self.prefix_tokens[-1]
-        if self.total_cycle_tokens <= 0:
-            raise ValueError("Train shard audit requires a positive total_cycle_tokens")
-
-    def shard_offset_start_token(self, shard_offset: int) -> int:
-        return self.prefix_tokens[shard_offset % len(self.files)]
-
-    def touched_shards(self, start_token: int, consumed_tokens: int) -> list[int]:
-        touched: list[int] = []
-        for shard_idx, (shard_start, shard_end) in enumerate(zip(self.prefix_tokens, self.prefix_tokens[1:], strict=True)):
-            if circular_window_overlap(start_token, consumed_tokens, shard_start, shard_end - shard_start, self.total_cycle_tokens) > 0:
-                touched.append(shard_idx)
-        return touched
-
-    def summarize_window(self, start_token: int, consumed_tokens: int) -> dict[str, object]:
-        unique_tokens = min(consumed_tokens, self.total_cycle_tokens)
-        touched = self.touched_shards(start_token, consumed_tokens)
-        return {
-            "consumed_tokens": consumed_tokens,
-            "unique_tokens": unique_tokens,
-            "dataset_fraction": unique_tokens / self.total_cycle_tokens,
-            "wraps": consumed_tokens // self.total_cycle_tokens,
-            "distinct_shards": len(touched),
-            "first_shard": touched[0] if touched else -1,
-            "last_shard": touched[-1] if touched else -1,
-            "touched_shards": touched,
-        }
-
-    def overlap_tokens(self, start_a: int, consumed_a: int, start_b: int, consumed_b: int) -> int:
-        return circular_window_overlap(start_a, consumed_a, start_b, consumed_b, self.total_cycle_tokens)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1257,8 +1167,6 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    if any(offset < 0 for offset in args.train_shard_audit_offsets):
-        raise ValueError(f"TRAIN_SHARD_AUDIT_OFFSETS must be non-negative, got {args.train_shard_audit_offsets}")
     if args.train_seq_len <= 0:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
@@ -1366,24 +1274,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_shard_audit = TrainShardAudit(args.train_files, args.train_shard_audit_offsets) if args.train_shard_audit else None
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    warmup_loader_snapshot: dict[str, int] | None = None
-    measured_loader_start_snapshot: dict[str, int] | None = None
-
-    def format_loader_snapshot(stage: str, snapshot: dict[str, int]) -> str:
-        return (
-            f"train_loader_state:stage:{stage} file_idx:{snapshot['file_idx']} pos:{snapshot['pos']} "
-            f"file_tokens:{snapshot['file_tokens']} total_taken:{snapshot['total_taken']}"
-        )
-
-    if train_shard_audit is not None:
-        offsets_str = ",".join(str(offset) for offset in train_shard_audit.shard_offsets)
-        log0(
-            f"train_shard_audit:enabled shard_offsets:{offsets_str} "
-            f"total_cycle_tokens:{train_shard_audit.total_cycle_tokens} warmup_resets_measured_loader:True"
-        )
-        log0(format_loader_snapshot("startup", train_loader.snapshot()))
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1422,9 +1313,6 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        if train_shard_audit is not None:
-            warmup_loader_snapshot = train_loader.snapshot()
-            log0(format_loader_snapshot("post_warmup_before_reset", warmup_loader_snapshot))
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1432,12 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        if train_shard_audit is not None:
-            measured_loader_start_snapshot = train_loader.snapshot()
-            log0(format_loader_snapshot("post_warmup_after_reset", measured_loader_start_snapshot))
-    elif train_shard_audit is not None:
-        measured_loader_start_snapshot = train_loader.snapshot()
-        log0(format_loader_snapshot("measured_start_no_warmup", measured_loader_start_snapshot))
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1537,47 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-
-    if train_shard_audit is not None:
-        measured_start_token = 0 if measured_loader_start_snapshot is None else measured_loader_start_snapshot["total_taken"]
-        measured_summary = train_shard_audit.summarize_window(measured_start_token, train_loader.stream.total_taken)
-        touched_prefix = ",".join(str(idx) for idx in measured_summary["touched_shards"][:8])
-        if len(measured_summary["touched_shards"]) > 8:
-            touched_prefix += ",..."
-        log0(
-            f"train_shard_audit_summary consumed_tokens:{measured_summary['consumed_tokens']} "
-            f"unique_tokens:{measured_summary['unique_tokens']} total_cycle_tokens:{train_shard_audit.total_cycle_tokens} "
-            f"dataset_fraction:{measured_summary['dataset_fraction']:.8f} wraps:{measured_summary['wraps']} "
-            f"distinct_shards:{measured_summary['distinct_shards']} first_shard:{measured_summary['first_shard']} "
-            f"last_shard:{measured_summary['last_shard']} touched_shards:{touched_prefix}"
-        )
-        warmup_consumed_tokens = 0 if warmup_loader_snapshot is None else warmup_loader_snapshot["total_taken"]
-        warmup_overlap_tokens = train_shard_audit.overlap_tokens(
-            0,
-            warmup_consumed_tokens,
-            measured_start_token,
-            int(measured_summary["consumed_tokens"]),
-        )
-        measured_unique_tokens = max(int(measured_summary["unique_tokens"]), 1)
-        log0(
-            f"train_shard_audit_warmup_overlap warmup_consumed_tokens:{warmup_consumed_tokens} "
-            f"measured_consumed_tokens:{measured_summary['consumed_tokens']} overlap_tokens:{warmup_overlap_tokens} "
-            f"replayed_fraction_of_measured_unique:{warmup_overlap_tokens / measured_unique_tokens:.8f}"
-        )
-        counterfactual_parts = []
-        measured_consumed_tokens = int(measured_summary["consumed_tokens"])
-        for shard_offset in train_shard_audit.shard_offsets:
-            counterfactual_overlap = train_shard_audit.overlap_tokens(
-                measured_start_token,
-                measured_consumed_tokens,
-                train_shard_audit.shard_offset_start_token(shard_offset),
-                measured_consumed_tokens,
-            )
-            counterfactual_parts.append(
-                f"{shard_offset}:{counterfactual_overlap}/{measured_unique_tokens}"
-                f"={counterfactual_overlap / measured_unique_tokens:.8f}"
-            )
-        log0(f"train_shard_audit_counterfactuals shard_offset_overlap:{' '.join(counterfactual_parts)}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
