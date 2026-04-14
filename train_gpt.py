@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    q_gain_lr_mult = float(os.environ.get("Q_GAIN_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.q_gain_lr_mult <= 0.0:
+        raise ValueError(f"Q_GAIN_LR_MULT must be positive, got {args.q_gain_lr_mult}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1214,13 +1217,24 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    q_gain_named_params = [(name, p) for name, p in block_named_params if name.endswith("q_gain")]
+    q_gain_split_active = not math.isclose(args.q_gain_lr_mult, 1.0, rel_tol=0.0, abs_tol=1e-12)
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and not (q_gain_split_active and name.endswith("q_gain"))
     ]
+    scalar_params = [p for _, p in scalar_named_params]
+    scalar_tensor_count = len(scalar_params)
+    scalar_numel = sum(p.numel() for p in scalar_params)
+    q_gain_params = [p for _, p in q_gain_named_params]
+    q_gain_tensor_count = len(q_gain_params)
+    q_gain_numel = sum(p.numel() for p in q_gain_params)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        scalar_tensor_count += 1
+        scalar_numel += base_model.skip_weights.numel()
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1250,17 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    if q_gain_split_active:
+        scalar_param_groups.append(
+            {
+                "params": q_gain_params,
+                "lr": args.scalar_lr * args.q_gain_lr_mult,
+                "base_lr": args.scalar_lr * args.q_gain_lr_mult,
+            }
+        )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,8 +1283,21 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} q_gain_lr_mult:{args.q_gain_lr_mult}"
     )
+    def log_scalar_group_audit(stage: str) -> None:
+        scalar_group = optimizer_scalar.param_groups[0]
+        q_gain_group = optimizer_scalar.param_groups[1] if q_gain_split_active else scalar_group
+        log0(
+            f"optimizer_scalar_groups stage:{stage} "
+            f"q_gain_split_active:{q_gain_split_active} "
+            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+            f"q_gain_tensors:{q_gain_tensor_count} q_gain_numel:{q_gain_numel} "
+            f"scalar_lr:{scalar_group['lr']:.8f} q_gain_lr:{q_gain_group['lr']:.8f}"
+        )
+    if q_gain_split_active:
+        log0("optimizer_q_gain_names " + ",".join(name for name, _ in q_gain_named_params))
+    log_scalar_group_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1356,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_scalar_group_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1352,7 +1389,9 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+                f"q_gain_lr:{(optimizer_scalar.param_groups[1] if q_gain_split_active else optimizer_scalar.param_groups[0])['lr']:.8f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1403,7 +1442,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+                f"q_gain_lr:{(optimizer_scalar.param_groups[1] if q_gain_split_active else optimizer_scalar.param_groups[0])['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1460,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_scalar_group_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
