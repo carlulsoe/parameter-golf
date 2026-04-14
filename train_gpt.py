@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    reset_train_loader_after_warmup = bool(int(os.environ.get("RESET_TRAIN_LOADER_AFTER_WARMUP", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -789,13 +788,9 @@ class TokenStream:
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_taken = 0
-        self.wraps = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.wraps += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -810,19 +805,8 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.total_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def state_dict(self) -> dict[str, object]:
-        return {
-            "file_idx": self.file_idx,
-            "file_name": self.files[self.file_idx].name,
-            "pos": self.pos,
-            "shard_tokens": int(self.tokens.numel()),
-            "total_taken": self.total_taken,
-            "wraps": self.wraps,
-        }
 
 
 class DistributedTokenLoader:
@@ -843,9 +827,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def state_dict(self) -> dict[str, object]:
-        return self.stream.state_dict()
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1158,20 +1139,6 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    def log_train_loader_state(stage: str) -> None:
-        state = train_loader.state_dict()
-        log0(
-            "train_loader_state: "
-            f"stage:{stage} "
-            f"reset_after_warmup:{args.reset_train_loader_after_warmup} "
-            f"file_idx:{state['file_idx']} "
-            f"file:{state['file_name']} "
-            f"pos:{state['pos']} "
-            f"shard_tokens:{state['shard_tokens']} "
-            f"total_taken:{state['total_taken']} "
-            f"wraps:{state['wraps']}"
-        )
-
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1301,7 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"reset_train_loader_after_warmup:{args.reset_train_loader_after_warmup}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1309,7 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_train_loader_state("warmup_start" if args.warmup_steps > 0 else "measured_start")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1348,16 +1313,13 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        log_train_loader_state("warmup_end")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.reset_train_loader_after_warmup:
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_train_loader_state("measured_start")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1457,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_train_loader_state("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
