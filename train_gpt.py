@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta1 = float(os.environ.get("TOKEN_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1161,6 +1162,13 @@ def main() -> None:
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    for beta_name, beta_value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("TOKEN_BETA1", args.token_beta1)):
+        if not 0.0 <= beta_value < 1.0:
+            raise ValueError(f"{beta_name} must be in [0, 1), got {beta_value}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if args.token_beta1 != args.beta1 and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA1 requires TIE_EMBEDDINGS=1 so the scope stays on the shared embedding/logit path")
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
@@ -1222,9 +1230,10 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_group_betas = (args.token_beta1, args.beta2)
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=token_group_betas,
         eps=args.adam_eps,
         fused=True,
     )
@@ -1252,6 +1261,20 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def optimizer_beta_summary(stage: str) -> None:
+        tok_betas = optimizer_tok.param_groups[0]["betas"]
+        head_summary = "(inactive)"
+        if base_model.lm_head is not None:
+            head_betas = optimizer_head.param_groups[0]["betas"]
+            head_summary = f"({head_betas[0]:.5f},{head_betas[1]:.5f})"
+        scalar_betas = optimizer_scalar.param_groups[0]["betas"]
+        log0(
+            f"optimizer_betas stage:{stage} "
+            f"tok:({tok_betas[0]:.5f},{tok_betas[1]:.5f}) "
+            f"head:{head_summary} "
+            f"scalar:({scalar_betas[0]:.5f},{scalar_betas[1]:.5f})"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1262,6 +1285,11 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_beta_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"token_beta1:{args.token_beta1:.5f} adam_eps:{args.adam_eps:.8f}"
+    )
+    optimizer_beta_summary("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1348,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        optimizer_beta_summary("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1448,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    optimizer_beta_summary("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
