@@ -76,7 +76,6 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1172,10 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.token_lr_mult) or args.token_lr_mult <= 0:
-        raise ValueError(f"TOKEN_LR_MULT must be finite and positive, got {args.token_lr_mult}")
-    if not args.tie_embeddings and args.token_lr_mult != 1.0:
-        raise ValueError("TOKEN_LR_MULT override requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1226,8 +1221,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    token_default_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_lr = token_default_lr * args.token_lr_mult
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1249,7 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_head: torch.optim.Optimizer | None = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1258,25 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    def group_live_lr(opt: torch.optim.Optimizer | None) -> float:
-        return float(opt.param_groups[0]["lr"]) if opt is not None and opt.param_groups else 0.0
-
-    def group_base_lr(opt: torch.optim.Optimizer | None) -> float:
-        if opt is None or not opt.param_groups:
-            return 0.0
-        group = opt.param_groups[0]
-        return float(group.get("base_lr", group["lr"]))
-
-    def log_optimizer_lr_groups(stage: str) -> None:
-        log0(
-            f"optimizer_lr_groups stage:{stage} tie_embeddings:{args.tie_embeddings} "
-            f"token_default_lr:{token_default_lr:.8f} token_lr_mult:{args.token_lr_mult:.8f} "
-            f"tok_base_lr:{group_base_lr(optimizer_tok):.8f} tok_lr:{group_live_lr(optimizer_tok):.8f} "
-            f"head_base_lr:{group_base_lr(optimizer_head):.8f} head_lr:{group_live_lr(optimizer_head):.8f} "
-            f"matrix_base_lr:{group_base_lr(optimizer_muon):.8f} matrix_lr:{group_live_lr(optimizer_muon):.8f} "
-            f"scalar_base_lr:{group_base_lr(optimizer_scalar):.8f} scalar_lr:{group_live_lr(optimizer_scalar):.8f}"
-        )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1288,12 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_tok_scope stage:startup tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_embeddings_only'} "
-        f"tensors:1 numel:{base_model.tok_emb.weight.numel()} names:tok_emb.weight"
-    )
-    log_optimizer_lr_groups("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1352,12 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log0(
-        f"optimizer_tok_scope stage:post_restore_startup tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_embeddings_only'} "
-        f"tensors:1 numel:{base_model.tok_emb.weight.numel()} names:tok_emb.weight"
-    )
-    log_optimizer_lr_groups("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1390,8 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"tok_lr:{group_live_lr(optimizer_tok):.8f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1442,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"tok_lr:{group_live_lr(optimizer_tok):.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1459,12 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log0(
-        f"optimizer_tok_scope stage:final tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_embeddings_only'} "
-        f"tensors:1 numel:{base_model.tok_emb.weight.numel()} names:tok_emb.weight"
-    )
-    log_optimizer_lr_groups("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
