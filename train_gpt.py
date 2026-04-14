@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_family_audit = bool(int(os.environ.get("SCALAR_FAMILY_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1083,6 +1084,140 @@ class GPT(nn.Module):
 # -----------------------------
 # TRAINING
 # -----------------------------
+SCALAR_FAMILY_AUDIT_SPECS = (
+    ("attn_scale", ("attn_scale",)),
+    ("mlp_scale", ("mlp_scale",)),
+    ("resid_mix", ("resid_mix",)),
+    ("q_gain", ("attn.q_gain",)),
+    ("skip_weights", ("skip_weights",)),
+)
+
+
+def build_scalar_family_named_params(model: nn.Module) -> dict[str, list[tuple[str, nn.Parameter]]]:
+    families = {family: [] for family, _ in SCALAR_FAMILY_AUDIT_SPECS}
+    for name, param in model.named_parameters():
+        for family, suffixes in SCALAR_FAMILY_AUDIT_SPECS:
+            if any(name.endswith(suffix) for suffix in suffixes):
+                families[family].append((name, param))
+                break
+    return families
+
+
+def capture_scalar_family_init(
+    scalar_family_named_params: dict[str, list[tuple[str, nn.Parameter]]]
+) -> dict[str, list[tuple[str, Tensor]]]:
+    return {
+        family: [(name, param.detach().float().cpu().clone()) for name, param in named_params]
+        for family, named_params in scalar_family_named_params.items()
+    }
+
+
+def log_scalar_family_optimizer_audit(
+    log0,
+    stage: str,
+    optimizer_scalar: torch.optim.Optimizer,
+    scalar_family_named_params: dict[str, list[tuple[str, nn.Parameter]]],
+) -> None:
+    scalar_param_ids = {id(param) for group in optimizer_scalar.param_groups for param in group["params"]}
+    scalar_tensor_count = len(scalar_param_ids)
+    scalar_numel = sum(
+        int(param.numel()) for group in optimizer_scalar.param_groups for param in group["params"]
+    )
+    lr_min = min(float(group["lr"]) for group in optimizer_scalar.param_groups)
+    lr_max = max(float(group["lr"]) for group in optimizer_scalar.param_groups)
+    base_lr_min = min(float(group.get("base_lr", group["lr"])) for group in optimizer_scalar.param_groups)
+    base_lr_max = max(float(group.get("base_lr", group["lr"])) for group in optimizer_scalar.param_groups)
+    log0(
+        "optimizer_scalar_group "
+        f"stage:{stage} "
+        f"scalar_tensors:{scalar_tensor_count} "
+        f"scalar_numel:{scalar_numel} "
+        f"scalar_lr_min:{lr_min:.8f} "
+        f"scalar_lr_max:{lr_max:.8f} "
+        f"scalar_base_lr_min:{base_lr_min:.8f} "
+        f"scalar_base_lr_max:{base_lr_max:.8f}"
+    )
+    family_parts = [f"stage:{stage}"]
+    for family, named_params in scalar_family_named_params.items():
+        family_tensors = sum(1 for _, param in named_params if id(param) in scalar_param_ids)
+        family_numel = sum(int(param.numel()) for _, param in named_params if id(param) in scalar_param_ids)
+        family_parts.append(f"{family}_tensors:{family_tensors}")
+        family_parts.append(f"{family}_numel:{family_numel}")
+        family_parts.append(f"{family}_in_scalar_group:{family_tensors == len(named_params)}")
+    log0("scalar_family_membership " + " ".join(family_parts))
+
+
+def capture_scalar_family_step_audit(
+    scalar_family_named_params: dict[str, list[tuple[str, nn.Parameter]]]
+) -> dict[str, dict[str, object]]:
+    step_audit: dict[str, dict[str, object]] = {}
+    for family, named_params in scalar_family_named_params.items():
+        pre_sq = 0.0
+        grad_sq = 0.0
+        snapshots: list[tuple[nn.Parameter, Tensor]] = []
+        for _, param in named_params:
+            snapshots.append((param, param.detach().clone()))
+            param_fp32 = param.detach().float()
+            pre_sq += float(torch.sum(param_fp32 * param_fp32).item())
+            if param.grad is not None:
+                grad_fp32 = param.grad.detach().float()
+                grad_sq += float(torch.sum(grad_fp32 * grad_fp32).item())
+        step_audit[family] = {
+            "pre_norm": math.sqrt(pre_sq),
+            "grad_norm": math.sqrt(grad_sq),
+            "snapshots": snapshots,
+        }
+    return step_audit
+
+
+def finalize_scalar_family_step_audit(
+    log0,
+    step: int,
+    scalar_family_step_audit: dict[str, dict[str, object]],
+) -> None:
+    audit_parts = [f"step:{step}"]
+    for family, audit in scalar_family_step_audit.items():
+        update_sq = 0.0
+        snapshots = audit["snapshots"]
+        if not isinstance(snapshots, list):
+            raise TypeError("snapshots must be a list")
+        for param, before in snapshots:
+            delta = (param.detach() - before).float()
+            update_sq += float(torch.sum(delta * delta).item())
+        pre_norm = float(audit["pre_norm"])
+        grad_norm = float(audit["grad_norm"])
+        denom = max(pre_norm, 1e-12)
+        audit_parts.append(f"{family}_grad_to_param:{grad_norm / denom:.8f}")
+        audit_parts.append(f"{family}_update_to_param:{math.sqrt(update_sq) / denom:.8f}")
+    log0("scalar_family_audit_step " + " ".join(audit_parts))
+
+
+def log_scalar_family_final_audit(
+    log0,
+    completed_updates: int,
+    scalar_family_named_params: dict[str, list[tuple[str, nn.Parameter]]],
+    scalar_family_init: dict[str, list[tuple[str, Tensor]]],
+) -> None:
+    audit_parts = [
+        f"completed_updates:{completed_updates}",
+        "ratio_denominators:step=pre_step_param_norm final=init_param_norm",
+    ]
+    for family, named_params in scalar_family_named_params.items():
+        init_named_params = scalar_family_init[family]
+        if len(init_named_params) != len(named_params):
+            raise RuntimeError(f"Scalar family {family} changed size between init and final audit")
+        init_sq = 0.0
+        drift_sq = 0.0
+        for (name, param), (init_name, init_tensor) in zip(named_params, init_named_params, strict=True):
+            if name != init_name:
+                raise RuntimeError(f"Scalar family {family} name mismatch: {name} != {init_name}")
+            current_cpu = param.detach().float().cpu()
+            init_sq += float(torch.sum(init_tensor * init_tensor).item())
+            diff = current_cpu - init_tensor
+            drift_sq += float(torch.sum(diff * diff).item())
+        audit_parts.append(f"{family}_drift_to_init:{math.sqrt(drift_sq) / max(math.sqrt(init_sq), 1e-12):.8f}")
+    log0("scalar_family_audit_final " + " ".join(audit_parts))
+
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1251,6 +1386,8 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    scalar_family_named_params = build_scalar_family_named_params(base_model)
+    scalar_family_init: dict[str, list[tuple[str, Tensor]]] | None = None
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1269,6 +1406,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.scalar_family_audit:
+        log_scalar_family_optimizer_audit(log0, "startup", optimizer_scalar, scalar_family_named_params)
+        log0(
+            "scalar_family_audit_startup "
+            "ratio_denominators:step=pre_step_param_norm final=init_param_norm "
+            f"families:{','.join(family for family, _ in SCALAR_FAMILY_AUDIT_SPECS)}"
+        )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1464,10 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.scalar_family_audit:
+            log_scalar_family_optimizer_audit(log0, "post_restore_startup", optimizer_scalar, scalar_family_named_params)
+    if args.scalar_family_audit:
+        scalar_family_init = capture_scalar_family_init(scalar_family_named_params)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1388,6 +1536,15 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        should_log_train = (
+            args.train_log_every > 0
+            and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        scalar_family_step_audit = (
+            capture_scalar_family_step_audit(scalar_family_named_params)
+            if args.scalar_family_audit and should_log_train
+            else None
+        )
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1396,15 +1553,13 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if scalar_family_step_audit is not None:
+                finalize_scalar_family_step_audit(log0, step, scalar_family_step_audit)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1574,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.scalar_family_audit:
+        log_scalar_family_optimizer_audit(log0, "final", optimizer_scalar, scalar_family_named_params)
+        if scalar_family_init is None:
+            raise RuntimeError("scalar_family_init must be captured when SCALAR_FAMILY_AUDIT=1")
+        log_scalar_family_final_audit(log0, step, scalar_family_named_params, scalar_family_init)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
