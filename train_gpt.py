@@ -55,6 +55,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_audit_tokens = int(os.environ.get("WARMUP_AUDIT_TOKENS", 8))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -794,6 +795,30 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
+    def cursor(self) -> tuple[str, int]:
+        return str(self.files[self.file_idx]), self.pos
+
+    def peek(self, n: int) -> Tensor:
+        if n <= 0:
+            return self.tokens.new_empty((0,))
+        chunks: list[Tensor] = []
+        remaining = n
+        file_idx = self.file_idx
+        pos = self.pos
+        tokens = self.tokens
+        while remaining > 0:
+            avail = tokens.numel() - pos
+            if avail <= 0:
+                file_idx = (file_idx + 1) % len(self.files)
+                tokens = load_data_shard(self.files[file_idx])
+                pos = 0
+                continue
+            k = min(remaining, avail)
+            chunks.append(tokens[pos : pos + k])
+            pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
@@ -817,13 +842,45 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.batch_calls = 0
+        self.total_stream_tokens_taken = 0
+        self.total_train_tokens_emitted = 0
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def batch_layout(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[int, int, int]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        if local_tokens % seq_len != 0:
+            raise ValueError(
+                f"Per-rank token count must divide seq_len exactly, got local_tokens={local_tokens} seq_len={seq_len}"
+            )
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        stream_tokens = per_rank_span * self.world_size
+        return local_tokens, per_rank_span, stream_tokens
+
+    def inspect_next_local_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int, prefix_tokens: int) -> dict[str, object]:
+        local_tokens, per_rank_span, stream_tokens = self.batch_layout(global_tokens, seq_len, grad_accum_steps)
+        file_name, pos = self.stream.cursor()
+        chunk = self.stream.peek(stream_tokens)
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        prefix_len = min(prefix_tokens, local_tokens)
+        return {
+            "file": file_name,
+            "pos": pos,
+            "local_tokens": local_tokens,
+            "per_rank_span": per_rank_span,
+            "stream_tokens": stream_tokens,
+            "input_prefix": local[:-1][:prefix_len].tolist(),
+            "target_prefix": local[1:][:prefix_len].tolist(),
+        }
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens, per_rank_span, stream_tokens = self.batch_layout(global_tokens, seq_len, grad_accum_steps)
+        chunk = self.stream.take(stream_tokens)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        self.batch_calls += 1
+        self.total_stream_tokens_taken += stream_tokens
+        self.total_train_tokens_emitted += local_tokens * self.world_size
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -1269,12 +1326,44 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"warmup_audit_tokens:{args.warmup_audit_tokens}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    warmup_audit_enabled = args.warmup_audit_tokens > 0
+    first_measured_batch_logged = False
+
+    def format_prefix(tokens: list[int]) -> str:
+        return ",".join(str(int(t)) for t in tokens) if tokens else "none"
+
+    def capture_loader_prefix(loader: DistributedTokenLoader) -> dict[str, object] | None:
+        if not warmup_audit_enabled:
+            return None
+        return loader.inspect_next_local_batch(
+            args.train_batch_tokens,
+            args.train_seq_len,
+            grad_accum_steps,
+            args.warmup_audit_tokens,
+        )
+
+    def log_loader_prefix(stage: str, info: dict[str, object] | None, extra: str = "") -> None:
+        if info is None:
+            return
+        suffix = f" {extra}" if extra else ""
+        log0(
+            f"train_stream_audit:{stage} rank:{rank} "
+            f"file:{info['file']} pos:{info['pos']} "
+            f"local_tokens:{info['local_tokens']} per_rank_span:{info['per_rank_span']} "
+            f"stream_tokens:{info['stream_tokens']} "
+            f"input_prefix:{format_prefix(info['input_prefix'])} "
+            f"target_prefix:{format_prefix(info['target_prefix'])}{suffix}"
+        )
+
+    initial_loader_prefix = capture_loader_prefix(train_loader)
+    log_loader_prefix("initial", initial_loader_prefix)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1296,6 +1385,11 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        warmup_local_tokens, _, warmup_stream_tokens = train_loader.batch_layout(
+            args.train_batch_tokens,
+            args.train_seq_len,
+            grad_accum_steps,
+        )
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1313,6 +1407,31 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        post_warmup_prefix = capture_loader_prefix(train_loader)
+        expected_batch_calls = args.warmup_steps * grad_accum_steps
+        expected_stream_tokens = expected_batch_calls * warmup_stream_tokens
+        expected_train_tokens = expected_batch_calls * warmup_local_tokens * world_size
+        replay_matches_initial_input = int(
+            bool(post_warmup_prefix is not None and initial_loader_prefix is not None)
+            and post_warmup_prefix["input_prefix"] == initial_loader_prefix["input_prefix"]
+        )
+        replay_matches_initial_target = int(
+            bool(post_warmup_prefix is not None and initial_loader_prefix is not None)
+            and post_warmup_prefix["target_prefix"] == initial_loader_prefix["target_prefix"]
+        )
+        log_loader_prefix(
+            "post_warmup_pre_reset",
+            post_warmup_prefix,
+            extra=(
+                f"batch_calls:{train_loader.batch_calls} expected_batch_calls:{expected_batch_calls} "
+                f"stream_tokens_taken:{train_loader.total_stream_tokens_taken} "
+                f"expected_stream_tokens:{expected_stream_tokens} "
+                f"train_tokens_emitted:{train_loader.total_train_tokens_emitted} "
+                f"expected_train_tokens:{expected_train_tokens} "
+                f"replay_matches_initial_input:{replay_matches_initial_input} "
+                f"replay_matches_initial_target:{replay_matches_initial_target}"
+            ),
+        )
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1320,6 +1439,26 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        post_reset_prefix = capture_loader_prefix(train_loader)
+        replay_matches_initial_input = int(
+            bool(post_reset_prefix is not None and initial_loader_prefix is not None)
+            and post_reset_prefix["input_prefix"] == initial_loader_prefix["input_prefix"]
+        )
+        replay_matches_initial_target = int(
+            bool(post_reset_prefix is not None and initial_loader_prefix is not None)
+            and post_reset_prefix["target_prefix"] == initial_loader_prefix["target_prefix"]
+        )
+        log_loader_prefix(
+            "post_warmup_post_reset",
+            post_reset_prefix,
+            extra=(
+                f"batch_calls:{train_loader.batch_calls} "
+                f"stream_tokens_taken:{train_loader.total_stream_tokens_taken} "
+                f"train_tokens_emitted:{train_loader.total_train_tokens_emitted} "
+                f"replay_matches_initial_input:{replay_matches_initial_input} "
+                f"replay_matches_initial_target:{replay_matches_initial_target}"
+            ),
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1373,6 +1512,29 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if not first_measured_batch_logged:
+                prefix_len = min(args.warmup_audit_tokens, x.size(0) * x.size(1))
+                first_input_prefix = x.reshape(-1)[:prefix_len].detach().cpu().tolist()
+                first_target_prefix = y.reshape(-1)[:prefix_len].detach().cpu().tolist()
+                replay_matches_initial_input = int(
+                    bool(initial_loader_prefix is not None) and first_input_prefix == initial_loader_prefix["input_prefix"]
+                )
+                replay_matches_initial_target = int(
+                    bool(initial_loader_prefix is not None) and first_target_prefix == initial_loader_prefix["target_prefix"]
+                )
+                cursor_file, cursor_pos = train_loader.stream.cursor()
+                log0(
+                    f"train_stream_audit:first_measured_batch rank:{rank} "
+                    f"file:{cursor_file} pos:{cursor_pos} "
+                    f"batch_calls:{train_loader.batch_calls} "
+                    f"stream_tokens_taken:{train_loader.total_stream_tokens_taken} "
+                    f"train_tokens_emitted:{train_loader.total_train_tokens_emitted} "
+                    f"input_prefix:{format_prefix(first_input_prefix)} "
+                    f"target_prefix:{format_prefix(first_target_prefix)} "
+                    f"replay_matches_initial_input:{replay_matches_initial_input} "
+                    f"replay_matches_initial_target:{replay_matches_initial_target}"
+                )
+                first_measured_batch_logged = True
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
