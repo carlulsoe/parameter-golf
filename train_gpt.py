@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not math.isfinite(args.token_weight_decay) or args.token_weight_decay < 0:
-        raise ValueError(f"TOKEN_WEIGHT_DECAY must be finite and non-negative, got {args.token_weight_decay}")
-    if args.token_weight_decay > 0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_WEIGHT_DECAY>0 requires TIE_EMBEDDINGS=1 so optimizer_tok still scopes the shared embedding/logit matrix")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1227,22 +1222,12 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_param_group = {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
-    if args.token_weight_decay > 0:
-        tok_param_group["weight_decay"] = args.token_weight_decay
-        optimizer_tok = torch.optim.AdamW(
-            [tok_param_group],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-    else:
-        optimizer_tok = torch.optim.Adam(
-            [tok_param_group],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -1267,24 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_token_optimizer_audit(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        group_weight_decay = float(tok_group.get("weight_decay", 0.0))
-        tok_tensor_count = sum(len(group["params"]) for group in optimizer_tok.param_groups)
-        tok_numel = sum(p.numel() for group in optimizer_tok.param_groups for p in group["params"])
-        log0(
-            "optimizer_tok audit: "
-            f"stage:{stage} "
-            f"optimizer:{type(optimizer_tok).__name__} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_embeddings_only'} "
-            f"lr:{float(tok_group['lr']):.8f} "
-            f"base_lr:{float(tok_group['base_lr']):.8f} "
-            f"weight_decay:{group_weight_decay:.8f} "
-            f"tensor_count:{tok_tensor_count} "
-            f"numel:{tok_numel}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1295,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log_token_optimizer_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1354,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_token_optimizer_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1454,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_token_optimizer_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
