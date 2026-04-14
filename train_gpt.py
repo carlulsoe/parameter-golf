@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    q_gain_lr_mult = float(os.environ.get("Q_GAIN_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.q_gain_lr_mult <= 0.0:
+        raise ValueError(f"Q_GAIN_LR_MULT must be positive, got {args.q_gain_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1214,11 +1217,16 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    q_gain_split_active = args.q_gain_lr_mult != 1.0
+    q_gain_named_params = [p for name, p in block_named_params if name.endswith("attn.q_gain")]
+    q_gain_names = [f"blocks.{name}" for name, _ in block_named_params if name.endswith("attn.q_gain")]
+    scalar_params = []
+    for name, p in block_named_params:
+        if not (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)):
+            continue
+        if q_gain_split_active and name.endswith("attn.q_gain"):
+            continue
+        scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1243,6 +1251,16 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_q_gain = None
+    if q_gain_split_active:
+        q_gain_lr = args.scalar_lr * args.q_gain_lr_mult
+        optimizer_q_gain = torch.optim.Adam(
+            [{"params": q_gain_named_params, "lr": q_gain_lr, "base_lr": q_gain_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_q_gain)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1251,6 +1269,28 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    scalar_numel = sum(int(p.numel()) for p in scalar_params)
+    q_gain_numel = sum(int(p.numel()) for p in q_gain_named_params)
+
+    def log_scalar_group_audit(stage: str) -> None:
+        scalar_lr_live = float(optimizer_scalar.param_groups[0]["lr"])
+        scalar_base_lr = float(optimizer_scalar.param_groups[0]["base_lr"])
+        q_gain_lr_live = float(optimizer_q_gain.param_groups[0]["lr"]) if optimizer_q_gain is not None else scalar_lr_live
+        q_gain_base_lr = (
+            float(optimizer_q_gain.param_groups[0]["base_lr"]) if optimizer_q_gain is not None else scalar_base_lr
+        )
+        log0(
+            "optimizer_scalar_groups: "
+            f"stage:{stage} "
+            f"q_gain_split_active:{q_gain_split_active} "
+            f"scalar_tensors:{len(scalar_params)} scalar_numel:{scalar_numel} "
+            f"q_gain_tensors:{len(q_gain_named_params)} q_gain_numel:{q_gain_numel} "
+            f"scalar_lr:{scalar_lr_live:.8f} scalar_base_lr:{scalar_base_lr:.8f} "
+            f"q_gain_lr:{q_gain_lr_live:.8f} q_gain_base_lr:{q_gain_base_lr:.8f}"
+        )
+        if q_gain_split_active:
+            log0(f"optimizer_q_gain_names: stage:{stage} names:{','.join(q_gain_names)}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1262,6 +1302,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"q_gain_lr_mult:{args.q_gain_lr_mult:.8f}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1269,6 +1310,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_scalar_group_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1362,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_scalar_group_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1462,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_scalar_group_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
