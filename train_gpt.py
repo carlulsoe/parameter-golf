@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    resid_mix_lr_mult = float(os.environ.get("RESID_MIX_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.resid_mix_lr_mult) or args.resid_mix_lr_mult <= 0:
-        raise ValueError(f"RESID_MIX_LR_MULT must be finite and positive, got {args.resid_mix_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1211,24 +1208,19 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith(".resid_mix")]
-    other_scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and not name.endswith(".resid_mix")
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        other_scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    resid_mix_params = [p for _, p in resid_mix_named_params]
-    other_scalar_params = [p for _, p in other_scalar_named_params]
-    if not resid_mix_params:
-        raise ValueError("Expected resid_mix params in optimizer_scalar")
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1244,22 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    resid_mix_base_lr = args.scalar_lr * args.resid_mix_lr_mult
     optimizer_scalar = torch.optim.Adam(
-        [
-            {
-                "name": "resid_mix",
-                "params": resid_mix_params,
-                "lr": resid_mix_base_lr,
-                "base_lr": resid_mix_base_lr,
-            },
-            {
-                "name": "other_scalar",
-                "params": other_scalar_params,
-                "lr": args.scalar_lr,
-                "base_lr": args.scalar_lr,
-            },
-        ],
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1274,32 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    scalar_param_names = {
-        id(param): name for name, param in resid_mix_named_params + other_scalar_named_params
-    }
-
-    def audit_scalar_optimizer(stage: str) -> None:
-        group_summaries: list[str] = []
-        resid_mix_names_live: list[str] = []
-        for group in optimizer_scalar.param_groups:
-            group_name = str(group.get("name", "unnamed"))
-            group_names = [scalar_param_names.get(id(param), "<unnamed>") for param in group["params"]]
-            if group_name == "resid_mix":
-                resid_mix_names_live = group_names
-            group_numel = sum(int(param.numel()) for param in group["params"])
-            group_summaries.append(
-                f"{group_name}:lr={float(group['lr']):.8f}|base_lr={float(group['base_lr']):.8f}|"
-                f"tensors={len(group['params'])}|numel={group_numel}"
-            )
-        log0(
-            f"optimizer_scalar_groups: stage:{stage} resid_mix_lr_mult:{args.resid_mix_lr_mult:.8f} "
-            f"groups:{';'.join(group_summaries)}"
-        )
-        log0(
-            f"optimizer_resid_mix_names: stage:{stage} tensors:{len(resid_mix_names_live)} "
-            f"names:{','.join(resid_mix_names_live)}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1308,7 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} resid_mix_lr_mult:{args.resid_mix_lr_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1317,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    audit_scalar_optimizer("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1369,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    audit_scalar_optimizer("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1464,8 +1414,6 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
-
-    audit_scalar_optimizer("final")
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
