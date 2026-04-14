@@ -58,7 +58,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
-    eval_audit_token_stride = int(os.environ.get("EVAL_AUDIT_TOKEN_STRIDE", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -281,131 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def eval_val_reset_counts(
-    args: Hyperparameters,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[int, int, int]:
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    local_batch_seqs = local_batch_tokens // args.eval_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
-    val_token_count = torch.zeros((), device=device, dtype=torch.int64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.int64)
-
-    for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-        batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-        raw_start = batch_seq_start * args.eval_seq_len
-        raw_end = batch_seq_end * args.eval_seq_len + 1
-        local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, args.eval_seq_len)
-        y = local[1:].reshape(-1, args.eval_seq_len)
-        val_token_count += y.numel()
-        prev_ids = x.reshape(-1)
-        tgt_ids = y.reshape(-1)
-        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int64)
-        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int64)
-        val_byte_count += token_bytes.sum()
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
-    return int(total_seqs), int(val_token_count.item()), int(val_byte_count.item())
-
-
-def eval_val_overlap_audit(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float, int, int, int]:
-    if args.eval_audit_token_stride <= 0:
-        raise ValueError(f"EVAL_AUDIT_TOKEN_STRIDE must be positive, got {args.eval_audit_token_stride}")
-    if args.eval_audit_token_stride >= args.eval_seq_len:
-        raise ValueError(
-            f"EVAL_AUDIT_TOKEN_STRIDE must be smaller than EVAL_SEQ_LEN, got "
-            f"{args.eval_audit_token_stride} vs {args.eval_seq_len}"
-        )
-    if args.eval_seq_len % args.eval_audit_token_stride != 0:
-        raise ValueError(
-            f"EVAL_AUDIT_TOKEN_STRIDE must divide EVAL_SEQ_LEN, got "
-            f"{args.eval_audit_token_stride} vs {args.eval_seq_len}"
-        )
-
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.eval_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    local_batch_windows = local_batch_tokens // args.eval_seq_len
-    total_windows = 1 + (val_tokens.numel() - 1 - args.eval_seq_len) // args.eval_audit_token_stride
-    window_start = (total_windows * rank) // world_size
-    window_end = (total_windows * (rank + 1)) // world_size
-    score_suffix_len = args.eval_audit_token_stride
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.int64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.int64)
-
-    model.eval()
-    with torch.inference_mode():
-        for batch_window_start in range(window_start, window_end, local_batch_windows):
-            batch_window_end = min(batch_window_start + local_batch_windows, window_end)
-            batch_windows = batch_window_end - batch_window_start
-            raw_start = batch_window_start * args.eval_audit_token_stride
-            raw_end = (batch_window_end - 1) * args.eval_audit_token_stride + args.eval_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            offsets = torch.arange(batch_windows, device=device, dtype=torch.int64) * args.eval_audit_token_stride
-            window_offsets = offsets[:, None] + torch.arange(args.eval_seq_len, device=device, dtype=torch.int64)[None, :]
-            x = local[window_offsets]
-            y = local[window_offsets + 1]
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                token_losses = model(x, y, loss_reduction="none").detach()
-            score_mask = torch.zeros((batch_windows, args.eval_seq_len), device=device, dtype=torch.bool)
-            score_mask[:, -score_suffix_len:] = True
-            if batch_window_start == 0:
-                score_mask[0, :] = True
-            val_loss_sum += token_losses.masked_select(score_mask).to(torch.float64).sum()
-            val_token_count += int(score_mask.sum().item())
-            prev_ids = x.masked_select(score_mask)
-            tgt_ids = y.masked_select(score_mask)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int64)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int64)
-            val_byte_count += token_bytes.sum()
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count.to(torch.float64)
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
-    return (
-        float(val_loss.item()),
-        float(bits_per_token * tokens_per_byte),
-        int(total_windows),
-        int(val_token_count.item()),
-        int(val_byte_count.item()),
-    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1179,7 +1053,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, loss_reduction: str = "mean") -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1195,7 +1069,6 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        target_shape = target_ids.shape
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1204,12 +1077,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        token_losses = F.cross_entropy(logits.float(), targets, reduction="none")
-        if loss_reduction == "mean":
-            return token_losses.mean()
-        if loss_reduction == "none":
-            return token_losses.view(target_shape)
-        raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -1683,46 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    if args.eval_audit_token_stride > 0:
-        overlap_val_loss, overlap_val_bpb, overlap_windows, overlap_token_count, overlap_byte_count = eval_val_overlap_audit(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
-        reset_chunks, reset_token_count, reset_byte_count = eval_val_reset_counts(
-            args,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
-        log0(
-            "final_int8_zlib_roundtrip_overlap_audit "
-            f"val_loss:{overlap_val_loss:.8f} "
-            f"val_bpb:{overlap_val_bpb:.8f} "
-            f"delta_val_loss:{overlap_val_loss - q_val_loss:+.8f} "
-            f"delta_val_bpb:{overlap_val_bpb - q_val_bpb:+.8f} "
-            f"stride:{args.eval_audit_token_stride} "
-            f"reset_chunks:{reset_chunks} "
-            f"overlap_windows:{overlap_windows} "
-            f"token_count:{overlap_token_count} "
-            f"reset_token_count:{reset_token_count} "
-            f"token_count_equal:{overlap_token_count == reset_token_count} "
-            f"byte_count:{overlap_byte_count} "
-            f"reset_byte_count:{reset_byte_count} "
-            f"byte_count_equal:{overlap_byte_count == reset_byte_count}"
-        )
 
     if distributed:
         dist.destroy_process_group()
