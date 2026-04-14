@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_lr_mult = float(os.environ.get("SCALAR_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.scalar_lr_mult <= 0.0:
+        raise ValueError(f"SCALAR_LR_MULT must be positive, got {args.scalar_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1208,7 +1211,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1219,9 +1222,16 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    scalar_param_names = [
+        name
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        scalar_param_names.append("skip_weights")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    scalar_lr = args.scalar_lr * args.scalar_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1237,7 +1247,7 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [{"params": scalar_params, "lr": scalar_lr, "base_lr": scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1252,6 +1262,29 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    scalar_param_numel = sum(int(p.numel()) for p in scalar_params)
+
+    def log_optimizer_lr_groups(stage: str) -> None:
+        log0(
+            "optimizer_lr_groups "
+            f"stage:{stage} "
+            f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
+            f"token_baseline_lr:{token_lr:.8f} "
+            f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
+            f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
+            f"scalar_baseline_lr:{args.scalar_lr:.8f} "
+            f"scalar_lr_mult:{args.scalar_lr_mult:.8f}"
+        )
+
+    def log_optimizer_scalar_scope(stage: str) -> None:
+        log0(
+            "optimizer_scalar_scope "
+            f"stage:{stage} "
+            f"tensors:{len(scalar_params)} "
+            f"numel:{scalar_param_numel} "
+            f"names:{','.join(scalar_param_names)}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1260,7 +1293,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1269,6 +1302,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_lr_groups(stage="startup")
+    log_optimizer_scalar_scope(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1355,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_lr_groups(stage="post_restore_startup")
+        log_optimizer_scalar_scope(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1352,7 +1389,10 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1403,7 +1443,10 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
+                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1462,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_lr_groups(stage="final")
+    log_optimizer_scalar_scope(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
