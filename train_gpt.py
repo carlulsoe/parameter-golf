@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    skip_weights_beta2 = float(os.environ.get("SKIP_WEIGHTS_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not (0.0 <= args.skip_weights_beta2 < 1.0):
-        raise ValueError(f"SKIP_WEIGHTS_BETA2 must be in [0, 1), got {args.skip_weights_beta2}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1222,8 +1219,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    skip_weights_split_active = base_model.skip_weights.numel() > 0 and args.skip_weights_beta2 != args.beta2
-    if base_model.skip_weights.numel() > 0 and not skip_weights_split_active:
+    if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1247,15 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_skip_weights = None
-    if skip_weights_split_active:
-        optimizer_skip_weights = torch.optim.Adam(
-            [{"params": [base_model.skip_weights], "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.skip_weights_beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_skip_weights)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1264,41 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    def format_optimizer_betas(optimizer: torch.optim.Optimizer | None, fallback: str = "inactive") -> str:
-        if optimizer is None:
-            return fallback
-        beta1, beta2 = optimizer.param_groups[0]["betas"]
-        return f"({beta1:.5f},{beta2:.5f})"
-
-    def log_optimizer_group_audit(stage: str) -> None:
-        scalar_numel = sum(int(p.numel()) for p in scalar_params)
-        skip_numel = int(base_model.skip_weights.numel()) if skip_weights_split_active else 0
-        skip_tensor_count = 1 if skip_weights_split_active else 0
-        log0(
-            "optimizer_beta_config "
-            f"beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-            f"skip_weights_beta2:{args.skip_weights_beta2:.5f}"
-        )
-        log0(
-            "optimizer_scalar_groups "
-            f"stage:{stage} "
-            f"skip_weights_split_active:{skip_weights_split_active} "
-            f"scalar_tensors:{len(scalar_params)} "
-            f"scalar_numel:{scalar_numel} "
-            f"skip_weights_tensors:{skip_tensor_count} "
-            f"skip_weights_numel:{skip_numel} "
-            f"scalar_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-            f"skip_weights_lr:{(optimizer_skip_weights.param_groups[0]['base_lr'] if optimizer_skip_weights is not None else optimizer_scalar.param_groups[0]['base_lr']):.8f}"
-        )
-        log0(
-            "optimizer_betas "
-            f"stage:{stage} "
-            f"tok:{format_optimizer_betas(optimizer_tok)} "
-            f"scalar:{format_optimizer_betas(optimizer_scalar)} "
-            f"skip_weights:{format_optimizer_betas(optimizer_skip_weights, fallback='shared')} "
-            f"head:{format_optimizer_betas(optimizer_head if base_model.lm_head is not None else None)}"
-        )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1310,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log_optimizer_group_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1369,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_group_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1469,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_group_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
