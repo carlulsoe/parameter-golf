@@ -60,6 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    warmup_audit_tokens = int(os.environ.get("WARMUP_AUDIT_TOKENS", 0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -794,6 +795,30 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
+    def describe_position(self) -> tuple[str, int]:
+        return self.files[self.file_idx].name, self.pos
+
+    def peek(self, n: int) -> Tensor:
+        if n <= 0:
+            return torch.empty(0, dtype=self.tokens.dtype)
+        chunks: list[Tensor] = []
+        file_idx = self.file_idx
+        tokens = self.tokens
+        pos = self.pos
+        remaining = n
+        while remaining > 0:
+            avail = tokens.numel() - pos
+            if avail <= 0:
+                file_idx = (file_idx + 1) % len(self.files)
+                tokens = load_data_shard(self.files[file_idx])
+                pos = 0
+                continue
+            k = min(remaining, avail)
+            chunks.append(tokens[pos : pos + k])
+            pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
@@ -817,16 +842,39 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.batch_calls = 0
+        self.total_stream_tokens_taken = 0
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        global_span = per_rank_span * self.world_size
+        chunk = self.stream.take(global_span)
+        self.batch_calls += 1
+        self.total_stream_tokens_taken += global_span
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def describe_state(self) -> tuple[str, int, int, int]:
+        file_name, pos = self.stream.describe_position()
+        return file_name, pos, self.batch_calls, self.total_stream_tokens_taken
+
+    def peek_local_batch_prefix(self, global_tokens: int, seq_len: int, grad_accum_steps: int, prefix_tokens: int) -> tuple[list[int], list[int]]:
+        if prefix_tokens <= 0:
+            return [], []
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.peek(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        x_prefix = x.reshape(-1)[:prefix_tokens].tolist()
+        y_prefix = y.reshape(-1)[:prefix_tokens].tolist()
+        return x_prefix, y_prefix
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1269,12 +1317,29 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.warmup_audit_tokens < 0:
+        raise ValueError(f"WARMUP_AUDIT_TOKENS must be non-negative, got {args.warmup_audit_tokens}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    initial_audit_input_prefix: list[int] = []
+    initial_audit_target_prefix: list[int] = []
+    first_measured_batch_audited = False
+    if args.warmup_audit_tokens > 0:
+        initial_file, initial_pos, initial_batch_calls, initial_stream_tokens_taken = train_loader.describe_state()
+        initial_audit_input_prefix, initial_audit_target_prefix = train_loader.peek_local_batch_prefix(
+            args.train_batch_tokens, args.train_seq_len, grad_accum_steps, args.warmup_audit_tokens
+        )
+        log0(
+            "train_stream_audit:initial "
+            f"file:{initial_file} pos:{initial_pos} "
+            f"batch_calls:{initial_batch_calls} total_stream_tokens_taken:{initial_stream_tokens_taken} "
+            f"input_prefix:{','.join(map(str, initial_audit_input_prefix))} "
+            f"target_prefix:{','.join(map(str, initial_audit_target_prefix))}"
+        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1313,6 +1378,22 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        if args.warmup_audit_tokens > 0:
+            post_warmup_file, post_warmup_pos, post_warmup_batch_calls, post_warmup_stream_tokens_taken = train_loader.describe_state()
+            post_warmup_input_prefix, post_warmup_target_prefix = train_loader.peek_local_batch_prefix(
+                args.train_batch_tokens, args.train_seq_len, grad_accum_steps, args.warmup_audit_tokens
+            )
+            expected_stream_tokens = args.warmup_steps * grad_accum_steps * (args.train_batch_tokens // grad_accum_steps + world_size)
+            log0(
+                "train_stream_audit:post_warmup_pre_reset "
+                f"file:{post_warmup_file} pos:{post_warmup_pos} "
+                f"batch_calls:{post_warmup_batch_calls} "
+                f"expected_batch_calls:{args.warmup_steps * grad_accum_steps} "
+                f"total_stream_tokens_taken:{post_warmup_stream_tokens_taken} "
+                f"expected_stream_tokens:{expected_stream_tokens} "
+                f"input_prefix:{','.join(map(str, post_warmup_input_prefix))} "
+                f"target_prefix:{','.join(map(str, post_warmup_target_prefix))}"
+            )
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1320,6 +1401,23 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if args.warmup_audit_tokens > 0:
+            reset_file, reset_pos, reset_batch_calls, reset_stream_tokens_taken = train_loader.describe_state()
+            reset_input_prefix, reset_target_prefix = train_loader.peek_local_batch_prefix(
+                args.train_batch_tokens, args.train_seq_len, grad_accum_steps, args.warmup_audit_tokens
+            )
+            log0(
+                "train_stream_audit:post_warmup_post_reset "
+                f"file:{reset_file} pos:{reset_pos} "
+                f"batch_calls:{reset_batch_calls} total_stream_tokens_taken:{reset_stream_tokens_taken} "
+                f"input_prefix:{','.join(map(str, reset_input_prefix))} "
+                f"target_prefix:{','.join(map(str, reset_target_prefix))}"
+            )
+            log0(
+                "train_stream_audit:post_warmup_compare "
+                f"replay_matches_initial_input:{int(reset_input_prefix == initial_audit_input_prefix)} "
+                f"replay_matches_initial_target:{int(reset_target_prefix == initial_audit_target_prefix)}"
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1372,6 +1470,21 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            if args.warmup_audit_tokens > 0 and step == 0 and micro_step == 0 and not first_measured_batch_audited:
+                measured_file, measured_pos, measured_batch_calls, measured_stream_tokens_taken = train_loader.describe_state()
+                measured_input_prefix, measured_target_prefix = train_loader.peek_local_batch_prefix(
+                    args.train_batch_tokens, args.train_seq_len, grad_accum_steps, args.warmup_audit_tokens
+                )
+                log0(
+                    "train_stream_audit:first_measured_batch "
+                    f"file:{measured_file} pos:{measured_pos} "
+                    f"batch_calls:{measured_batch_calls} total_stream_tokens_taken:{measured_stream_tokens_taken} "
+                    f"replay_matches_initial_input:{int(measured_input_prefix == initial_audit_input_prefix)} "
+                    f"replay_matches_initial_target:{int(measured_target_prefix == initial_audit_target_prefix)} "
+                    f"input_prefix:{','.join(map(str, measured_input_prefix))} "
+                    f"target_prefix:{','.join(map(str, measured_target_prefix))}"
+                )
+                first_measured_batch_audited = True
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
