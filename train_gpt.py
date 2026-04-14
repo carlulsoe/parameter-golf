@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    mlp_scale_lr_scale = float(os.environ.get("MLP_SCALE_LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.mlp_scale_lr_scale) or args.mlp_scale_lr_scale < 0.0:
-        raise ValueError(f"MLP_SCALE_LR_SCALE must be finite and non-negative, got {args.mlp_scale_lr_scale}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1212,18 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    mlp_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith("mlp_scale")]
-    mlp_scale_split_active = args.mlp_scale_lr_scale != 1.0
-    if mlp_scale_split_active:
-        expected_mlp_scale_names = tuple(f"{i}.mlp_scale" for i in range(args.num_layers))
-        actual_mlp_scale_names = tuple(name for name, _ in mlp_scale_named_params)
-        if actual_mlp_scale_names != expected_mlp_scale_names:
-            raise ValueError(
-                "Unexpected mlp_scale parameter names; "
-                f"expected {expected_mlp_scale_names}, got {actual_mlp_scale_names}"
-            )
-    mlp_scale_name_set = {name for name, _ in mlp_scale_named_params}
-    mlp_scale_params = [p for _, p in mlp_scale_named_params]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1232,8 +1217,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and (not mlp_scale_split_active or name not in mlp_scale_name_set)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1258,18 +1242,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_mlp_scale = None
-    if mlp_scale_split_active:
-        mlp_scale_lr = args.scalar_lr * args.mlp_scale_lr_scale
-        optimizer_mlp_scale = torch.optim.Adam(
-            [{"params": mlp_scale_params, "lr": mlp_scale_lr, "base_lr": mlp_scale_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_mlp_scale is not None:
-        optimizers.append(optimizer_mlp_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1278,28 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    def log_scalar_optimizer_state(stage: str, completed_updates: int | None = None) -> None:
-        scalar_tensor_count = sum(len(group["params"]) for group in optimizer_scalar.param_groups)
-        scalar_numel = sum(int(p.numel()) for group in optimizer_scalar.param_groups for p in group["params"])
-        scalar_lr_live = optimizer_scalar.param_groups[0]["lr"] if optimizer_scalar.param_groups else 0.0
-        mlp_scale_tensor_count = len(mlp_scale_params) if optimizer_mlp_scale is not None else 0
-        mlp_scale_numel = sum(int(p.numel()) for p in mlp_scale_params) if optimizer_mlp_scale is not None else 0
-        mlp_scale_lr_live = optimizer_mlp_scale.param_groups[0]["lr"] if optimizer_mlp_scale is not None else 0.0
-        msg = (
-            f"optimizer_scalar_groups stage:{stage} "
-            f"mode:{'split_active' if optimizer_mlp_scale is not None else 'baseline_unchanged'} "
-            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
-            f"mlp_scale_tensors:{mlp_scale_tensor_count} "
-            f"mlp_scale_numel:{mlp_scale_numel} "
-            f"scalar_lr:{scalar_lr_live:.8f} mlp_scale_lr_scale:{args.mlp_scale_lr_scale:.5f} "
-            f"mlp_scale_lr:{mlp_scale_lr_live:.8f}"
-        )
-        if completed_updates is not None:
-            msg += f" completed_updates:{completed_updates}"
-        log0(msg)
-        if optimizer_mlp_scale is not None:
-            log0(f"optimizer_mlp_scale_names stage:{stage} names:{','.join(name for name, _ in mlp_scale_named_params)}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1311,7 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log_scalar_optimizer_state("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1370,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_scalar_optimizer_state("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1470,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_optimizer_state("final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
