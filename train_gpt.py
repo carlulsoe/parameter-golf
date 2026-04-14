@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    attn_scale_lr_mult = float(os.environ.get("ATTN_SCALE_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1176,8 +1175,6 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    if not math.isfinite(args.attn_scale_lr_mult) or args.attn_scale_lr_mult <= 0.0:
-        raise ValueError(f"ATTN_SCALE_LR_MULT must be finite and positive, got {args.attn_scale_lr_mult}")
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1212,24 +1209,18 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    attn_scale_split_active = not math.isclose(args.attn_scale_lr_mult, 1.0, rel_tol=0.0, abs_tol=0.0)
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    attn_scale_named_params = [(f"blocks.{name}", p) for name, p in block_named_params if name.endswith("attn_scale")]
-    scalar_named_params = [
-        (f"blocks.{name}", p)
+    scalar_params = [
+        p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and (not attn_scale_split_active or not name.endswith("attn_scale"))
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [p for _, p in scalar_named_params]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    attn_scale_params = [p for _, p in attn_scale_named_params]
-    attn_scale_names = [name for name, _ in attn_scale_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1251,18 +1242,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
-    optimizer_attn_scale = None
-    if attn_scale_split_active:
-        attn_scale_lr = args.scalar_lr * args.attn_scale_lr_mult
-        optimizer_attn_scale = torch.optim.Adam(
-            [{"params": attn_scale_params, "lr": attn_scale_lr, "base_lr": attn_scale_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_attn_scale)
-    optimizers.append(optimizer_scalar)
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1271,32 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-
-    def log_attn_scale_optimizer_state(stage: str, completed_updates: int | None = None) -> None:
-        scalar_group = optimizer_scalar.param_groups[0]
-        scalar_tensor_count = sum(len(group["params"]) for group in optimizer_scalar.param_groups)
-        scalar_numel = sum(p.numel() for group in optimizer_scalar.param_groups for p in group["params"])
-        msg = (
-            f"optimizer_scalar_groups stage:{stage} "
-            f"attn_scale_split_active:{attn_scale_split_active} "
-            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
-            f"attn_scale_tensors:{len(attn_scale_params)} "
-            f"attn_scale_numel:{sum(p.numel() for p in attn_scale_params)} "
-            f"scalar_lr:{float(scalar_group['lr']):.8f} "
-            f"scalar_base_lr:{float(scalar_group['base_lr']):.8f} "
-            f"attn_scale_lr_mult:{args.attn_scale_lr_mult:.8f}"
-        )
-        if optimizer_attn_scale is not None:
-            attn_scale_group = optimizer_attn_scale.param_groups[0]
-            msg += (
-                f" attn_scale_lr:{float(attn_scale_group['lr']):.8f} "
-                f"attn_scale_base_lr:{float(attn_scale_group['base_lr']):.8f}"
-            )
-        if completed_updates is not None:
-            msg += f" completed_updates:{completed_updates}"
-        log0(msg)
-        if attn_scale_split_active:
-            log0(f"optimizer_attn_scale_names stage:{stage} names:{','.join(attn_scale_names)}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1315,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_attn_scale_optimizer_state(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1367,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_attn_scale_optimizer_state(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1453,12 +1405,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if attn_scale_split_active and optimizer_attn_scale is not None:
-                log0(
-                    f"optimizer_attn_scale_lr_trace step:{step} "
-                    f"scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
-                    f"attn_scale_lr:{float(optimizer_attn_scale.param_groups[0]['lr']):.8f}"
-                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1473,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_attn_scale_optimizer_state(stage="final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
