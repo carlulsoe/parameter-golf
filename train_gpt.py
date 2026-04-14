@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,6 +1091,11 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    for name, value in (("BETA1", args.beta1), ("BETA2", args.beta2), ("TOKEN_BETA2", args.token_beta2)):
+        if not (0.0 <= value < 1.0):
+            raise ValueError(f"{name} must be in [0, 1), got {value}")
+    if not args.tie_embeddings and args.token_beta2 != args.beta2:
+        raise ValueError("TOKEN_BETA2 override requires TIE_EMBEDDINGS=1 so the token optimizer remains the tied token/logit path")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1138,6 +1144,20 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+    def log_optimizer_adam_betas(stage: str) -> None:
+        tok_beta1, tok_beta2 = optimizer_tok.param_groups[0]["betas"]
+        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
+        head_betas = "(inactive)"
+        if base_model.lm_head is not None:
+            head_beta1, head_beta2 = optimizer_head.param_groups[0]["betas"]
+            head_betas = f"({head_beta1:.5f},{head_beta2:.5f})"
+        log0(
+            f"optimizer_adam_betas stage:{stage} "
+            f"tok:({tok_beta1:.5f},{tok_beta2:.5f}) "
+            f"scalar:({scalar_beta1:.5f},{scalar_beta2:.5f}) "
+            f"head:{head_betas}"
+        )
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -1224,7 +1244,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.token_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1263,12 +1283,17 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"token_beta2:{args.token_beta2:.5f} adam_eps:{args.adam_eps:.8g}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_adam_betas("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1345,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_adam_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1546,6 +1572,7 @@ def main() -> None:
         is_boundary_token_lut,
     )
     torch.cuda.synchronize()
+    log_optimizer_adam_betas("final")
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
