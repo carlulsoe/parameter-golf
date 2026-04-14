@@ -58,7 +58,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
-    eval_audit_token_stride = int(os.environ.get("EVAL_AUDIT_TOKEN_STRIDE", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -281,214 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def forward_logits(model: nn.Module, input_ids: Tensor) -> Tensor:
-    inner_model = model.module if isinstance(model, DDP) else model
-    inner_model = getattr(inner_model, "_orig_mod", inner_model)
-    if not isinstance(inner_model, GPT):
-        raise TypeError(f"Expected GPT model for audit logits, got {type(inner_model).__name__}")
-    x = inner_model.tok_emb(input_ids)
-    x = F.rms_norm(x, (x.size(-1),))
-    x0 = x
-    skips: list[Tensor] = []
-
-    for i in range(inner_model.num_encoder_layers):
-        x = inner_model.blocks[i](x, x0)
-        skips.append(x)
-    for i in range(inner_model.num_decoder_layers):
-        if skips:
-            x = x + inner_model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-        x = inner_model.blocks[inner_model.num_encoder_layers + i](x, x0)
-
-    x = inner_model.final_norm(x)
-    if inner_model.tie_embeddings:
-        logits_proj = F.linear(x, inner_model.tok_emb.weight)
-    else:
-        if inner_model.lm_head is None:
-            raise RuntimeError("lm_head is required when tie_embeddings=False")
-        logits_proj = inner_model.lm_head(x)
-    return inner_model.logit_softcap * torch.tanh(logits_proj / inner_model.logit_softcap)
-
-
-def accumulate_loss_and_bytes(
-    logits: Tensor,
-    x: Tensor,
-    y: Tensor,
-    score_start: int,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    vocab_size = logits.size(-1)
-    scored_logits = logits[:, score_start:, :].reshape(-1, vocab_size)
-    scored_targets = y[:, score_start:].reshape(-1)
-    token_losses = F.cross_entropy(scored_logits.float(), scored_targets, reduction="none")
-    prev_ids = x[:, score_start:].reshape(-1)
-    token_bytes = base_bytes_lut[scored_targets].to(dtype=torch.int16)
-    token_bytes += (has_leading_space_lut[scored_targets] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-    loss_sum = token_losses.to(torch.float64).sum()
-    token_count = torch.tensor(float(scored_targets.numel()), device=logits.device, dtype=torch.float64)
-    byte_count = token_bytes.to(torch.float64).sum()
-    return loss_sum, token_count, byte_count
-
-
-def eval_val_context_audit(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    canonical_val_loss: float,
-    canonical_val_bpb: float,
-) -> dict[str, float | int | bool] | None:
-    stride = args.eval_audit_token_stride
-    if stride <= 0:
-        return None
-    if stride > args.eval_seq_len:
-        raise ValueError(
-            f"EVAL_AUDIT_TOKEN_STRIDE must be in [1, EVAL_SEQ_LEN], got {stride} with EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.eval_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one audit overlap sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    if local_batch_tokens < stride:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one audit matched baseline sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_AUDIT_TOKEN_STRIDE={stride}"
-        )
-
-    total_targets = val_tokens.numel() - 1
-    if total_targets < args.eval_seq_len:
-        raise ValueError(
-            f"Validation split is too short for overlap audit with EVAL_SEQ_LEN={args.eval_seq_len}: "
-            f"total_targets={total_targets}"
-        )
-
-    total_windows = 1 + (total_targets - args.eval_seq_len) // stride
-    matched_tokens = total_windows * stride
-    skipped_prefix_tokens = args.eval_seq_len - stride
-    overlap_batch_windows = max(local_batch_tokens // args.eval_seq_len, 1)
-    baseline_batch_windows = max(local_batch_tokens // stride, 1)
-    window_start = (total_windows * rank) // world_size
-    window_end = (total_windows * (rank + 1)) // world_size
-
-    overlap_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    overlap_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    overlap_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    baseline_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    baseline_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    baseline_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    model.eval()
-    with torch.inference_mode():
-        for batch_window_start in range(window_start, window_end, overlap_batch_windows):
-            batch_window_end = min(batch_window_start + overlap_batch_windows, window_end)
-            x_batch = torch.stack(
-                [
-                    val_tokens[i * stride : i * stride + args.eval_seq_len]
-                    for i in range(batch_window_start, batch_window_end)
-                ]
-            ).to(device=device, dtype=torch.int64, non_blocking=True)
-            y_batch = torch.stack(
-                [
-                    val_tokens[i * stride + 1 : i * stride + args.eval_seq_len + 1]
-                    for i in range(batch_window_start, batch_window_end)
-                ]
-            ).to(device=device, dtype=torch.int64, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = forward_logits(model, x_batch)
-            loss_sum, token_count, byte_count = accumulate_loss_and_bytes(
-                logits,
-                x_batch,
-                y_batch,
-                args.eval_seq_len - stride,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            overlap_loss_sum += loss_sum
-            overlap_token_count += token_count
-            overlap_byte_count += byte_count
-
-        for batch_window_start in range(window_start, window_end, baseline_batch_windows):
-            batch_window_end = min(batch_window_start + baseline_batch_windows, window_end)
-            x_batch = torch.stack(
-                [
-                    val_tokens[i * stride + skipped_prefix_tokens : i * stride + args.eval_seq_len]
-                    for i in range(batch_window_start, batch_window_end)
-                ]
-            ).to(device=device, dtype=torch.int64, non_blocking=True)
-            y_batch = torch.stack(
-                [
-                    val_tokens[i * stride + skipped_prefix_tokens + 1 : i * stride + args.eval_seq_len + 1]
-                    for i in range(batch_window_start, batch_window_end)
-                ]
-            ).to(device=device, dtype=torch.int64, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = forward_logits(model, x_batch)
-            loss_sum, token_count, byte_count = accumulate_loss_and_bytes(
-                logits,
-                x_batch,
-                y_batch,
-                0,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            baseline_loss_sum += loss_sum
-            baseline_token_count += token_count
-            baseline_byte_count += byte_count
-
-    if dist.is_available() and dist.is_initialized():
-        for tensor in (
-            overlap_loss_sum,
-            overlap_token_count,
-            overlap_byte_count,
-            baseline_loss_sum,
-            baseline_token_count,
-            baseline_byte_count,
-        ):
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
-    overlap_val_loss = overlap_loss_sum / overlap_token_count
-    overlap_bits_per_token = overlap_val_loss.item() / math.log(2.0)
-    overlap_tokens_per_byte = overlap_token_count.item() / overlap_byte_count.item()
-    baseline_val_loss = baseline_loss_sum / baseline_token_count
-    baseline_bits_per_token = baseline_val_loss.item() / math.log(2.0)
-    baseline_tokens_per_byte = baseline_token_count.item() / baseline_byte_count.item()
-
-    canonical_equivalent = stride == args.eval_seq_len
-    overlap_vs_canonical_abs_diff = abs(float(overlap_val_loss.item()) - canonical_val_loss)
-    baseline_vs_canonical_abs_diff = abs(float(baseline_val_loss.item()) - canonical_val_loss)
-    model.train()
-    return {
-        "stride": stride,
-        "windows": total_windows,
-        "matched_tokens": int(matched_tokens),
-        "matched_bytes": int(round(overlap_byte_count.item())),
-        "skipped_prefix_tokens": int(skipped_prefix_tokens),
-        "canonical_equivalent": canonical_equivalent,
-        "canonical_val_loss": canonical_val_loss,
-        "canonical_val_bpb": canonical_val_bpb,
-        "matched_baseline_val_loss": float(baseline_val_loss.item()),
-        "matched_baseline_val_bpb": float(baseline_bits_per_token * baseline_tokens_per_byte),
-        "overlap_val_loss": float(overlap_val_loss.item()),
-        "overlap_val_bpb": float(overlap_bits_per_token * overlap_tokens_per_byte),
-        "matched_bytes_agree": int(round(overlap_byte_count.item())) == int(round(baseline_byte_count.item())),
-        "overlap_vs_canonical_abs_diff": overlap_vs_canonical_abs_diff,
-        "baseline_vs_canonical_abs_diff": baseline_vs_canonical_abs_diff,
-    }
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1357,12 +1148,6 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
-    if args.eval_audit_token_stride > 0:
-        log0(
-            "val_context_audit: "
-            f"enabled=True stride:{args.eval_audit_token_stride} "
-            f"eval_seq_len:{args.eval_seq_len}"
-        )
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -1766,42 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    context_audit = eval_val_context_audit(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        q_val_loss,
-        q_val_bpb,
-    )
-    if context_audit is not None:
-        log0(
-            "final_int8_zlib_roundtrip_context_audit_matched: "
-            f"stride:{context_audit['stride']} "
-            f"windows:{context_audit['windows']} "
-            f"matched_tokens:{context_audit['matched_tokens']} "
-            f"matched_bytes:{context_audit['matched_bytes']} "
-            f"skipped_prefix_tokens:{context_audit['skipped_prefix_tokens']} "
-            f"matched_bytes_agree:{context_audit['matched_bytes_agree']} "
-            f"canonical_val_loss:{context_audit['canonical_val_loss']:.8f} "
-            f"canonical_val_bpb:{context_audit['canonical_val_bpb']:.8f} "
-            f"matched_baseline_val_loss:{context_audit['matched_baseline_val_loss']:.8f} "
-            f"matched_baseline_val_bpb:{context_audit['matched_baseline_val_bpb']:.8f} "
-            f"overlap_val_loss:{context_audit['overlap_val_loss']:.8f} "
-            f"overlap_val_bpb:{context_audit['overlap_val_bpb']:.8f}"
-        )
-        log0(
-            "final_int8_zlib_roundtrip_context_audit_equivalence: "
-            f"stride_equals_eval_seq_len:{context_audit['canonical_equivalent']} "
-            f"baseline_vs_canonical_abs_diff:{context_audit['baseline_vs_canonical_abs_diff']:.12f} "
-            f"overlap_vs_canonical_abs_diff:{context_audit['overlap_vs_canonical_abs_diff']:.12f}"
-        )
 
     if distributed:
         dist.destroy_process_group()
