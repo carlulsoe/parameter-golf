@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    q_gain_lr_mult = float(os.environ.get("Q_GAIN_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.q_gain_lr_mult <= 0.0:
-        raise ValueError(f"Q_GAIN_LR_MULT must be positive, got {args.q_gain_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1212,8 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    q_gain_named_params = [(name, p) for name, p in block_named_params if "q_gain" in name]
-    q_gain_param_ids = {id(p) for _, p in q_gain_named_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1222,7 +1217,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and id(p) not in q_gain_param_ids
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1241,27 +1236,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_q_gain = None
-    if args.q_gain_lr_mult != 1.0:
-        if not q_gain_named_params:
-            raise RuntimeError("Q_GAIN_LR_MULT was set but no q_gain parameters were found")
-        q_gain_lr = args.scalar_lr * args.q_gain_lr_mult
-        optimizer_q_gain = torch.optim.Adam(
-            [{"params": [p for _, p in q_gain_named_params], "lr": q_gain_lr, "base_lr": q_gain_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
-    if optimizer_q_gain is not None:
-        optimizers.append(optimizer_q_gain)
-    optimizers.append(optimizer_scalar)
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1270,34 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-    scalar_numel = sum(p.numel() for p in scalar_params)
-    q_gain_numel = sum(p.numel() for _, p in q_gain_named_params)
-
-    def current_lrs() -> tuple[float, float, float, float]:
-        tok_lr_live = float(optimizer_tok.param_groups[0]["lr"])
-        matrix_lr_live = float(optimizer_muon.param_groups[0]["lr"])
-        scalar_lr_live = float(optimizer_scalar.param_groups[0]["lr"])
-        q_gain_lr_live = float(optimizer_q_gain.param_groups[0]["lr"]) if optimizer_q_gain is not None else scalar_lr_live
-        return tok_lr_live, matrix_lr_live, scalar_lr_live, q_gain_lr_live
-
-    def log_q_gain_scope(stage: str) -> None:
-        _, _, scalar_lr_live, q_gain_lr_live = current_lrs()
-        q_gain_base_lr = (
-            float(optimizer_q_gain.param_groups[0]["base_lr"])
-            if optimizer_q_gain is not None
-            else float(optimizer_scalar.param_groups[0]["base_lr"])
-        )
-        log0(
-            f"optimizer_q_gain_scope:stage:{stage} split_active:{optimizer_q_gain is not None} "
-            f"q_gain_lr_mult:{args.q_gain_lr_mult:.5f} q_gain_tensors:{len(q_gain_named_params)} "
-            f"q_gain_numel:{q_gain_numel} scalar_tensors:{len(scalar_params)} scalar_numel:{scalar_numel} "
-            f"q_gain_base_lr:{q_gain_base_lr:.8f} scalar_base_lr:{float(optimizer_scalar.param_groups[0]['base_lr']):.8f} "
-            f"q_gain_lr:{q_gain_lr_live:.8f} scalar_lr:{scalar_lr_live:.8f}"
-        )
-        log0(
-            "optimizer_q_gain_names:"
-            f"stage:{stage} names:{','.join(name for name, _ in q_gain_named_params)}"
-        )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1307,7 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} q_gain_lr_mult:{args.q_gain_lr_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1316,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_q_gain_scope("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1368,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_q_gain_scope("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1399,12 +1350,9 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
-            tok_lr_live, matrix_lr_live, scalar_lr_live, q_gain_lr_live = current_lrs()
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"tok_lr:{tok_lr_live:.8f} matrix_lr:{matrix_lr_live:.8f} "
-                f"scalar_lr:{scalar_lr_live:.8f} q_gain_lr:{q_gain_lr_live:.8f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1453,12 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            tok_lr_live, matrix_lr_live, scalar_lr_live, q_gain_lr_live = current_lrs()
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"tok_lr:{tok_lr_live:.8f} matrix_lr:{matrix_lr_live:.8f} "
-                f"scalar_lr:{scalar_lr_live:.8f} q_gain_lr:{q_gain_lr_live:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1470,7 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log_q_gain_scope("final")
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
