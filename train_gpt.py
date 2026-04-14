@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    control_lr_scale = float(os.environ.get("CONTROL_LR_SCALE", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -856,6 +857,38 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def build_param_name_by_id(module: nn.Module) -> dict[int, str]:
+    return {id(param): name for name, param in module.named_parameters()}
+
+
+def audit_optimizer_groups(
+    optimizer: torch.optim.Optimizer,
+    param_name_by_id: dict[int, str],
+    stage: str,
+    prefix: str,
+    log0,
+) -> None:
+    parts = [f"{prefix}: stage:{stage}", f"groups:{len(optimizer.param_groups)}"]
+    for group in optimizer.param_groups:
+        scope = str(group.get("scope", "unknown"))
+        params = list(group.get("params", []))
+        tensor_count = len(params)
+        numel = sum(int(param.numel()) for param in params)
+        base_lr = float(group.get("base_lr", group["lr"]))
+        lr = float(group["lr"])
+        contains_skip_weights = any(param_name_by_id.get(id(param), "") == "skip_weights" for param in params)
+        parts.extend(
+            (
+                f"{scope}_tensors:{tensor_count}",
+                f"{scope}_numel:{numel}",
+                f"{scope}_base_lr:{base_lr:.8f}",
+                f"{scope}_lr:{lr:.8f}",
+                f"{scope}_contains_skip_weights:{contains_skip_weights}",
+            )
+        )
+    log0(" ".join(parts))
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1167,6 +1200,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    if not math.isfinite(args.control_lr_scale) or args.control_lr_scale <= 0.0:
+        raise ValueError(f"CONTROL_LR_SCALE must be positive and finite, got {args.control_lr_scale}")
     if args.train_seq_len <= 0:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
@@ -1214,13 +1249,19 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    scalar_named_params = [(name, p) for name, p in block_named_params if p.ndim < 2]
+    control_named_params = [
+        (name, p) for name, p in block_named_params if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_named_params = [
+        (name, p)
+        for name, p in scalar_named_params
+        if not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+        control_named_params.append(("skip_weights", base_model.skip_weights))
+    scalar_params = [p for _, p in scalar_named_params]
+    control_params = [p for _, p in control_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1277,28 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_param_groups = []
+    if scalar_params:
+        scalar_param_groups.append(
+            {
+                "params": scalar_params,
+                "lr": args.scalar_lr,
+                "base_lr": args.scalar_lr,
+                "scope": "other_scalar",
+            }
+        )
+    if control_params:
+        control_lr = args.scalar_lr * args.control_lr_scale
+        scalar_param_groups.append(
+            {
+                "params": control_params,
+                "lr": control_lr,
+                "base_lr": control_lr,
+                "scope": "control",
+            }
+        )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1253,6 +1314,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    param_name_by_id = build_param_name_by_id(base_model)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1260,8 +1322,11 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"control_lr_scale:{args.control_lr_scale:.8f} "
+        f"control_lr:{args.scalar_lr * args.control_lr_scale:.8f}"
     )
+    audit_optimizer_groups(optimizer_scalar, param_name_by_id, "startup", "optimizer_scalar_groups", log0)
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1385,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        audit_optimizer_groups(optimizer_scalar, param_name_by_id, "post_restore_startup", "optimizer_scalar_groups", log0)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1485,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    audit_optimizer_groups(optimizer_scalar, param_name_by_id, "final", "optimizer_scalar_groups", log0)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
