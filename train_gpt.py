@@ -50,7 +50,6 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    eval_audit_token_stride = int(os.environ.get("EVAL_AUDIT_TOKEN_STRIDE", 0))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -281,141 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def loss_per_token(model: nn.Module, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-    core_model = model.module if isinstance(model, DDP) else model
-    x = core_model.tok_emb(input_ids)
-    x = F.rms_norm(x, (x.size(-1),))
-    x0 = x
-    skips: list[Tensor] = []
-    for i in range(core_model.num_encoder_layers):
-        x = core_model.blocks[i](x, x0)
-        skips.append(x)
-    for i in range(core_model.num_decoder_layers):
-        if skips:
-            x = x + core_model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-        x = core_model.blocks[core_model.num_encoder_layers + i](x, x0)
-    x = core_model.final_norm(x).reshape(-1, x.size(-1))
-    targets = target_ids.reshape(-1)
-    if core_model.tie_embeddings:
-        logits_proj = F.linear(x, core_model.tok_emb.weight)
-    else:
-        if core_model.lm_head is None:
-            raise RuntimeError("lm_head is required when tie_embeddings=False")
-        logits_proj = core_model.lm_head(x)
-    logits = core_model.logit_softcap * torch.tanh(logits_proj / core_model.logit_softcap)
-    return F.cross_entropy(logits.float(), targets, reduction="none").reshape_as(target_ids)
-
-
-def eval_val_context_audit(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> dict[str, float] | None:
-    stride = args.eval_audit_token_stride
-    if stride <= 0:
-        return None
-    if args.eval_seq_len <= 0:
-        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if stride > args.eval_seq_len:
-        raise ValueError(
-            f"EVAL_AUDIT_TOKEN_STRIDE must be <= EVAL_SEQ_LEN, got {stride} vs {args.eval_seq_len}"
-        )
-
-    effective_seq_len = args.eval_seq_len + stride
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < effective_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one richer-context audit window per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, effective_seq_len={effective_seq_len}"
-        )
-    local_batch_windows = max(local_batch_tokens // effective_seq_len, 1)
-    total_seqs = (val_tokens.numel() - 1) // args.eval_seq_len
-    total_windows = max(total_seqs - 1, 0)
-    if total_windows <= 0:
-        return None
-
-    window_start = (total_windows * rank) // world_size
-    window_end = (total_windows * (rank + 1)) // world_size
-    baseline_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    richer_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    audit_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    audit_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    audit_window_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    model.eval()
-    with torch.inference_mode():
-        for batch_window_start in range(window_start, window_end, local_batch_windows):
-            batch_window_end = min(batch_window_start + local_batch_windows, window_end)
-            baseline_xs: list[Tensor] = []
-            baseline_ys: list[Tensor] = []
-            richer_xs: list[Tensor] = []
-            richer_ys: list[Tensor] = []
-            for window_idx in range(batch_window_start, batch_window_end):
-                raw_start = (window_idx + 1) * args.eval_seq_len
-                baseline = val_tokens[raw_start : raw_start + stride + 1]
-                richer = val_tokens[raw_start - args.eval_seq_len : raw_start + stride + 1]
-                baseline_xs.append(baseline[:-1])
-                baseline_ys.append(baseline[1:])
-                richer_xs.append(richer[:-1])
-                richer_ys.append(richer[1:])
-
-            baseline_x = torch.stack(baseline_xs).to(device=device, dtype=torch.int64, non_blocking=True)
-            baseline_y = torch.stack(baseline_ys).to(device=device, dtype=torch.int64, non_blocking=True)
-            richer_x = torch.stack(richer_xs).to(device=device, dtype=torch.int64, non_blocking=True)
-            richer_y = torch.stack(richer_ys).to(device=device, dtype=torch.int64, non_blocking=True)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                baseline_losses = loss_per_token(model, baseline_x, baseline_y)
-                richer_losses = loss_per_token(model, richer_x, richer_y)[:, -stride:]
-
-            baseline_loss_sum += baseline_losses.to(torch.float64).sum()
-            richer_loss_sum += richer_losses.to(torch.float64).sum()
-            batch_token_count = float(baseline_y.numel())
-            audit_token_count += batch_token_count
-            prev_ids = baseline_x.reshape(-1)
-            tgt_ids = baseline_y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            audit_byte_count += token_bytes.to(torch.float64).sum()
-            audit_window_count += float(batch_window_end - batch_window_start)
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(baseline_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(richer_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(audit_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(audit_byte_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(audit_window_count, op=dist.ReduceOp.SUM)
-
-    if audit_token_count.item() <= 0 or audit_byte_count.item() <= 0:
-        model.train()
-        return None
-
-    baseline_val_loss = baseline_loss_sum / audit_token_count
-    richer_val_loss = richer_loss_sum / audit_token_count
-    bits_per_token_scale = 1.0 / math.log(2.0)
-    tokens_per_byte = audit_token_count.item() / audit_byte_count.item()
-    model.train()
-    return {
-        "stride": float(stride),
-        "effective_seq_len": float(effective_seq_len),
-        "window_count": float(audit_window_count.item()),
-        "target_token_count": float(audit_token_count.item()),
-        "target_byte_count": float(audit_byte_count.item()),
-        "baseline_val_loss": float(baseline_val_loss.item()),
-        "baseline_val_bpb": float(baseline_val_loss.item() * bits_per_token_scale * tokens_per_byte),
-        "richer_val_loss": float(richer_val_loss.item()),
-        "richer_val_bpb": float(richer_val_loss.item() * bits_per_token_scale * tokens_per_byte),
-    }
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1312,10 +1176,6 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(
-        f"val_context_audit:enabled={args.eval_audit_token_stride > 0} "
-        f"stride:{args.eval_audit_token_stride}"
-    )
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1494,32 +1354,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            context_audit = eval_val_context_audit(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            if context_audit is not None:
-                log0(
-                    "val_context_audit_matched: "
-                    f"stride:{int(context_audit['stride'])} "
-                    f"effective_seq_len:{int(context_audit['effective_seq_len'])} "
-                    f"windows:{int(context_audit['window_count'])} "
-                    f"target_tokens:{int(context_audit['target_token_count'])} "
-                    f"baseline_val_loss:{context_audit['baseline_val_loss']:.8f} "
-                    f"baseline_val_bpb:{context_audit['baseline_val_bpb']:.8f} "
-                    f"richer_val_loss:{context_audit['richer_val_loss']:.8f} "
-                    f"richer_val_bpb:{context_audit['richer_val_bpb']:.8f} "
-                    f"delta_val_loss:{context_audit['richer_val_loss'] - context_audit['baseline_val_loss']:.8f} "
-                    f"delta_val_bpb:{context_audit['richer_val_bpb'] - context_audit['baseline_val_bpb']:.8f}"
-                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1717,32 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    final_context_audit = eval_val_context_audit(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    if final_context_audit is not None:
-        log0(
-            "final_int8_zlib_roundtrip_context_audit_matched "
-            f"stride:{int(final_context_audit['stride'])} "
-            f"effective_seq_len:{int(final_context_audit['effective_seq_len'])} "
-            f"windows:{int(final_context_audit['window_count'])} "
-            f"target_tokens:{int(final_context_audit['target_token_count'])} "
-            f"baseline_val_loss:{final_context_audit['baseline_val_loss']:.8f} "
-            f"baseline_val_bpb:{final_context_audit['baseline_val_bpb']:.8f} "
-            f"richer_val_loss:{final_context_audit['richer_val_loss']:.8f} "
-            f"richer_val_bpb:{final_context_audit['richer_val_bpb']:.8f} "
-            f"delta_val_loss:{final_context_audit['richer_val_loss'] - final_context_audit['baseline_val_loss']:.8f} "
-            f"delta_val_bpb:{final_context_audit['richer_val_bpb'] - final_context_audit['baseline_val_bpb']:.8f}"
-        )
 
     if distributed:
         dist.destroy_process_group()
