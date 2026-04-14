@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not 0.0 <= args.scalar_beta2 < 1.0:
+        raise ValueError(f"SCALAR_BETA2 must be in [0, 1), got {args.scalar_beta2}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1238,7 +1241,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.scalar_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1252,11 +1255,30 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    scalar_control_tensor_count = sum(
+        1 for name, _ in block_named_params if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ) + int(base_model.skip_weights.numel() > 0)
+    scalar_noncontrol_tensor_count = sum(
+        1 for name, p in block_named_params if p.ndim < 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    scalar_param_numel = sum(int(p.numel()) for p in scalar_params)
+
+    def log_optimizer_scalar_betas(stage: str) -> None:
+        beta1, beta2 = optimizer_scalar.param_groups[0]["betas"]
+        log0(
+            f"optimizer_scalar_betas stage:{stage} "
+            f"beta1:{beta1:.5f} beta2:{beta2:.5f} "
+            f"tensors:{len(scalar_params)} numel:{scalar_param_numel} "
+            f"control_tensors:{scalar_control_tensor_count} "
+            f"noncontrol_tensors:{scalar_noncontrol_tensor_count}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"optimizer_betas beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} scalar_beta2:{args.scalar_beta2:.5f}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1269,6 +1291,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_scalar_betas("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1343,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_scalar_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1443,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_scalar_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
