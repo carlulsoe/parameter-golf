@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,6 +1091,10 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.token_lr_mult <= 0:
+        raise ValueError(f"TOKEN_LR_MULT must be positive, got {args.token_lr_mult}")
+    if args.token_lr_mult != 1.0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_LR_MULT override requires TIE_EMBEDDINGS=1")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1221,7 +1226,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr_baseline = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr = token_lr_baseline * args.token_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1252,6 +1258,17 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_optimizer_lr_groups(stage: str) -> None:
+        log0(
+            f"optimizer_lr_groups stage:{stage} "
+            f"tie_embeddings:{args.tie_embeddings} "
+            f"token_baseline_lr:{token_lr_baseline:.8f} "
+            f"token_lr_mult:{args.token_lr_mult:.8f} "
+            f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
+            f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
+            f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1268,6 +1285,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log_optimizer_lr_groups("startup")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1320,6 +1338,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_lr_groups("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1415,6 +1434,7 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    log_optimizer_lr_groups("final")
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
