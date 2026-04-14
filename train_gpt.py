@@ -60,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    train_warmup_prefix_audit = bool(int(os.environ.get("TRAIN_WARMUP_PREFIX_AUDIT", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -779,39 +778,19 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def get_data_shard_num_tokens(file: Path) -> int:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    return num_tokens
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str, audit: bool = False):
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.audit = audit
-        self.file_token_counts = [get_data_shard_num_tokens(file) for file in self.files] if audit else []
-        self.total_cycle_tokens = sum(self.file_token_counts) if audit else 0
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_taken = 0
-        self.wraps = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.wraps += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -826,28 +805,18 @@ class TokenStream:
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
             self.pos += k
-            self.total_taken += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def state_dict(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "total_taken": self.total_taken,
-            "wraps": self.wraps,
-            "total_cycle_tokens": self.total_cycle_tokens,
-        }
 
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, audit: bool = False):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, audit=audit)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1305,15 +1274,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, audit=args.train_warmup_prefix_audit)
-    warmup_loader_end_state: dict[str, int] | None = None
-    measured_loader_start_state: dict[str, int] | None = None
-
-    if args.train_warmup_prefix_audit:
-        log0(
-            "train_warmup_prefix_audit:enabled "
-            f"warmup_steps:{args.warmup_steps} total_cycle_tokens:{train_loader.stream.total_cycle_tokens}"
-        )
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1358,33 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.train_warmup_prefix_audit:
-            warmup_loader_end_state = train_loader.stream.state_dict()
-            log0(
-                "train_loader_state: "
-                f"stage:warmup_end file_idx:{warmup_loader_end_state['file_idx']} "
-                f"pos:{warmup_loader_end_state['pos']} total_taken:{warmup_loader_end_state['total_taken']} "
-                f"wraps:{warmup_loader_end_state['wraps']}"
-            )
-        train_loader = DistributedTokenLoader(
-            args.train_files, rank, world_size, device, audit=args.train_warmup_prefix_audit
-        )
-        if args.train_warmup_prefix_audit:
-            measured_loader_start_state = train_loader.stream.state_dict()
-            log0(
-                "train_loader_state: "
-                f"stage:measured_start file_idx:{measured_loader_start_state['file_idx']} "
-                f"pos:{measured_loader_start_state['pos']} total_taken:{measured_loader_start_state['total_taken']} "
-                f"wraps:{measured_loader_start_state['wraps']} reset_after_warmup:True"
-            )
-    elif args.train_warmup_prefix_audit:
-        measured_loader_start_state = train_loader.stream.state_dict()
-        log0(
-            "train_loader_state: "
-            f"stage:measured_start file_idx:{measured_loader_start_state['file_idx']} "
-            f"pos:{measured_loader_start_state['pos']} total_taken:{measured_loader_start_state['total_taken']} "
-            f"wraps:{measured_loader_start_state['wraps']} reset_after_warmup:False"
-        )
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1484,32 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.train_warmup_prefix_audit:
-        measured_loader_end_state = train_loader.stream.state_dict()
-        if measured_loader_start_state is None:
-            measured_loader_start_state = train_loader.stream.state_dict()
-        warmup_consumed_tokens = 0 if warmup_loader_end_state is None else warmup_loader_end_state["total_taken"]
-        measured_consumed_tokens = measured_loader_end_state["total_taken"] - measured_loader_start_state["total_taken"]
-        replayed_warmup_prefix_tokens = min(warmup_consumed_tokens, measured_consumed_tokens)
-        total_cycle_tokens = measured_loader_end_state["total_cycle_tokens"]
-        measured_dataset_fraction = measured_consumed_tokens / max(total_cycle_tokens, 1)
-        log0(
-            "train_loader_state: "
-            f"stage:measured_end file_idx:{measured_loader_end_state['file_idx']} "
-            f"pos:{measured_loader_end_state['pos']} total_taken:{measured_loader_end_state['total_taken']} "
-            f"wraps:{measured_loader_end_state['wraps']}"
-        )
-        log0(
-            "train_warmup_prefix_audit_summary: "
-            f"warmup_consumed_tokens:{warmup_consumed_tokens} "
-            f"measured_consumed_tokens:{measured_consumed_tokens} "
-            f"measured_token_span:[{measured_loader_start_state['total_taken']},{measured_loader_end_state['total_taken']}) "
-            f"measured_dataset_fraction:{measured_dataset_fraction:.8f} "
-            f"warmup_wraps:{0 if warmup_loader_end_state is None else warmup_loader_end_state['wraps']} "
-            f"measured_wraps:{measured_loader_end_state['wraps']} "
-            f"replayed_warmup_prefix_tokens:{replayed_warmup_prefix_tokens} "
-            f"replayed_fraction_of_measured:{(replayed_warmup_prefix_tokens / max(measured_consumed_tokens, 1)):.8f}"
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
