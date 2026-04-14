@@ -330,6 +330,11 @@ INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS = tuple(
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS", "").split(",")
     if pattern
 )
+INT8_QUANT_ERROR_AUDIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_QUANT_ERROR_AUDIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS", "").split(",")
@@ -337,6 +342,7 @@ INT8_KEEP_FLOAT_FP32_EXTRA_NAME_PATTERNS = tuple(
 )
 INT8_AUTO_KEEP_FLOAT_LOG_TOPK = int(os.environ.get("INT8_AUTO_KEEP_FLOAT_LOG_TOPK", 3))
 INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK = int(os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_LOG_TOPK", 9))
+INT8_QUANT_ERROR_AUDIT_LOG_TOPK = int(os.environ.get("INT8_QUANT_ERROR_AUDIT_LOG_TOPK", 9))
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -675,6 +681,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     stats["keep_float_fp32_audit_candidate_summary"] = (
         str(keep_float_fp32_audit["candidate_summary"]) if keep_float_fp32_audit is not None else ""
     )
+    stats["quant_error_audit_matched_tensor_count"] = 0
+    stats["quant_error_audit_quantized_tensor_count"] = 0
+    stats["quant_error_audit_mean_error"] = 0.0
+    stats["quant_error_audit_median_error"] = 0.0
+    stats["quant_error_audit_max_error"] = 0.0
+    stats["quant_error_audit_candidate_summary"] = ""
+    quant_error_audit_results: list[dict[str, object]] = []
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -690,6 +703,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+        quant_error_audit_match = matches_name_patterns(name, INT8_QUANT_ERROR_AUDIT_NAME_PATTERNS)
+        if quant_error_audit_match:
+            stats["quant_error_audit_matched_tensor_count"] += 1
         keep_large = matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS)
         keep_auto = name == selected_auto_keep_name
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_large or keep_auto:
@@ -719,10 +735,35 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
                 stats["fp32_scale_payload_bytes"] += tensor_nbytes(s)
             if min_clip_value != INT8_BASELINE_MIN_CLIP:
                 stats["min_clip_override_tensor_count"] += 1
+        if quant_error_audit_match:
+            error = normalized_mae(t, dequantize_quantized_tensor(q, s, dtype=t.dtype))
+            stats["quant_error_audit_quantized_tensor_count"] += 1
+            quant_error_audit_results.append(
+                {
+                    "name": name,
+                    "error": error,
+                    "scale_dtype": str(scale_dtype).removeprefix("torch."),
+                    "min_clip_value": min_clip_value,
+                }
+            )
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    if quant_error_audit_results:
+        errors = [float(item["error"]) for item in quant_error_audit_results]
+        stats["quant_error_audit_mean_error"] = float(sum(errors) / len(errors))
+        stats["quant_error_audit_median_error"] = median_float(errors)
+        stats["quant_error_audit_max_error"] = float(max(errors))
+        ranked = sorted(quant_error_audit_results, key=lambda item: (float(item["error"]), str(item["name"])), reverse=True)
+        stats["quant_error_audit_candidate_summary"] = ",".join(
+            (
+                f"{str(item['name'])}|error={float(item['error']):.8f}|"
+                f"scale_dtype={str(item['scale_dtype'])}|min_clip={float(item['min_clip_value']):.5f}"
+                for item in ranked[: max(INT8_QUANT_ERROR_AUDIT_LOG_TOPK, 0)]
+            )
+        )
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -1511,6 +1552,19 @@ def main() -> None:
             )
             if quant_stats["keep_float_fp32_audit_candidate_summary"]:
                 log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
+        if INT8_QUANT_ERROR_AUDIT_NAME_PATTERNS:
+            audit_summary = ",".join(INT8_QUANT_ERROR_AUDIT_NAME_PATTERNS)
+            log0(
+                "Int8 quant error audit: "
+                f"matched_tensors:{quant_stats['quant_error_audit_matched_tensor_count']} "
+                f"quantized_tensors:{quant_stats['quant_error_audit_quantized_tensor_count']} "
+                f"patterns:{audit_summary} "
+                f"mean_error:{quant_stats['quant_error_audit_mean_error']:.8f} "
+                f"median_error:{quant_stats['quant_error_audit_median_error']:.8f} "
+                f"max_error:{quant_stats['quant_error_audit_max_error']:.8f}"
+            )
+            if quant_stats["quant_error_audit_candidate_summary"]:
+                log0(f"Int8 quant error candidates: {quant_stats['quant_error_audit_candidate_summary']}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
