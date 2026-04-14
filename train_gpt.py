@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    attn_scale_lr_mult = float(os.environ.get("ATTN_SCALE_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -857,131 +856,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-def build_scalar_group_audit(
-    optimizer_scalar: torch.optim.Optimizer,
-    param_name_by_id: dict[int, str],
-    expected_default_names: tuple[str, ...],
-    expected_attn_scale_names: tuple[str, ...],
-    split_active: bool,
-) -> dict[str, object]:
-    expected_all_names = set(expected_default_names) | set(expected_attn_scale_names)
-    expected_default_set = set(expected_default_names)
-    expected_attn_scale_set = set(expected_attn_scale_names)
-    seen_names: set[str] = set()
-    disjoint = True
-    groups: list[dict[str, object]] = []
-    default_group_exact = False
-    attn_scale_group_exact = False
-    unknown_names: list[str] = []
-
-    for group_idx, group in enumerate(optimizer_scalar.param_groups):
-        group_names: list[str] = []
-        group_numel = 0
-        for param_idx, param in enumerate(group["params"]):
-            name = param_name_by_id.get(id(param))
-            if name is None:
-                name = f"<unknown_group{group_idx}_param{param_idx}>"
-                unknown_names.append(name)
-            group_names.append(name)
-            group_numel += int(param.numel())
-        group_set = set(group_names)
-        if seen_names & group_set:
-            disjoint = False
-        seen_names.update(group_set)
-        role = "other"
-        exact_family_match = False
-        if group_set == expected_default_set:
-            role = "default"
-            default_group_exact = True
-        elif split_active and group_set == expected_attn_scale_set:
-            role = "attn_scale"
-            exact_family_match = True
-            attn_scale_group_exact = True
-        groups.append(
-            {
-                "index": group_idx,
-                "role": role,
-                "base_lr": float(group.get("base_lr", group.get("lr", 0.0))),
-                "lr": float(group.get("lr", 0.0)),
-                "tensors": len(group_names),
-                "numel": group_numel,
-                "names": sorted(group_names),
-                "exact_family_match": exact_family_match,
-            }
-        )
-
-    missing_names = sorted(expected_all_names - seen_names)
-    unexpected_names = sorted(name for name in seen_names - expected_all_names if not name.startswith("<unknown_"))
-    expected_group_count = 2 if split_active else 1
-    exact_match = (
-        disjoint
-        and len(groups) == expected_group_count
-        and default_group_exact
-        and (attn_scale_group_exact if split_active else True)
-        and not unknown_names
-        and not missing_names
-        and not unexpected_names
-    )
-    return {
-        "group_count": len(groups),
-        "disjoint": disjoint,
-        "exact_match": exact_match,
-        "default_group_exact": default_group_exact,
-        "attn_scale_group_exact": attn_scale_group_exact,
-        "missing_names": missing_names,
-        "unexpected_names": unexpected_names,
-        "unknown_names": unknown_names,
-        "groups": groups,
-    }
-
-
-def log_scalar_group_audit(
-    log0,
-    stage: str,
-    optimizer_scalar: torch.optim.Optimizer,
-    param_name_by_id: dict[int, str],
-    expected_default_names: tuple[str, ...],
-    expected_attn_scale_names: tuple[str, ...],
-    split_active: bool,
-) -> None:
-    audit = build_scalar_group_audit(
-        optimizer_scalar=optimizer_scalar,
-        param_name_by_id=param_name_by_id,
-        expected_default_names=expected_default_names,
-        expected_attn_scale_names=expected_attn_scale_names,
-        split_active=split_active,
-    )
-    missing = ",".join(audit["missing_names"]) if audit["missing_names"] else "none"
-    unexpected = ",".join(audit["unexpected_names"]) if audit["unexpected_names"] else "none"
-    unknown = ",".join(audit["unknown_names"]) if audit["unknown_names"] else "none"
-    log0(
-        "optimizer_scalar_groups: "
-        f"stage:{stage} "
-        f"split_active:{split_active} "
-        f"group_count:{audit['group_count']} "
-        f"disjoint:{audit['disjoint']} "
-        f"exact_match:{audit['exact_match']} "
-        f"default_group_exact:{audit['default_group_exact']} "
-        f"attn_scale_group_exact:{audit['attn_scale_group_exact']} "
-        f"missing:{missing} "
-        f"unexpected:{unexpected} "
-        f"unknown:{unknown}"
-    )
-    for group in audit["groups"]:
-        names = ",".join(group["names"]) if group["names"] else "none"
-        extra = f" exact_family_match:{group['exact_family_match']}" if group["role"] == "attn_scale" else ""
-        log0(
-            "optimizer_scalar_group: "
-            f"stage:{stage} "
-            f"role:{group['role']} "
-            f"base_lr:{group['base_lr']:.8f} "
-            f"lr:{group['lr']:.8f} "
-            f"tensors:{group['tensors']} "
-            f"numel:{group['numel']} "
-            f"names:{names}{extra}"
-        )
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1297,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.attn_scale_lr_mult <= 0.0:
-        raise ValueError(f"ATTN_SCALE_LR_MULT must be positive, got {args.attn_scale_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1336,47 +1208,19 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    model_named_params = list(base_model.named_parameters())
-    param_name_by_id = {id(param): name for name, param in model_named_params}
-    block_named_params = [(name, param) for name, param in model_named_params if name.startswith("blocks.")]
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    original_scalar_named_params = [
-        (name, p)
+    scalar_params = [
+        p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    original_scalar_named_params_by_name = {name: param for name, param in original_scalar_named_params}
-    expected_attn_scale_names = tuple(f"blocks.{layer_idx}.attn_scale" for layer_idx in range(args.num_layers))
-    matched_attn_scale_names = tuple(name for name in original_scalar_named_params_by_name if name in expected_attn_scale_names)
-    if matched_attn_scale_names != expected_attn_scale_names:
-        raise ValueError(
-            "ATTN_SCALE optimizer split expected exact attn_scale family; "
-            f"expected:{','.join(expected_attn_scale_names) or 'none'} "
-            f"found:{','.join(sorted(matched_attn_scale_names)) or 'none'}"
-        )
-    attn_scale_named_params = [(name, original_scalar_named_params_by_name[name]) for name in expected_attn_scale_names]
-    attn_scale_name_set = set(expected_attn_scale_names)
-    default_scalar_named_params = [
-        (name, param) for name, param in original_scalar_named_params if name not in attn_scale_name_set
-    ]
     if base_model.skip_weights.numel() > 0:
-        default_scalar_named_params.append(("skip_weights", base_model.skip_weights))
-    original_scalar_name_set = {name for name, _ in original_scalar_named_params}
-    if base_model.skip_weights.numel() > 0:
-        original_scalar_name_set.add("skip_weights")
-    default_scalar_name_set = {name for name, _ in default_scalar_named_params}
-    if default_scalar_name_set & attn_scale_name_set:
-        raise ValueError("ATTN_SCALE optimizer split produced overlapping scalar groups")
-    if default_scalar_name_set | attn_scale_name_set != original_scalar_name_set:
-        raise ValueError("ATTN_SCALE optimizer split did not preserve the original scalar parameter set")
-    split_attn_scale = args.attn_scale_lr_mult != 1.0
-    expected_default_group_names = tuple(
-        name for name, _ in (default_scalar_named_params if split_attn_scale else default_scalar_named_params + attn_scale_named_params)
-    )
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1392,30 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar_group_specs = [
-        {
-            "params": [param for _, param in default_scalar_named_params],
-            "lr": args.scalar_lr,
-            "base_lr": args.scalar_lr,
-        }
-    ]
-    if split_attn_scale:
-        if not optimizer_scalar_group_specs[0]["params"]:
-            raise ValueError("ATTN_SCALE_LR_MULT split would create an empty default scalar param group")
-        attn_scale_params = [param for _, param in attn_scale_named_params]
-        if not attn_scale_params:
-            raise ValueError("ATTN_SCALE_LR_MULT requires at least one attn_scale tensor")
-        optimizer_scalar_group_specs.append(
-            {
-                "params": attn_scale_params,
-                "lr": args.scalar_lr * args.attn_scale_lr_mult,
-                "base_lr": args.scalar_lr * args.attn_scale_lr_mult,
-            }
-        )
-    else:
-        optimizer_scalar_group_specs[0]["params"].extend(param for _, param in attn_scale_named_params)
     optimizer_scalar = torch.optim.Adam(
-        [group for group in optimizer_scalar_group_specs if group["params"]],
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1438,17 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"attn_scale_lr_mult:{args.attn_scale_lr_mult}"
-    )
-    log_scalar_group_audit(
-        log0=log0,
-        stage="startup",
-        optimizer_scalar=optimizer_scalar,
-        param_name_by_id=param_name_by_id,
-        expected_default_names=expected_default_group_names,
-        expected_attn_scale_names=expected_attn_scale_names,
-        split_active=split_attn_scale,
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1505,15 +1317,6 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        log_scalar_group_audit(
-            log0=log0,
-            stage="post_restore_startup",
-            optimizer_scalar=optimizer_scalar,
-            param_name_by_id=param_name_by_id,
-            expected_default_names=expected_default_group_names,
-            expected_attn_scale_names=expected_attn_scale_names,
-            split_active=split_attn_scale,
-        )
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1547,16 +1350,9 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
-            val_log_suffix = ""
-            if split_attn_scale:
-                val_log_suffix = (
-                    f" scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
-                    f"attn_scale_lr:{float(optimizer_scalar.param_groups[1]['lr']):.8f}"
-                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-                f"{val_log_suffix}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1605,16 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            train_log_suffix = ""
-            if split_attn_scale:
-                train_log_suffix = (
-                    f" scalar_lr:{float(optimizer_scalar.param_groups[0]['lr']):.8f} "
-                    f"attn_scale_lr:{float(optimizer_scalar.param_groups[1]['lr']):.8f}"
-                )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{train_log_suffix}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1629,15 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log_scalar_group_audit(
-        log0=log0,
-        stage="final",
-        optimizer_scalar=optimizer_scalar,
-        param_name_by_id=param_name_by_id,
-        expected_default_names=expected_default_group_names,
-        expected_attn_scale_names=expected_attn_scale_names,
-        split_active=split_attn_scale,
     )
 
     # -----------------------------
