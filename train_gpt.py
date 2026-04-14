@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    resid_mix_lr_mult = float(os.environ.get("RESID_MIX_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1178,6 +1179,8 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.resid_mix_lr_mult <= 0:
+        raise ValueError(f"RESID_MIX_LR_MULT must be positive, got {args.resid_mix_lr_mult}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1209,6 +1212,10 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    resid_mix_group_active = not math.isclose(args.resid_mix_lr_mult, 1.0, rel_tol=0.0, abs_tol=1e-12)
+    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith(".resid_mix")]
+    resid_mix_params = [p for _, p in resid_mix_named_params]
+    resid_mix_param_ids = {id(p) for p in resid_mix_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1217,10 +1224,12 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and (not resid_mix_group_active or id(p) not in resid_mix_param_ids)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    resid_mix_lr = args.scalar_lr * args.resid_mix_lr_mult
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1237,7 +1246,14 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [
+            {"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "role": "default"},
+            *(
+                [{"params": resid_mix_params, "lr": resid_mix_lr, "base_lr": resid_mix_lr, "role": "resid_mix"}]
+                if resid_mix_group_active
+                else []
+            ),
+        ],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,7 +1276,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"resid_mix_lr_mult:{args.resid_mix_lr_mult}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1281,6 +1298,66 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    param_name_lookup = {id(param): name for name, param in base_model.named_parameters()}
+    expected_scalar_group_names = {"default": set(), "resid_mix": set()}
+    for param in scalar_params:
+        name = param_name_lookup.get(id(param))
+        if name is not None:
+            expected_scalar_group_names["default"].add(name)
+    for param in resid_mix_params:
+        name = param_name_lookup.get(id(param))
+        if name is not None:
+            expected_scalar_group_names["resid_mix"].add(name)
+
+    def log_scalar_group_audit(stage: str) -> None:
+        group_summaries = []
+        seen_names: set[str] = set()
+        duplicate_names: set[str] = set()
+        for group in optimizer_scalar.param_groups:
+            role = str(group.get("role", "default"))
+            group_names = []
+            group_numel = 0
+            for param in group["params"]:
+                name = param_name_lookup.get(id(param))
+                if name is None:
+                    continue
+                group_names.append(name)
+                group_numel += param.numel()
+                if name in seen_names:
+                    duplicate_names.add(name)
+                seen_names.add(name)
+            group_names.sort()
+            expected_names = expected_scalar_group_names.get(role, set())
+            exact_match = set(group_names) == expected_names
+            group_summaries.append(
+                (
+                    role,
+                    exact_match,
+                    len(group_names),
+                    group_numel,
+                    float(group["base_lr"]),
+                    float(group["lr"]),
+                    ",".join(group_names),
+                )
+            )
+        expected_role_count = 2 if resid_mix_group_active else 1
+        expected_union = expected_scalar_group_names["default"] | expected_scalar_group_names["resid_mix"]
+        union_match = seen_names == expected_union
+        disjoint = not duplicate_names
+        exact_match = union_match and len(group_summaries) == expected_role_count and all(summary[1] for summary in group_summaries)
+        log0(
+            f"optimizer_scalar_groups: stage:{stage} split_active:{resid_mix_group_active} "
+            f"group_count:{len(group_summaries)} disjoint:{disjoint} exact_match:{exact_match}"
+        )
+        for role, group_exact_match, tensor_count, group_numel, base_lr, live_lr, names_csv in sorted(group_summaries):
+            log0(
+                f"optimizer_scalar_group: stage:{stage} role:{role} exact_match:{group_exact_match} "
+                f"base_lr:{base_lr:.8f} lr:{live_lr:.8f} tensors:{tensor_count} numel:{group_numel} "
+                f"names:{names_csv or 'none'}"
+            )
+
+    log_scalar_group_audit("startup")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1320,6 +1397,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_scalar_group_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1352,7 +1430,9 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+                f"resid_mix_lr:{optimizer_scalar.param_groups[-1]['lr']:.8f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1403,7 +1483,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+                f"resid_mix_lr:{optimizer_scalar.param_groups[-1]['lr']:.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1501,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_scalar_group_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
