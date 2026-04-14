@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1139,6 +1140,24 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    def format_optimizer_betas(opt: torch.optim.Optimizer | None) -> str:
+        if opt is None:
+            return "none"
+        betas = opt.param_groups[0].get("betas")
+        if betas is None:
+            return "none"
+        beta1, beta2 = betas
+        return f"({beta1:.5f},{beta2:.5f})"
+
+    def log_optimizer_betas(stage: str) -> None:
+        head_opt = optimizer_head if base_model.lm_head is not None else None
+        log0(
+            f"optimizer_betas stage:{stage} "
+            f"tok:{format_optimizer_betas(optimizer_tok)} "
+            f"head:{format_optimizer_betas(head_opt)} "
+            f"scalar:{format_optimizer_betas(optimizer_scalar)}"
+        )
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1238,7 +1257,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.scalar_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1262,6 +1281,11 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"scalar_optimizer_config beta1:{args.scalar_beta1:.5f} "
+        f"beta2:{args.beta2:.5f}"
+    )
+    log_optimizer_betas("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1344,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1444,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
