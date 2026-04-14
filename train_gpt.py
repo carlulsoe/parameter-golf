@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,6 +1091,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1260,7 +1263,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"ema_decay:{args.ema_decay}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1320,6 +1324,14 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_decay > 0.0:
+        ema_state = {
+            name: tensor.detach().clone().float() if tensor.is_floating_point() else tensor.detach().clone()
+            for name, tensor in base_model.state_dict().items()
+        }
+        log0(f"ema:enabled decay:{args.ema_decay:.5f} tensors:{len(ema_state)}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1392,6 +1404,14 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state is not None:
+            one_minus_decay = 1.0 - args.ema_decay
+            for name, tensor in base_model.state_dict().items():
+                ema_tensor = ema_state[name]
+                if tensor.is_floating_point():
+                    ema_tensor.lerp_(tensor.detach().float(), one_minus_decay)
+                else:
+                    ema_tensor.copy_(tensor.detach())
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1439,17 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if ema_state is not None:
+        ema_model_state = {
+            name: (
+                tensor.to(device=base_model.state_dict()[name].device, dtype=base_model.state_dict()[name].dtype)
+                if tensor.is_floating_point()
+                else tensor.to(device=base_model.state_dict()[name].device)
+            )
+            for name, tensor in ema_state.items()
+        }
+        base_model.load_state_dict(ema_model_state, strict=True)
+        log0(f"ema:applied export_step:{step} decay:{args.ema_decay:.5f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
