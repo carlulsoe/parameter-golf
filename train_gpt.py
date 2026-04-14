@@ -84,6 +84,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
+    token_beta1 = float(os.environ.get("TOKEN_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1178,6 +1179,14 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if not (0.0 <= args.beta1 < 1.0):
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not (0.0 <= args.token_beta1 < 1.0):
+        raise ValueError(f"TOKEN_BETA1 must be in [0, 1), got {args.token_beta1}")
+    if not (0.0 <= args.beta2 < 1.0):
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if args.token_beta1 != args.beta1 and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA1 override requires TIE_EMBEDDINGS=1")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1224,7 +1233,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.token_beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1252,11 +1261,31 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def format_betas(opt: torch.optim.Optimizer) -> str:
+        beta1, beta2 = opt.param_groups[0]["betas"]
+        return f"({beta1:.5f},{beta2:.5f})"
+
+    def log_optimizer_adam_betas(stage: str) -> None:
+        head_betas = format_betas(optimizer_head) if base_model.lm_head is not None else "none"
+        log0(
+            f"optimizer_adam_betas:stage:{stage} tok:{format_betas(optimizer_tok)} "
+            f"scalar:{format_betas(optimizer_scalar)} head:{head_betas}"
+        )
+        log0(
+            f"optimizer_tok_scope:stage:{stage} tie_embeddings:{args.tie_embeddings} "
+            f"scope:{'tied_only' if args.tie_embeddings else 'input_only'} tensors:1 "
+            f"numel:{base_model.tok_emb.weight.numel()} names:tok_emb.weight"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"optimizer_adam_config:default_beta1:{args.beta1:.5f} token_beta1:{args.token_beta1:.5f} "
+        f"beta2:{args.beta2:.5f}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1269,6 +1298,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_adam_betas(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1350,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_adam_betas(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1450,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_adam_betas(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
