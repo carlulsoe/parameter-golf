@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1172,16 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not (0.0 <= args.beta1 < 1.0):
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not (0.0 <= args.beta2 < 1.0):
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if not (0.0 <= args.token_beta2 < 1.0):
-        raise ValueError(f"TOKEN_BETA2 must be in [0, 1), got {args.token_beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
-        raise ValueError("TOKEN_BETA2 requires TIE_EMBEDDINGS=1 when it differs from BETA2")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1235,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.token_beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1263,33 +1252,11 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    named_params_by_id = {id(param): name for name, param in base_model.named_parameters()}
-
-    def log_optimizer_tok_audit(stage: str) -> None:
-        group = optimizer_tok.param_groups[0]
-        group_names = [named_params_by_id.get(id(param), "<unknown>") for param in group["params"]]
-        lr = float(group["lr"])
-        base_lr = float(group.get("base_lr", lr))
-        beta1, beta2 = group["betas"]
-        log0(
-            "optimizer_tok audit: "
-            f"stage:{stage} optimizer:{type(optimizer_tok).__name__} "
-            f"scope:{'tied_shared_tok_emb_logit_group' if args.tie_embeddings else 'untied_tok_emb_only'} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"tensors:{len(group['params'])} names:{','.join(group_names)} "
-            f"beta1:{beta1:.5f} beta2:{beta2:.5f} "
-            f"configured_token_lr:{token_lr:.8f} base_lr:{base_lr:.8f} lr:{lr:.8f}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"token_beta2:{args.token_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1302,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_optimizer_tok_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1354,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_tok_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1454,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_tok_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
