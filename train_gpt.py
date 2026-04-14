@@ -88,9 +88,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-
-DEFAULT_TIED_EMBED_INIT_STD = 0.005
-
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1142,14 +1139,6 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    if not math.isfinite(args.tied_embed_init_std) or args.tied_embed_init_std <= 0.0:
-        raise ValueError(f"TIED_EMBED_INIT_STD must be positive and finite, got {args.tied_embed_init_std}")
-    if (not args.tie_embeddings) and args.tied_embed_init_std != DEFAULT_TIED_EMBED_INIT_STD:
-        raise ValueError(
-            "Non-default TIED_EMBED_INIT_STD requires TIE_EMBEDDINGS=1 so the override stays scoped "
-            "to the shared embedding/logit matrix"
-        )
-
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1213,22 +1202,6 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-
-    def log_tied_embed_init_audit(stage: str) -> None:
-        tok_emb_weight = base_model.tok_emb.weight.detach().float()
-        tok_emb_std = float(tok_emb_weight.std(unbiased=False).item())
-        tok_emb_rms = float(tok_emb_weight.square().mean().sqrt().item())
-        override_active = args.tied_embed_init_std != DEFAULT_TIED_EMBED_INIT_STD
-        log0(
-            "tied_embed_init_audit "
-            f"stage:{stage} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"optimizer_head:{'active' if base_model.lm_head is not None else 'inactive'} "
-            f"tied_embed_init_std:{args.tied_embed_init_std:.8f} "
-            f"override_active:{override_active} "
-            f"tok_emb_weight_std:{tok_emb_std:.8f} "
-            f"tok_emb_weight_rms:{tok_emb_rms:.8f}"
-        )
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1296,7 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_tied_embed_init_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1348,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_tied_embed_init_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1448,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_tied_embed_init_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
