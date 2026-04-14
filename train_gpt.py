@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    resid_mix_lr_mult = float(os.environ.get("RESID_MIX_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not math.isfinite(args.resid_mix_lr_mult) or args.resid_mix_lr_mult <= 0:
+        raise ValueError(f"RESID_MIX_LR_MULT must be finite and positive, got {args.resid_mix_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1214,16 +1217,24 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    resid_mix_named_params = [(f"blocks.{name}", p) for name, p in block_named_params if name.endswith("resid_mix")]
+    resid_mix_params = [p for _, p in resid_mix_named_params]
+    resid_mix_param_ids = {id(p) for p in resid_mix_params}
     scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    resid_mix_lr_split_active = args.resid_mix_lr_mult != 1.0
+    if resid_mix_lr_split_active:
+        scalar_params = [p for p in scalar_params if id(p) not in resid_mix_param_ids]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    resid_mix_numel = sum(p.numel() for p in resid_mix_params)
+    scalar_numel = sum(p.numel() for p in scalar_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr, "group_name": "tok"}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1237,15 +1248,25 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "scalar"}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_resid_mix = None
+    if resid_mix_lr_split_active:
+        resid_mix_lr = args.scalar_lr * args.resid_mix_lr_mult
+        optimizer_resid_mix = torch.optim.Adam(
+            [{"params": resid_mix_params, "lr": resid_mix_lr, "base_lr": resid_mix_lr, "group_name": "resid_mix"}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_resid_mix)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr, "group_name": "head"}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1262,6 +1283,33 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if resid_mix_lr_split_active:
+        def optimizer_group_by_name(opt: torch.optim.Optimizer, group_name: str) -> dict[str, object]:
+            for group in opt.param_groups:
+                if group.get("group_name") == group_name:
+                    return group
+            raise RuntimeError(f"Missing optimizer group {group_name}")
+
+        def log_resid_mix_lr_groups(stage: str, completed_updates: int | None = None) -> None:
+            scalar_group = optimizer_group_by_name(optimizer_scalar, "scalar")
+            resid_mix_group = optimizer_group_by_name(optimizer_resid_mix, "resid_mix")
+            completed_suffix = "" if completed_updates is None else f" completed_updates:{completed_updates}"
+            log0(
+                "optimizer_scalar_groups: "
+                f"stage:{stage} "
+                f"resid_mix_split_active:{resid_mix_lr_split_active} "
+                f"resid_mix_tensors:{len(resid_mix_named_params)} "
+                f"resid_mix_numel:{resid_mix_numel} "
+                f"scalar_tensors:{len(scalar_group['params'])} "
+                f"scalar_numel:{scalar_numel} "
+                f"scalar_lr:{float(scalar_group['lr']):.8f} "
+                f"resid_mix_lr:{float(resid_mix_group['lr']):.8f} "
+                f"resid_mix_lr_mult:{args.resid_mix_lr_mult:.8f}"
+                f"{completed_suffix}"
+            )
+            log0("optimizer_resid_mix_names: " + ",".join(name for name, _ in resid_mix_named_params))
+
+        log_resid_mix_lr_groups("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1368,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if resid_mix_lr_split_active:
+            log_resid_mix_lr_groups("post_restore_startup", completed_updates=0)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1405,6 +1455,16 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if resid_mix_lr_split_active:
+                scalar_group = optimizer_group_by_name(optimizer_scalar, "scalar")
+                resid_mix_group = optimizer_group_by_name(optimizer_resid_mix, "resid_mix")
+                log0(
+                    "optimizer_resid_mix_lr_trace: "
+                    f"step:{step} "
+                    f"scalar_lr:{float(scalar_group['lr']):.8f} "
+                    f"resid_mix_lr:{float(resid_mix_group['lr']):.8f} "
+                    f"resid_mix_lr_mult:{args.resid_mix_lr_mult:.8f}"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1479,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if resid_mix_lr_split_active:
+        log_resid_mix_lr_groups("final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
