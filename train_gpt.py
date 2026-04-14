@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    token_beta1 = float(os.environ.get("TOKEN_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1172,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not 0.0 <= args.beta1 < 1.0:
-        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-    if not 0.0 <= args.token_beta1 < 1.0:
-        raise ValueError(f"TOKEN_BETA1 must be in [0, 1), got {args.token_beta1}")
-    if not 0.0 <= args.beta2 < 1.0:
-        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-    if args.adam_eps <= 0.0:
-        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1233,7 +1224,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.token_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1261,19 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_optimizer_betas(stage: str) -> None:
-        tok_beta1, tok_beta2 = optimizer_tok.param_groups[0]["betas"]
-        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
-        head_msg = "head:inactive"
-        if base_model.lm_head is not None:
-            head_beta1, head_beta2 = optimizer_head.param_groups[0]["betas"]
-            head_msg = f"head:({head_beta1:.5f},{head_beta2:.5f})"
-        log0(
-            f"optimizer_betas stage:{stage} "
-            f"tok:({tok_beta1:.5f},{tok_beta2:.5f}) "
-            f"scalar:({scalar_beta1:.5f},{scalar_beta2:.5f}) {head_msg}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1284,11 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_beta_config beta1:{args.beta1:.5f} token_beta1:{args.token_beta1:.5f} "
-        f"beta2:{args.beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log_optimizer_betas("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1347,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_betas("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1447,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_betas("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
