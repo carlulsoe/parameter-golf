@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    resid_mix_lr_mult = float(os.environ.get("RESID_MIX_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.resid_mix_lr_mult) or args.resid_mix_lr_mult <= 0.0:
-        raise ValueError(f"RESID_MIX_LR_MULT must be positive and finite, got {args.resid_mix_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1217,16 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith("resid_mix")]
-    resid_mix_params = [p for _, p in resid_mix_named_params]
     scalar_params = [
         p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and not name.endswith("resid_mix")
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    resid_mix_split_active = args.resid_mix_lr_mult != 1.0 and len(resid_mix_params) > 0
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1242,14 +1236,8 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
-    if resid_mix_split_active:
-        resid_mix_lr = args.scalar_lr * args.resid_mix_lr_mult
-        scalar_param_groups.append({"params": resid_mix_params, "lr": resid_mix_lr, "base_lr": resid_mix_lr})
-    else:
-        scalar_params.extend(resid_mix_params)
     optimizer_scalar = torch.optim.Adam(
-        scalar_param_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1272,30 +1260,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} resid_mix_lr_mult:{args.resid_mix_lr_mult:.5f}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if resid_mix_split_active:
-        log0("optimizer_resid_mix_names:" + ",".join(f"blocks.{name}" for name, _ in resid_mix_named_params))
-    def log_scalar_groups(stage: str, completed_updates: int | None = None) -> None:
-        scalar_group = optimizer_scalar.param_groups[0]
-        scalar_tensors = len(scalar_group["params"])
-        scalar_numel = sum(int(p.numel()) for p in scalar_group["params"])
-        msg = (
-            f"optimizer_scalar_groups stage:{stage} resid_mix_split_active:{resid_mix_split_active} "
-            f"scalar_tensors:{scalar_tensors} scalar_numel:{scalar_numel} scalar_lr:{scalar_group['lr']:.8f}"
-        )
-        if resid_mix_split_active:
-            resid_mix_group = optimizer_scalar.param_groups[1]
-            resid_mix_tensors = len(resid_mix_group["params"])
-            resid_mix_numel = sum(int(p.numel()) for p in resid_mix_group["params"])
-            msg += (
-                f" resid_mix_tensors:{resid_mix_tensors} resid_mix_numel:{resid_mix_numel} "
-                f"resid_mix_lr:{resid_mix_group['lr']:.8f} resid_mix_lr_mult:{args.resid_mix_lr_mult:.5f}"
-            )
-        if completed_updates is not None:
-            msg += f" completed_updates:{completed_updates}"
-        log0(msg)
-    log_scalar_groups("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1351,7 +1317,6 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        log_scalar_groups("post_restore_startup")
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1436,16 +1401,10 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            msg = (
+            log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if resid_mix_split_active:
-                msg += (
-                    f" scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-                    f"resid_mix_lr:{optimizer_scalar.param_groups[1]['lr']:.8f}"
-                )
-            log0(msg)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1460,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_groups("final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
