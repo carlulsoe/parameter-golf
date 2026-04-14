@@ -86,6 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    token_eps = float(os.environ.get("TOKEN_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -1153,6 +1154,17 @@ def main() -> None:
     # TOKENIZER + VALIDATION METRIC SETUP
     # -----------------------------
 
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
+    if args.token_eps <= 0.0:
+        raise ValueError(f"TOKEN_EPS must be positive, got {args.token_eps}")
+    if args.token_eps != args.adam_eps and not args.tie_embeddings:
+        raise ValueError("TOKEN_EPS overrides require TIE_EMBEDDINGS=1")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1178,6 +1190,23 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+
+    def log_optimizer_betas_and_eps(stage: str) -> None:
+        head_group = optimizer_head.param_groups[0] if base_model.lm_head is not None else None
+        head_betas = (
+            f"({head_group['betas'][0]:.5f},{head_group['betas'][1]:.5f})"
+            if head_group is not None
+            else "(inactive)"
+        )
+        head_eps = f"{head_group['eps']:.8f}" if head_group is not None else "inactive"
+        log0(
+            f"optimizer_beta_eps_audit stage:{stage} "
+            f"tok_betas:({optimizer_tok.param_groups[0]['betas'][0]:.5f},{optimizer_tok.param_groups[0]['betas'][1]:.5f}) "
+            f"tok_eps:{optimizer_tok.param_groups[0]['eps']:.8f} "
+            f"head_betas:{head_betas} head_eps:{head_eps} "
+            f"scalar_betas:({optimizer_scalar.param_groups[0]['betas'][0]:.5f},{optimizer_scalar.param_groups[0]['betas'][1]:.5f}) "
+            f"scalar_eps:{optimizer_scalar.param_groups[0]['eps']:.8f}"
+        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1225,7 +1254,7 @@ def main() -> None:
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+        eps=args.token_eps,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1263,12 +1292,17 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"optimizer_eps_config adam_eps:{args.adam_eps:.8f} token_eps:{args.token_eps:.8f} "
+        f"token_scope:{'tied_embedding_logit' if args.tie_embeddings else 'input_embedding_only'}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_betas_and_eps("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1354,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_betas_and_eps("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1454,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_betas_and_eps("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
