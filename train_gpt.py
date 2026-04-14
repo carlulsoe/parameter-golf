@@ -54,7 +54,6 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmdown_min_mult = float(os.environ.get("WARMDOWN_MIN_MULT", 0.0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not 0.0 <= args.warmdown_min_mult <= 1.0:
-        raise ValueError(f"WARMDOWN_MIN_MULT must be in [0, 1], got {args.warmdown_min_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1271,10 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"warmdown_schedule:warmdown_iters:{args.warmdown_iters} "
-        f"warmdown_min_mult:{args.warmdown_min_mult:.5f}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1294,17 +1287,11 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            if warmdown_start <= step < args.iterations:
-                mult = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
-                return max(mult, args.warmdown_min_mult)
-            return 1.0
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        if remaining_ms <= warmdown_ms:
-            mult = remaining_ms / max(warmdown_ms, 1e-9)
-            return max(mult, args.warmdown_min_mult)
-        return 1.0
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1340,7 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    last_lr_mult = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1381,7 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        last_lr_mult = scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1418,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"lr_mult:{scale:.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1434,10 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"warmdown_audit:last_lr_mult:{last_lr_mult:.5f} "
-        f"stop_after_step:{stop_after_step if stop_after_step is not None else -1}"
     )
 
     # -----------------------------
