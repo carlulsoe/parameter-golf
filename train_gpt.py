@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    token_grad_clip_norm = float(os.environ.get("TOKEN_GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,14 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"GRAD_CLIP_NORM must be non-negative, got {args.grad_clip_norm}")
+    if args.token_grad_clip_norm < 0:
+        raise ValueError(f"TOKEN_GRAD_CLIP_NORM must be non-negative, got {args.token_grad_clip_norm}")
+    if args.token_grad_clip_norm > 0 and args.grad_clip_norm > 0:
+        raise ValueError("TOKEN_GRAD_CLIP_NORM and GRAD_CLIP_NORM are mutually exclusive")
+    if args.token_grad_clip_norm > 0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_GRAD_CLIP_NORM requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1252,6 +1261,15 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_token_clip_audit(stage: str) -> None:
+        log0(
+            "token_grad_clip_audit "
+            f"stage:{stage} tie_embeddings:{args.tie_embeddings} "
+            f"token_grad_clip_norm:{args.token_grad_clip_norm:.5f} "
+            f"token_tensors:1 token_numel:{base_model.tok_emb.weight.numel()} "
+            "token_names:tok_emb.weight"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1262,6 +1280,11 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_clipping grad_clip_norm:{args.grad_clip_norm:.5f} "
+        f"token_grad_clip_norm:{args.token_grad_clip_norm:.5f}"
+    )
+    log_token_clip_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1343,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_token_clip_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1388,8 +1412,13 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        token_grad_norm = None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        elif args.token_grad_clip_norm > 0:
+            token_grad_norm = torch.nn.utils.clip_grad_norm_(
+                [base_model.tok_emb.weight], args.token_grad_clip_norm
+            )
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1401,10 +1430,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            train_log = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if token_grad_norm is not None:
+                train_log += f" token_grad_norm:{float(token_grad_norm):.5f}"
+            log0(train_log)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1451,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_token_clip_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
