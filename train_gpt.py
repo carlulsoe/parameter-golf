@@ -1089,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    default_tied_embed_lr = 0.05
-    configured_tied_embed_lr = os.environ.get("TIED_EMBED_LR")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1173,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.tied_embed_lr) or args.tied_embed_lr <= 0.0:
-        raise ValueError(f"TIED_EMBED_LR must be positive and finite, got {args.tied_embed_lr}")
-    if (
-        not args.tie_embeddings
-        and configured_tied_embed_lr is not None
-        and float(configured_tied_embed_lr) != default_tied_embed_lr
-    ):
-        raise ValueError("Non-default TIED_EMBED_LR requires TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1262,21 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
-
-    def log_optimizer_tok_audit(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        tok_names = ",".join(param_name_by_id.get(id(param), "<unnamed>") for param in tok_group["params"])
-        scope = "tied_shared_matrix" if args.tie_embeddings else "untied_tok_emb_only"
-        log0(
-            "optimizer_tok_audit: "
-            f"stage:{stage} optimizer:{type(optimizer_tok).__name__} "
-            f"tie_embeddings:{args.tie_embeddings} scope:{scope} "
-            f"tensors:{len(tok_group['params'])} names:{tok_names} "
-            f"configured_tied_embed_lr:{args.tied_embed_lr:.8f} "
-            f"base_lr:{float(tok_group['base_lr']):.8f} lr:{float(tok_group['lr']):.8f}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1294,13 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.tie_embeddings:
-        log0(
-            "tied_embed_lr_guard:"
-            f"active tie_embeddings:{args.tie_embeddings} "
-            f"configured_tied_embed_lr:{args.tied_embed_lr:.8f}"
-        )
-    log_optimizer_tok_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1352,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_tok_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1452,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_tok_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
