@@ -76,6 +76,7 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1171,6 +1172,10 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not math.isfinite(args.token_lr_mult) or args.token_lr_mult <= 0.0:
+        raise ValueError(f"TOKEN_LR_MULT must be finite and positive, got {args.token_lr_mult}")
+    if args.token_lr_mult != 1.0 and not args.tie_embeddings:
+        raise ValueError("TOKEN_LR_MULT requires TIE_EMBEDDINGS=1 so optimizer_tok stays a tied shared-matrix ablation")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1222,8 +1227,9 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_base_lr = token_lr * args.token_lr_mult
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_base_lr, "base_lr": token_base_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1252,6 +1258,22 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_optimizer_tok(stage: str) -> None:
+        tok_group = optimizer_tok.param_groups[0]
+        log0(
+            "optimizer_tok audit: "
+            f"stage:{stage} "
+            f"optimizer:{optimizer_tok.__class__.__name__} "
+            f"tie_embeddings:{args.tie_embeddings} "
+            "scope:tied_shared_matrix "
+            "tensors:1 "
+            "names:tok_emb.weight "
+            f"token_lr_mult:{args.token_lr_mult:.5f} "
+            f"configured_token_lr:{token_lr:.8f} "
+            f"base_lr:{float(tok_group['base_lr']):.8f} "
+            f"lr:{float(tok_group['lr']):.8f}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1262,6 +1284,12 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(
+        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"token_lr_mult:{args.token_lr_mult:.5f} configured_token_lr:{token_lr:.8f} "
+        f"realized_token_base_lr:{token_base_lr:.8f}"
+    )
+    log_optimizer_tok("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1348,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_tok("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1448,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_tok("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
