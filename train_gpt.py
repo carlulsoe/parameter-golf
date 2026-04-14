@@ -79,7 +79,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    scalar_lr_min_scale = float(os.environ.get("SCALAR_LR_MIN_SCALE", 0.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not math.isfinite(args.scalar_lr_min_scale) or not (0.0 <= args.scalar_lr_min_scale <= 1.0):
-        raise ValueError(
-            f"SCALAR_LR_MIN_SCALE must be finite and stay in [0, 1], got {args.scalar_lr_min_scale}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1268,10 +1263,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"scalar_lr_schedule warmdown_min_scale:{args.scalar_lr_min_scale:.5f} "
-        f"scope:optimizer_scalar_only"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1340,7 +1331,6 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
-    last_scalar_scale = 1.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1377,8 +1367,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        scalar_scale = max(scale, args.scalar_lr_min_scale)
-        last_scalar_scale = scalar_scale
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1397,9 +1385,8 @@ def main() -> None:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
-            opt_scale = scalar_scale if opt is optimizer_scalar else scale
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * opt_scale
+                group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1416,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"lr_mult:{scale:.5f} scalar_lr_mult:{scalar_scale:.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1432,10 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        f"scalar_lr_audit warmdown_min_scale:{args.scalar_lr_min_scale:.5f} "
-        f"last_scalar_lr_mult:{last_scalar_scale:.5f}"
     )
 
     # -----------------------------
