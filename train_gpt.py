@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1268,6 +1271,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"ema_decay:{args.ema_decay:.6f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,6 +1331,14 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    ema_state: dict[str, Tensor] | None = None
+    ema_updates = 0
+    if args.ema_decay > 0.0:
+        ema_state = {
+            name: param.detach().float().clone()
+            for name, param in base_model.named_parameters()
+        }
+        log0(f"ema_state:init tensors:{len(ema_state)} decay:{args.ema_decay:.6f}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1392,6 +1404,12 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state is not None:
+            one_minus_decay = 1.0 - args.ema_decay
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    ema_state[name].lerp_(param.detach().float(), weight=one_minus_decay)
+            ema_updates += 1
         zero_grad_all()
 
         step += 1
@@ -1419,6 +1437,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if ema_state is not None:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.copy_(ema_state[name].to(device=param.device, dtype=param.dtype))
+        log0(f"ema_state:applied updates:{ema_updates} decay:{args.ema_decay:.6f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
