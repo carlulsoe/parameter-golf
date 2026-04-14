@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    resid_mix_grad_scale = float(os.environ.get("RESID_MIX_GRAD_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1178,6 +1179,8 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if not math.isfinite(args.resid_mix_grad_scale) or args.resid_mix_grad_scale <= 0.0:
+        raise ValueError(f"RESID_MIX_GRAD_SCALE must be finite and positive, got {args.resid_mix_grad_scale}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1219,6 +1222,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    resid_mix_named_params = [(name, p) for name, p in block_named_params if name.endswith("resid_mix")]
+    resid_mix_params = [p for _, p in resid_mix_named_params]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1261,6 +1266,11 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"resid_mix_grad_config: scale:{args.resid_mix_grad_scale:.5f} "
+        f"tensors:{len(resid_mix_named_params)} numel:{sum(p.numel() for p in resid_mix_params)} "
+        f"names:{','.join(name for name, _ in resid_mix_named_params)}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1379,6 +1389,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
+        if args.resid_mix_grad_scale != 1.0:
+            for p in resid_mix_params:
+                if p.grad is not None:
+                    p.grad.mul_(args.resid_mix_grad_scale)
+
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
@@ -1418,6 +1433,11 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        f"resid_mix_grad_audit: scale:{args.resid_mix_grad_scale:.5f} "
+        f"tensors:{len(resid_mix_named_params)} numel:{sum(p.numel() for p in resid_mix_params)} "
+        f"completed_updates:{step}"
     )
 
     # -----------------------------
