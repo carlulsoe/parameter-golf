@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    skip_weight_lr_mult = float(os.environ.get("SKIP_WEIGHT_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1089,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not math.isfinite(args.skip_weight_lr_mult) or args.skip_weight_lr_mult <= 0.0:
+        raise ValueError(f"SKIP_WEIGHT_LR_MULT must be finite and > 0, got {args.skip_weight_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1219,7 +1222,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
+    split_skip_weights = base_model.skip_weights.numel() > 0 and args.skip_weight_lr_mult != 1.0
+    if base_model.skip_weights.numel() > 0 and not split_skip_weights:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1243,6 +1247,16 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_skip = None
+    if split_skip_weights:
+        skip_weight_lr = args.scalar_lr * args.skip_weight_lr_mult
+        optimizer_skip = torch.optim.Adam(
+            [{"params": [base_model.skip_weights], "lr": skip_weight_lr, "base_lr": skip_weight_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_skip)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1261,6 +1275,18 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    scalar_tensor_count = len(scalar_params)
+    scalar_numel = sum(p.numel() for p in scalar_params)
+    log0(
+        "optimizer_scalar_groups "
+        f"stage:startup skip_weight_split_active:{split_skip_weights} "
+        f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+        f"skip_weight_tensors:{1 if split_skip_weights else 0} "
+        f"skip_weight_numel:{base_model.skip_weights.numel() if split_skip_weights else 0} "
+        f"scalar_lr:{args.scalar_lr:.8f} "
+        f"skip_weight_lr:{(args.scalar_lr * args.skip_weight_lr_mult) if split_skip_weights else args.scalar_lr:.8f} "
+        f"skip_weight_lr_mult:{args.skip_weight_lr_mult:.8f}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1320,6 +1346,16 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log0(
+            "optimizer_scalar_groups "
+            f"stage:post_restore_startup skip_weight_split_active:{split_skip_weights} "
+            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+            f"skip_weight_tensors:{1 if split_skip_weights else 0} "
+            f"skip_weight_numel:{base_model.skip_weights.numel() if split_skip_weights else 0} "
+            f"scalar_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
+            f"skip_weight_lr:{optimizer_skip.param_groups[0]['base_lr'] if optimizer_skip is not None else args.scalar_lr:.8f} "
+            f"skip_weight_lr_mult:{args.skip_weight_lr_mult:.8f}"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1418,6 +1454,17 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "optimizer_scalar_groups "
+        f"stage:final skip_weight_split_active:{split_skip_weights} "
+        f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+        f"skip_weight_tensors:{1 if split_skip_weights else 0} "
+        f"skip_weight_numel:{base_model.skip_weights.numel() if split_skip_weights else 0} "
+        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"skip_weight_lr:{optimizer_skip.param_groups[0]['lr'] if optimizer_skip is not None else optimizer_scalar.param_groups[0]['lr']:.8f} "
+        f"skip_weight_lr_mult:{args.skip_weight_lr_mult:.8f} "
+        f"completed_updates:{step}"
     )
 
     # -----------------------------
