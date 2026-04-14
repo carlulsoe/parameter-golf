@@ -78,7 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_weight_decay = float(os.environ.get("MATRIX_WEIGHT_DECAY", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -88,10 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    matrix_wd_expect_auto_keep_selected = os.environ.get("MATRIX_WD_EXPECT_AUTO_KEEP_SELECTED", "")
-    matrix_wd_expect_fp32_scale_tensors = int(os.environ.get("MATRIX_WD_EXPECT_FP32_SCALE_TENSORS", -1))
-    matrix_wd_expect_min_clip_override_tensors = int(os.environ.get("MATRIX_WD_EXPECT_MIN_CLIP_OVERRIDE_TENSORS", -1))
-    matrix_wd_expect_extra_fp32_keep_tensors = int(os.environ.get("MATRIX_WD_EXPECT_EXTRA_FP32_KEEP_TENSORS", -1))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -117,18 +112,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        nesterov: bool = True,
-        weight_decay: float = 0.0,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -150,7 +137,6 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-            weight_decay = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -178,8 +164,6 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                if weight_decay != 0.0:
-                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -482,12 +466,6 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
-
-def matrix_group_l2_norm(params: list[Tensor]) -> float:
-    total = 0.0
-    for p in params:
-        total += float(p.detach().float().pow(2).sum().item())
-    return math.sqrt(total)
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1111,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.matrix_weight_decay < 0.0:
-        raise ValueError(f"MATRIX_WEIGHT_DECAY must be non-negative, got {args.matrix_weight_decay}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1245,9 +1221,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    matrix_tensor_count = len(matrix_params)
-    matrix_param_numel = sum(int(p.numel()) for p in matrix_params)
-    matrix_l2_norm_before = matrix_group_l2_norm(matrix_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1260,7 +1233,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=args.matrix_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1288,23 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"matrix_weight_decay:{args.matrix_weight_decay}"
-    )
-    log0(
-        "optimizer_muon_group: "
-        f"tensors:{matrix_tensor_count} "
-        f"numel:{matrix_param_numel} "
-        f"weight_decay:{args.matrix_weight_decay:.8f} "
-        f"matrix_l2_norm_before:{matrix_l2_norm_before:.8f}"
-    )
-    log0(
-        "matrix_weight_decay_export_policy: "
-        "metric_attribution_requires_fixed_export_audits "
-        f"expected_auto_keep:{args.matrix_wd_expect_auto_keep_selected or 'skip'} "
-        f"expected_fp32_scale_tensors:{args.matrix_wd_expect_fp32_scale_tensors if args.matrix_wd_expect_fp32_scale_tensors >= 0 else 'skip'} "
-        f"expected_min_clip_override_tensors:{args.matrix_wd_expect_min_clip_override_tensors if args.matrix_wd_expect_min_clip_override_tensors >= 0 else 'skip'} "
-        f"expected_extra_fp32_keep_tensors:{args.matrix_wd_expect_extra_fp32_keep_tensors if args.matrix_wd_expect_extra_fp32_keep_tensors >= 0 else 'skip'}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1370,7 +1326,6 @@ def main() -> None:
     # -----------------------------
 
     training_time_ms = 0.0
-    optimizer_muon_cumulative_lr_weight_decay = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1432,9 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        optimizer_muon_cumulative_lr_weight_decay += sum(
-            float(group["lr"]) * float(group.get("weight_decay", 0.0)) for group in optimizer_muon.param_groups
-        )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1466,17 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    matrix_l2_norm_after = matrix_group_l2_norm(matrix_params)
-    log0(
-        "optimizer_muon_decay_audit: "
-        f"tensors:{matrix_tensor_count} "
-        f"numel:{matrix_param_numel} "
-        f"weight_decay:{args.matrix_weight_decay:.8f} "
-        f"cumulative_lr_weight_decay:{optimizer_muon_cumulative_lr_weight_decay:.8f} "
-        f"matrix_l2_norm_before:{matrix_l2_norm_before:.8f} "
-        f"matrix_l2_norm_after:{matrix_l2_norm_after:.8f} "
-        "norm_summary_is_sanity_check:not_causal_proof"
     )
 
     # -----------------------------
@@ -1570,48 +1511,6 @@ def main() -> None:
             )
             if quant_stats["keep_float_fp32_audit_candidate_summary"]:
                 log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
-        export_auto_keep_matches = (
-            True
-            if not args.matrix_wd_expect_auto_keep_selected
-            else quant_stats["auto_keep_selected_name"] == args.matrix_wd_expect_auto_keep_selected
-        )
-        export_fp32_scale_matches = (
-            True
-            if args.matrix_wd_expect_fp32_scale_tensors < 0
-            else quant_stats["fp32_scale_tensor_count"] == args.matrix_wd_expect_fp32_scale_tensors
-        )
-        export_min_clip_matches = (
-            True
-            if args.matrix_wd_expect_min_clip_override_tensors < 0
-            else quant_stats["min_clip_override_tensor_count"] == args.matrix_wd_expect_min_clip_override_tensors
-        )
-        export_extra_fp32_keep_matches = (
-            True
-            if args.matrix_wd_expect_extra_fp32_keep_tensors < 0
-            else quant_stats["extra_fp32_keep_tensor_count"] == args.matrix_wd_expect_extra_fp32_keep_tensors
-        )
-        export_guard_ready = (
-            export_auto_keep_matches
-            and export_fp32_scale_matches
-            and export_min_clip_matches
-            and export_extra_fp32_keep_matches
-        )
-        log0(
-            "matrix_weight_decay_export_guard: "
-            f"attribution_ready:{export_guard_ready} "
-            f"auto_keep_selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
-            f"expected_auto_keep:{args.matrix_wd_expect_auto_keep_selected or 'skip'} "
-            f"auto_keep_match:{export_auto_keep_matches} "
-            f"fp32_scale_tensors:{quant_stats['fp32_scale_tensor_count']} "
-            f"expected_fp32_scale_tensors:{args.matrix_wd_expect_fp32_scale_tensors if args.matrix_wd_expect_fp32_scale_tensors >= 0 else 'skip'} "
-            f"fp32_scale_match:{export_fp32_scale_matches} "
-            f"min_clip_override_tensors:{quant_stats['min_clip_override_tensor_count']} "
-            f"expected_min_clip_override_tensors:{args.matrix_wd_expect_min_clip_override_tensors if args.matrix_wd_expect_min_clip_override_tensors >= 0 else 'skip'} "
-            f"min_clip_match:{export_min_clip_matches} "
-            f"extra_fp32_keep_tensors:{quant_stats['extra_fp32_keep_tensor_count']} "
-            f"expected_extra_fp32_keep_tensors:{args.matrix_wd_expect_extra_fp32_keep_tensors if args.matrix_wd_expect_extra_fp32_keep_tensors >= 0 else 'skip'} "
-            f"extra_fp32_keep_match:{export_extra_fp32_keep_matches}"
-        )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
