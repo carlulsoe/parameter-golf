@@ -85,7 +85,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    skip_beta2 = float(os.environ.get("SKIP_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1220,18 +1219,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [p for p in scalar_params if p is not base_model.skip_weights]
-    skip_group_active = base_model.skip_weights.numel() > 0
-    scalar_group_specs = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "betas": (args.beta1, args.beta2)}]
-    if skip_group_active:
-        scalar_group_specs.append(
-            {
-                "params": [base_model.skip_weights],
-                "lr": args.scalar_lr,
-                "base_lr": args.scalar_lr,
-                "betas": (args.beta1, args.skip_beta2),
-            }
-        )
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1248,7 +1237,8 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        scalar_group_specs,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1268,10 +1258,6 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"optimizer_adam_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
-        f"skip_beta2:{args.skip_beta2:.5f} adam_eps:{args.adam_eps:g}"
-    )
-    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1283,33 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-
-    scalar_group_names = ("baseline", "skip") if skip_group_active else ("baseline",)
-
-    def audit_scalar_optimizer(stage: str) -> None:
-        group_fields = [f"groups:{len(optimizer_scalar.param_groups)}"]
-        for group_name, group in zip(scalar_group_names, optimizer_scalar.param_groups, strict=True):
-            tensors = int(len(group["params"]))
-            numel = int(sum(int(p.numel()) for p in group["params"]))
-            beta1, beta2 = group["betas"]
-            group_fields.extend(
-                (
-                    f"{group_name}_tensors:{tensors}",
-                    f"{group_name}_numel:{numel}",
-                    f"{group_name}_betas:({beta1:.5f},{beta2:.5f})",
-                )
-            )
-        if not skip_group_active:
-            group_fields.extend(("skip_tensors:0", "skip_numel:0", "skip_betas:(inactive)"))
-        log0(f"optimizer_scalar_groups stage:{stage} {' '.join(group_fields)}")
-        log0(
-            f"optimizer_skip_scope stage:{stage} active:{skip_group_active} "
-            f"tensors:{1 if skip_group_active else 0} "
-            f"numel:{int(base_model.skip_weights.numel()) if skip_group_active else 0} "
-            f"names:{'skip_weights' if skip_group_active else 'none'}"
-        )
-
-    audit_scalar_optimizer(stage="startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1361,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        audit_scalar_optimizer(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1461,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    audit_scalar_optimizer(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
