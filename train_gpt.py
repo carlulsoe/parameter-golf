@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    skip_lr_mult = float(os.environ.get("SKIP_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1171,6 +1172,8 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if args.skip_lr_mult <= 0.0:
+        raise ValueError(f"SKIP_LR_MULT must be positive, got {args.skip_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1209,6 +1212,8 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    named_params = list(base_model.named_parameters())
+    param_name_by_id = {id(param): name for name, param in named_params}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1219,8 +1224,22 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    skip_params = [base_model.skip_weights] if base_model.skip_weights.numel() > 0 else []
+    split_skip_lr = args.skip_lr_mult != 1.0 and bool(skip_params)
+    scalar_param_groups = [
+        {"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "role": "default"}
+    ]
+    if split_skip_lr:
+        scalar_param_groups.append(
+            {
+                "params": skip_params,
+                "lr": args.scalar_lr * args.skip_lr_mult,
+                "base_lr": args.scalar_lr * args.skip_lr_mult,
+                "role": "skip_weights",
+            }
+        )
+    elif skip_params:
+        scalar_param_groups[0]["params"] = scalar_params + skip_params
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1237,7 +1256,7 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1260,7 +1279,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} skip_lr_mult:{args.skip_lr_mult}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1279,6 +1298,48 @@ def main() -> None:
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
+
+    scalar_default_param_ids = {id(param) for param in scalar_params}
+    scalar_skip_param_ids = {id(param) for param in skip_params}
+
+    def log_scalar_optimizer_groups(stage: str) -> None:
+        group_summaries: dict[str, set[int]] = {}
+        all_group_ids: list[set[int]] = []
+        for idx, group in enumerate(optimizer_scalar.param_groups):
+            role = str(group.get("role", f"group_{idx}"))
+            group_ids = {id(param) for param in group["params"]}
+            group_summaries[role] = group_ids
+            all_group_ids.append(group_ids)
+            names = ",".join(sorted(param_name_by_id[param_id] for param_id in group_ids))
+            numel = sum(int(param.numel()) for param in group["params"])
+            log0(
+                f"optimizer_scalar_group: stage:{stage} idx:{idx} role:{role} "
+                f"lr:{float(group['lr']):.8f} base_lr:{float(group['base_lr']):.8f} "
+                f"tensors:{len(group['params'])} numel:{numel} names:{names or 'none'}"
+            )
+        combined_ids = set().union(*all_group_ids) if all_group_ids else set()
+        total_group_items = sum(len(group_ids) for group_ids in all_group_ids)
+        disjoint = total_group_items == len(combined_ids)
+        exact_match = combined_ids == (scalar_default_param_ids | scalar_skip_param_ids)
+        if split_skip_lr:
+            exact_match = (
+                exact_match
+                and group_summaries.get("default", set()) == scalar_default_param_ids
+                and group_summaries.get("skip_weights", set()) == scalar_skip_param_ids
+                and len(optimizer_scalar.param_groups) == 2
+            )
+        log0(
+            f"optimizer_scalar_groups: stage:{stage} split_active:{split_skip_lr} "
+            f"group_count:{len(optimizer_scalar.param_groups)} disjoint:{disjoint} exact_match:{exact_match}"
+        )
+
+    def optimizer_group_lr(optimizer: torch.optim.Optimizer, role: str, fallback: float = 0.0) -> float:
+        for group in optimizer.param_groups:
+            if str(group.get("role", "")) == role:
+                return float(group["lr"])
+        return fallback
+
+    log_scalar_optimizer_groups("startup")
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1320,6 +1381,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_scalar_optimizer_groups("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1353,6 +1415,12 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                + (
+                    f" scalar_lr:{optimizer_group_lr(optimizer_scalar, 'default', args.scalar_lr):.8f} "
+                    f"skip_lr:{optimizer_group_lr(optimizer_scalar, 'skip_weights', args.scalar_lr):.8f}"
+                    if split_skip_lr
+                    else ""
+                )
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1404,6 +1472,12 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                + (
+                    f" scalar_lr:{optimizer_group_lr(optimizer_scalar, 'default', args.scalar_lr):.8f} "
+                    f"skip_lr:{optimizer_group_lr(optimizer_scalar, 'skip_weights', args.scalar_lr):.8f}"
+                    if split_skip_lr
+                    else ""
+                )
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1493,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_scalar_optimizer_groups("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
