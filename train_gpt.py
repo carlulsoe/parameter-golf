@@ -1089,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not math.isfinite(args.scalar_lr) or args.scalar_lr <= 0.0:
-        raise ValueError(f"SCALAR_LR must be positive and finite, got {args.scalar_lr}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1272,32 +1270,6 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    named_params = list(base_model.named_parameters())
-    param_name_by_id = {id(param): name for name, param in named_params}
-
-    def log_optimizer_scalar_audit(stage: str) -> None:
-        names: list[str] = []
-        numel = 0
-        for group in optimizer_scalar.param_groups:
-            for param in group["params"]:
-                name = param_name_by_id.get(id(param), "<unknown>")
-                names.append(name)
-                numel += int(param.numel())
-        names.sort()
-        joined_names = ",".join(names) if names else "none"
-        group0 = optimizer_scalar.param_groups[0] if optimizer_scalar.param_groups else {}
-        beta1, beta2 = group0.get("betas", (float("nan"), float("nan")))
-        log0(
-            "optimizer_scalar audit: "
-            f"stage:{stage} optimizer:{optimizer_scalar.__class__.__name__} "
-            f"groups:{len(optimizer_scalar.param_groups)} tensors:{len(names)} numel:{numel} "
-            f"base_lr:{float(group0.get('base_lr', 0.0)):.8f} lr:{float(group0.get('lr', 0.0)):.8f} "
-            f"beta1:{float(beta1):.5f} beta2:{float(beta2):.5f}"
-        )
-        log0(f"optimizer_scalar names: stage:{stage} names:{joined_names}", console=False)
-
-    log_optimizer_scalar_audit("startup")
-
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1348,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_scalar_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1448,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_scalar_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
