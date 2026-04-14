@@ -79,6 +79,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    mlp_scale_lr_mult = float(os.environ.get("MLP_SCALE_LR_MULT", 1.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -466,6 +467,9 @@ def median_float(values: list[float]) -> float:
     if len(ordered) % 2:
         return float(ordered[mid])
     return float((ordered[mid - 1] + ordered[mid]) * 0.5)
+
+def params_numel(params: list[nn.Parameter]) -> int:
+    return sum(int(p.numel()) for p in params)
 
 def audit_keep_float_fp32_family(state_dict: dict[str, Tensor]) -> dict[str, object] | None:
     if not INT8_KEEP_FLOAT_FP32_AUDIT_NAME_PATTERNS:
@@ -1109,6 +1113,8 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    if not math.isfinite(args.mlp_scale_lr_mult) or args.mlp_scale_lr_mult <= 0.0:
+        raise ValueError(f"MLP_SCALE_LR_MULT must be finite and positive, got {args.mlp_scale_lr_mult}")
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
@@ -1221,6 +1227,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    mlp_scale_named_params = [(name, p) for name, p in block_named_params if name.endswith("mlp_scale")]
+    mlp_scale_param_ids = {id(p) for _, p in mlp_scale_named_params}
+    mlp_scale_params = [p for _, p in mlp_scale_named_params]
+    other_scalar_params = [p for p in scalar_params if id(p) not in mlp_scale_param_ids]
+    mlp_scale_split_active = args.mlp_scale_lr_mult != 1.0
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1236,8 +1247,21 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_group_specs = (
+        [
+            {"params": other_scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "other_scalar"},
+            {
+                "params": mlp_scale_params,
+                "lr": args.scalar_lr * args.mlp_scale_lr_mult,
+                "base_lr": args.scalar_lr * args.mlp_scale_lr_mult,
+                "group_name": "mlp_scale",
+            },
+        ]
+        if mlp_scale_split_active
+        else [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "group_name": "scalar"}]
+    )
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_group_specs,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1252,6 +1276,38 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def find_scalar_group(group_name: str) -> dict[str, object] | None:
+        for group in optimizer_scalar.param_groups:
+            if group.get("group_name") == group_name:
+                return group
+        return None
+
+    def scalar_group_lr(group_name: str) -> float:
+        group = find_scalar_group(group_name)
+        return float(group["lr"]) if group is not None else 0.0
+
+    def log_optimizer_scalar_groups(stage: str) -> None:
+        scalar_group = find_scalar_group("scalar")
+        other_scalar_group = find_scalar_group("other_scalar")
+        mlp_scale_group = find_scalar_group("mlp_scale")
+        scalar_lr_live = float((other_scalar_group or scalar_group)["lr"])
+        mlp_scale_lr_live = float((mlp_scale_group or scalar_group)["lr"])
+        log0(
+            "optimizer_scalar_groups "
+            f"stage:{stage} "
+            f"mlp_scale_split_active:{mlp_scale_split_active} "
+            f"mlp_scale_tensors:{len(mlp_scale_params)} "
+            f"mlp_scale_numel:{params_numel(mlp_scale_params)} "
+            f"other_scalar_tensors:{len(other_scalar_params) if mlp_scale_split_active else len(scalar_params)} "
+            f"other_scalar_numel:{params_numel(other_scalar_params) if mlp_scale_split_active else params_numel(scalar_params)} "
+            f"scalar_lr:{scalar_lr_live:.8f} "
+            f"mlp_scale_lr:{mlp_scale_lr_live:.8f} "
+            f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult:.8f}"
+        )
+
+    if mlp_scale_split_active:
+        log0(f"optimizer_mlp_scale_names names:{','.join(name for name, _ in mlp_scale_named_params)}")
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1260,8 +1316,10 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult}"
     )
+    log_optimizer_scalar_groups("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1378,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_scalar_groups("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1403,7 +1462,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"scalar_lr:{scalar_group_lr('other_scalar') if mlp_scale_split_active else scalar_group_lr('scalar'):.8f} "
+                f"mlp_scale_lr:{scalar_group_lr('mlp_scale') if mlp_scale_split_active else scalar_group_lr('scalar'):.8f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1419,6 +1480,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_scalar_groups("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
