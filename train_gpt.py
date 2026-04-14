@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    q_gain_lr_mult = float(os.environ.get("Q_GAIN_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,8 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.q_gain_lr_mult <= 0.0:
-        raise ValueError(f"Q_GAIN_LR_MULT must be positive, got {args.q_gain_lr_mult}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1224,11 +1221,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    q_gain_params = [p for name, p in block_named_params if name.endswith("attn.q_gain")]
-    q_gain_param_ids = {id(p) for p in q_gain_params}
-    q_gain_split_active = args.q_gain_lr_mult != 1.0 and len(q_gain_params) > 0
-    if q_gain_split_active:
-        scalar_params = [p for p in scalar_params if id(p) not in q_gain_param_ids]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1244,17 +1236,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "role": "default"}]
-    if q_gain_split_active:
-        scalar_param_groups.append(
-            {
-                "params": q_gain_params,
-                "lr": args.scalar_lr * args.q_gain_lr_mult,
-                "base_lr": args.scalar_lr * args.q_gain_lr_mult,
-                "role": "q_gain",
-            }
-        )
-    optimizer_scalar = torch.optim.Adam(scalar_param_groups, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1273,7 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} q_gain_lr_mult:{args.q_gain_lr_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1294,43 +1281,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
-    def log_scalar_group_audit(stage: str) -> None:
-        named_params = dict(base_model.named_parameters())
-        param_names = {id(param): name for name, param in named_params.items()}
-        expected_default_ids = {id(p) for p in scalar_params}
-        expected_q_gain_ids = q_gain_param_ids if q_gain_split_active else set()
-        all_expected_ids = expected_default_ids | expected_q_gain_ids
-        live_ids: set[int] = set()
-        group_summaries: list[tuple[str, float, float, int, int, str]] = []
-        for group in optimizer_scalar.param_groups:
-            params = [p for p in group["params"] if p is not None]
-            group_ids = {id(p) for p in params}
-            live_ids |= group_ids
-            group_names = sorted(param_names[id(p)] for p in params if id(p) in param_names)
-            group_summaries.append(
-                (
-                    str(group.get("role", "default")),
-                    float(group.get("base_lr", 0.0)),
-                    float(group.get("lr", 0.0)),
-                    len(params),
-                    sum(int(p.numel()) for p in params),
-                    ",".join(group_names),
-                )
-            )
-        disjoint = sum(item[3] for item in group_summaries) == len(live_ids)
-        exact_match = live_ids == all_expected_ids
-        log0(
-            f"optimizer_scalar_groups stage:{stage} split_active:{q_gain_split_active} "
-            f"group_count:{len(group_summaries)} disjoint:{disjoint} exact_match:{exact_match}"
-        )
-        for role, base_lr, lr, tensor_count, numel_count, names in group_summaries:
-            log0(
-                f"optimizer_scalar_group stage:{stage} role:{role} base_lr:{base_lr:.8f} "
-                f"lr:{lr:.8f} tensors:{tensor_count} numel:{numel_count} names:{names}"
-            )
-
-    log_scalar_group_audit("startup")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1369,7 +1319,6 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        log_scalar_group_audit("post_restore_startup")
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1452,15 +1401,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            q_gain_group = next(
-                (group for group in optimizer_scalar.param_groups if str(group.get("role", "default")) == "q_gain"),
-                None,
-            )
-            q_gain_lr = float(q_gain_group["lr"]) if q_gain_group is not None else args.scalar_lr * scale
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"scalar_lr:{args.scalar_lr * scale:.8f} q_gain_lr:{q_gain_lr:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1476,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_group_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
