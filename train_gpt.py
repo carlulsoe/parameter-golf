@@ -76,7 +76,6 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.token_lr_mult <= 0.0:
-        raise ValueError(f"TOKEN_LR_MULT must be positive, got {args.token_lr_mult}")
-    if args.token_lr_mult != 1.0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_LR_MULT != 1.0 requires TIE_EMBEDDINGS=1 so the override stays on the shared token/logit path")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1214,7 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1227,8 +1221,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    token_base_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_lr = token_base_lr * args.token_lr_mult
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1259,57 +1252,13 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def get_group_names(group: dict[str, object]) -> list[str]:
-        names: list[str] = []
-        for param in group["params"]:
-            name = param_name_by_id.get(id(param))
-            if name is not None:
-                names.append(name)
-        return names
-
-    def log_optimizer_lr_audit(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        scalar_group = optimizer_scalar.param_groups[0]
-        head_group = optimizer_head.param_groups[0] if base_model.lm_head is not None else None
-        tok_base_lr = float(tok_group["base_lr"])
-        scalar_base_lr = float(scalar_group["base_lr"])
-        head_base_lr = float(head_group["base_lr"]) if head_group is not None else 0.0
-        tok_lr = float(tok_group["lr"])
-        scalar_lr = float(scalar_group["lr"])
-        head_lr = float(head_group["lr"]) if head_group is not None else 0.0
-        log0(
-            "optimizer_lr_groups "
-            f"stage:{stage} "
-            f"token_lr_mult:{args.token_lr_mult:.5f} "
-            f"tok_base_lr:{tok_base_lr:.8f} tok_lr:{tok_lr:.8f} "
-            f"scalar_base_lr:{scalar_base_lr:.8f} scalar_lr:{scalar_lr:.8f} "
-            f"head_base_lr:{head_base_lr:.8f} head_lr:{head_lr:.8f} "
-            f"tok_to_scalar_base_ratio:{(tok_base_lr / scalar_base_lr):.8f} "
-            f"tok_to_scalar_live_ratio:{(tok_lr / scalar_lr):.8f}"
-        )
-
-    def log_optimizer_tok_scope(stage: str) -> None:
-        tok_group = optimizer_tok.param_groups[0]
-        tok_names = get_group_names(tok_group)
-        tok_numel = sum(int(param.numel()) for param in tok_group["params"])
-        scope = "tied_only" if args.tie_embeddings else "input_only"
-        log0(
-            "optimizer_tok_scope "
-            f"stage:{stage} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{scope} "
-            f"tensors:{len(tok_names)} "
-            f"numel:{tok_numel} "
-            f"names:{','.join(tok_names)}"
-        )
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} token_lr_mult:{args.token_lr_mult:.5f} "
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
@@ -1320,8 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log_optimizer_lr_audit("startup")
-    log_optimizer_tok_scope("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1373,8 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log_optimizer_lr_audit("post_restore_startup")
-    log_optimizer_tok_scope("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1458,10 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-                f"head_lr:{(optimizer_head.param_groups[0]['lr'] if base_model.lm_head is not None else 0.0):.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1477,8 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_lr_audit("final")
-    log_optimizer_tok_scope("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
