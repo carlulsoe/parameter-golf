@@ -60,7 +60,6 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    train_start_shard_audit = bool(int(os.environ.get("TRAIN_START_SHARD_AUDIT", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -779,65 +778,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_data_shard_num_tokens(file: Path) -> int:
-    header = np.fromfile(file, dtype="<i4", count=3)
-    if header.size != 3 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    return int(header[2])
-
-
-def interval_overlap(start_a: int, length_a: int, start_b: int, length_b: int) -> int:
-    end_a = start_a + length_a
-    end_b = start_b + length_b
-    return max(min(end_a, end_b) - max(start_a, start_b), 0)
-
-
-def unique_prefix_overlap(start: int, length: int, prefix_len: int, total_tokens: int) -> int:
-    if length <= 0 or prefix_len <= 0 or total_tokens <= 0:
-        return 0
-    prefix_len = min(prefix_len, total_tokens)
-    if length >= total_tokens:
-        return prefix_len
-    start %= total_tokens
-    end = start + length
-    if end <= total_tokens:
-        return interval_overlap(start, length, 0, prefix_len)
-    first = interval_overlap(start, total_tokens - start, 0, prefix_len)
-    second = interval_overlap(0, end - total_tokens, 0, prefix_len)
-    return first + second
-
-
-def simulate_stream_window(
-    file_token_counts: list[int], start_file_idx: int, start_pos: int, tokens_to_consume: int
-) -> dict[str, int]:
-    num_files = len(file_token_counts)
-    if num_files == 0:
-        raise ValueError("simulate_stream_window requires at least one shard")
-    file_idx = start_file_idx % num_files
-    pos = start_pos
-    remaining = tokens_to_consume
-    wrap_count = 0
-    distinct_shards: set[int] = set()
-    while remaining > 0:
-        avail = file_token_counts[file_idx] - pos
-        if avail <= 0:
-            file_idx = (file_idx + 1) % num_files
-            if file_idx == 0:
-                wrap_count += 1
-            pos = 0
-            continue
-        take = min(remaining, avail)
-        distinct_shards.add(file_idx)
-        pos += take
-        remaining -= take
-    return {
-        "end_file_idx": file_idx,
-        "end_pos": pos,
-        "wrap_count": wrap_count,
-        "distinct_shards": len(distinct_shards),
-    }
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -845,19 +785,12 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_token_counts = [load_data_shard_num_tokens(file) for file in self.files]
-        self.total_dataset_tokens = sum(self.file_token_counts)
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.total_stream_tokens = 0
-        self.wrap_count = 0
-        self.touched_file_indices: set[int] = set()
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        if self.file_idx == 0:
-            self.wrap_count += 1
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -871,22 +804,9 @@ class TokenStream:
                 continue
             k = min(remaining, avail)
             chunks.append(self.tokens[self.pos : self.pos + k])
-            self.touched_file_indices.add(self.file_idx)
             self.pos += k
-            self.total_stream_tokens += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-    def snapshot(self) -> dict[str, int]:
-        return {
-            "file_idx": self.file_idx,
-            "pos": self.pos,
-            "num_files": len(self.files),
-            "total_dataset_tokens": self.total_dataset_tokens,
-            "total_stream_tokens": self.total_stream_tokens,
-            "wrap_count": self.wrap_count,
-            "distinct_shards_touched": len(self.touched_file_indices),
-        }
 
 
 class DistributedTokenLoader:
@@ -897,42 +817,16 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
-        self.next_batch_calls = 0
-        self.total_supervised_tokens = 0
-        self.total_target_shift_tokens = 0
-        self.last_local_tokens = 0
-        self.last_global_tokens = 0
-        self.last_grad_accum_steps = 0
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
-        self.next_batch_calls += 1
-        self.total_supervised_tokens += local_tokens * self.world_size
-        self.total_target_shift_tokens += self.world_size
-        self.last_local_tokens = local_tokens
-        self.last_global_tokens = global_tokens
-        self.last_grad_accum_steps = grad_accum_steps
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-    def snapshot(self) -> dict[str, int]:
-        snapshot = self.stream.snapshot()
-        snapshot.update(
-            {
-                "next_batch_calls": self.next_batch_calls,
-                "total_supervised_tokens": self.total_supervised_tokens,
-                "total_target_shift_tokens": self.total_target_shift_tokens,
-                "last_local_tokens": self.last_local_tokens,
-                "last_global_tokens": self.last_global_tokens,
-                "last_grad_accum_steps": self.last_grad_accum_steps,
-            }
-        )
-        return snapshot
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1381,28 +1275,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    warmup_loader_snapshot: dict[str, int] | None = None
-    measured_loader_start_snapshot: dict[str, int] | None = None
-
-    if args.train_start_shard_audit:
-        startup_loader_snapshot = train_loader.snapshot()
-        startup_local_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-        startup_supervised_tokens = startup_local_tokens * world_size
-        startup_target_shift_tokens = world_size
-        startup_stream_tokens = startup_supervised_tokens + startup_target_shift_tokens
-        log0(
-            "train_start_shard_audit: "
-            f"enabled:True "
-            f"requested_global_tokens_arg:{args.train_batch_tokens} "
-            f"local_tokens_per_microbatch:{startup_local_tokens} "
-            f"supervised_tokens_per_microbatch:{startup_supervised_tokens} "
-            f"target_shift_tokens_per_microbatch:{startup_target_shift_tokens} "
-            f"stream_tokens_per_microbatch:{startup_stream_tokens} "
-            f"world_size:{world_size} "
-            f"grad_accum_steps:{grad_accum_steps} "
-            f"train_shards:{startup_loader_snapshot['num_files']} "
-            f"dataset_total_tokens:{startup_loader_snapshot['total_dataset_tokens']}"
-        )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1447,35 +1319,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        if args.train_start_shard_audit:
-            warmup_loader_snapshot = train_loader.snapshot()
-            log0(
-                "warmup_loader_audit: "
-                f"warmup_steps:{args.warmup_steps} "
-                f"warmup_microbatches:{warmup_loader_snapshot['next_batch_calls']} "
-                f"warmup_supervised_tokens:{warmup_loader_snapshot['total_supervised_tokens']} "
-                f"warmup_target_shift_tokens:{warmup_loader_snapshot['total_target_shift_tokens']} "
-                f"warmup_stream_tokens:{warmup_loader_snapshot['total_stream_tokens']} "
-                f"post_warmup_file_idx:{warmup_loader_snapshot['file_idx']} "
-                f"post_warmup_pos:{warmup_loader_snapshot['pos']} "
-                f"post_warmup_wrap_count:{warmup_loader_snapshot['wrap_count']} "
-                f"post_warmup_distinct_shards:{warmup_loader_snapshot['distinct_shards_touched']}"
-            )
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        if args.train_start_shard_audit:
-            measured_loader_start_snapshot = train_loader.snapshot()
-            rewound_after_warmup = (
-                measured_loader_start_snapshot["file_idx"] == 0
-                and measured_loader_start_snapshot["pos"] == 0
-                and measured_loader_start_snapshot["total_stream_tokens"] == 0
-            )
-            log0(
-                "measured_loader_start: "
-                f"rewound_after_warmup:{rewound_after_warmup} "
-                f"measured_start_file_idx:{measured_loader_start_snapshot['file_idx']} "
-                f"measured_start_pos:{measured_loader_start_snapshot['pos']} "
-                f"measured_start_stream_tokens:{measured_loader_start_snapshot['total_stream_tokens']}"
-            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1575,79 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    if args.train_start_shard_audit:
-        measured_loader_end_snapshot = train_loader.snapshot()
-        dataset_total_tokens = measured_loader_end_snapshot["total_dataset_tokens"]
-        warmup_stream_tokens = warmup_loader_snapshot["total_stream_tokens"] if warmup_loader_snapshot is not None else 0
-        measured_stream_tokens = measured_loader_end_snapshot["total_stream_tokens"]
-        baseline_replay_tokens = unique_prefix_overlap(
-            start=0,
-            length=measured_stream_tokens,
-            prefix_len=warmup_stream_tokens,
-            total_tokens=dataset_total_tokens,
-        )
-        continue_replay_tokens = unique_prefix_overlap(
-            start=warmup_stream_tokens,
-            length=measured_stream_tokens,
-            prefix_len=warmup_stream_tokens,
-            total_tokens=dataset_total_tokens,
-        )
-        continue_unique_union_tokens = min(
-            dataset_total_tokens,
-            min(warmup_stream_tokens, dataset_total_tokens)
-            + min(measured_stream_tokens, dataset_total_tokens)
-            - continue_replay_tokens,
-        )
-        log0(
-            "train_loader_final_audit: "
-            f"measured_microbatches:{measured_loader_end_snapshot['next_batch_calls']} "
-            f"measured_supervised_tokens:{measured_loader_end_snapshot['total_supervised_tokens']} "
-            f"measured_target_shift_tokens:{measured_loader_end_snapshot['total_target_shift_tokens']} "
-            f"measured_stream_tokens:{measured_stream_tokens} "
-            f"measured_end_file_idx:{measured_loader_end_snapshot['file_idx']} "
-            f"measured_end_pos:{measured_loader_end_snapshot['pos']} "
-            f"measured_wrap_count:{measured_loader_end_snapshot['wrap_count']} "
-            f"measured_distinct_shards:{measured_loader_end_snapshot['distinct_shards_touched']} "
-            f"baseline_replay_tokens:{baseline_replay_tokens} "
-            f"continue_replay_tokens:{continue_replay_tokens} "
-            f"continue_avoided_replay_tokens:{baseline_replay_tokens - continue_replay_tokens} "
-            f"continue_unique_union_tokens:{continue_unique_union_tokens}"
-        )
-        if warmup_loader_snapshot is not None:
-            file_token_counts = train_loader.stream.file_token_counts
-            shard_start_offsets = np.cumsum([0, *file_token_counts[:-1]], dtype=np.int64)
-            for shard_offset in (1, 4, 8, 16, 32):
-                start_file_idx = shard_offset % len(file_token_counts)
-                simulated = simulate_stream_window(
-                    file_token_counts=file_token_counts,
-                    start_file_idx=start_file_idx,
-                    start_pos=0,
-                    tokens_to_consume=measured_stream_tokens,
-                )
-                offset_replay_tokens = unique_prefix_overlap(
-                    start=int(shard_start_offsets[start_file_idx]),
-                    length=measured_stream_tokens,
-                    prefix_len=warmup_stream_tokens,
-                    total_tokens=dataset_total_tokens,
-                )
-                offset_unique_union_tokens = min(
-                    dataset_total_tokens,
-                    min(warmup_stream_tokens, dataset_total_tokens)
-                    + min(measured_stream_tokens, dataset_total_tokens)
-                    - offset_replay_tokens,
-                )
-                log0(
-                    "train_start_shard_counterfactual: "
-                    f"offset:{shard_offset} "
-                    f"start_file_idx:{start_file_idx} "
-                    f"replay_tokens:{offset_replay_tokens} "
-                    f"avoided_replay_tokens:{baseline_replay_tokens - offset_replay_tokens} "
-                    f"unique_union_tokens:{offset_unique_union_tokens} "
-                    f"distinct_shards:{simulated['distinct_shards']} "
-                    f"wrap_count:{simulated['wrap_count']} "
-                    f"end_file_idx:{simulated['end_file_idx']} "
-                    f"end_pos:{simulated['end_pos']}"
-                )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
