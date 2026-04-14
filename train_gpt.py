@@ -1089,6 +1089,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if not math.isfinite(args.scalar_lr) or args.scalar_lr <= 0.0:
+        raise ValueError(f"SCALAR_LR must be positive and finite, got {args.scalar_lr}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1252,6 +1254,56 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    param_name_map_lists: dict[int, list[str]] = {}
+    for name, param in base_model.named_parameters():
+        param_name_map_lists.setdefault(id(param), []).append(name)
+    param_name_map = {param_id: tuple(names) for param_id, names in param_name_map_lists.items()}
+
+    def log_optimizer_scalar_audit(stage: str) -> None:
+        scope = "block_scalar_control_params"
+        base_lrs: list[float] = []
+        lrs: list[float] = []
+        total_tensors = 0
+        total_numel = 0
+        named_tensors = 0
+        missing_name_tensors = 0
+        unique_names: set[str] = set()
+        for group in optimizer_scalar.param_groups:
+            base_lrs.append(float(group.get("base_lr", group["lr"])))
+            lrs.append(float(group["lr"]))
+            for param in group["params"]:
+                total_tensors += 1
+                total_numel += int(param.numel())
+                param_names = param_name_map.get(id(param))
+                if param_names is None:
+                    missing_name_tensors += 1
+                    continue
+                named_tensors += 1
+                unique_names.update(param_names)
+        sample_names = ",".join(sorted(unique_names)[:8]) if unique_names else "none"
+        contains_skip_weights = "skip_weights" in unique_names
+        beta1, beta2 = optimizer_scalar.defaults["betas"]
+        log0(
+            "optimizer_scalar_audit "
+            f"stage:{stage} "
+            f"optimizer:{optimizer_scalar.__class__.__name__} "
+            f"scope:{scope} "
+            f"groups:{len(optimizer_scalar.param_groups)} "
+            f"tensors:{total_tensors} "
+            f"numel:{total_numel} "
+            f"named_tensors:{named_tensors} "
+            f"missing_name_tensors:{missing_name_tensors} "
+            f"contains_skip_weights:{contains_skip_weights} "
+            f"base_lr_min:{min(base_lrs):.8f} "
+            f"base_lr_max:{max(base_lrs):.8f} "
+            f"lr_min:{min(lrs):.8f} "
+            f"lr_max:{max(lrs):.8f} "
+            f"beta1:{beta1:.5f} "
+            f"beta2:{beta2:.5f} "
+            f"adam_eps:{optimizer_scalar.defaults['eps']:.8f} "
+            f"sample_names:{sample_names}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1269,6 +1321,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_scalar_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1373,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    log_optimizer_scalar_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1473,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_scalar_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
