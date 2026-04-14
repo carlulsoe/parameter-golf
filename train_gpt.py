@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    mlp_scale_beta1 = float(os.environ.get("MLP_SCALE_BETA1", os.environ.get("BETA1", 0.9)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1171,6 +1172,14 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if not 0.0 <= args.mlp_scale_beta1 < 1.0:
+        raise ValueError(f"MLP_SCALE_BETA1 must be in [0, 1), got {args.mlp_scale_beta1}")
+    if args.adam_eps <= 0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1209,16 +1218,23 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    block_param_names = {id(p): f"blocks.{name}" for name, p in block_named_params}
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
+    scalar_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    mlp_scale_split_active = args.mlp_scale_beta1 != args.beta1
+    mlp_scale_named_params = [(name, p) for name, p in scalar_named_params if name.endswith("mlp_scale")]
+    if mlp_scale_split_active:
+        scalar_named_params = [(name, p) for name, p in scalar_named_params if not name.endswith("mlp_scale")]
+    scalar_params = [p for _, p in scalar_named_params]
+    mlp_scale_params = [p for _, p in mlp_scale_named_params]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1243,6 +1259,15 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_mlp_scale = None
+    if mlp_scale_split_active:
+        optimizer_mlp_scale = torch.optim.Adam(
+            [{"params": mlp_scale_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.mlp_scale_beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_mlp_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1251,6 +1276,32 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    def log_mlp_scale_optimizer_audit(stage: str, completed_updates: int | None = None) -> None:
+        if optimizer_mlp_scale is None:
+            return
+        scalar_tensor_count = sum(len(group["params"]) for group in optimizer_scalar.param_groups)
+        scalar_numel = sum(p.numel() for group in optimizer_scalar.param_groups for p in group["params"])
+        mlp_scale_tensor_count = sum(len(group["params"]) for group in optimizer_mlp_scale.param_groups)
+        mlp_scale_numel = sum(p.numel() for group in optimizer_mlp_scale.param_groups for p in group["params"])
+        scalar_lr = optimizer_scalar.param_groups[0]["lr"]
+        mlp_scale_lr = optimizer_mlp_scale.param_groups[0]["lr"]
+        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
+        mlp_scale_beta1, mlp_scale_beta2 = optimizer_mlp_scale.param_groups[0]["betas"]
+        updates_suffix = "" if completed_updates is None else f" completed_updates:{completed_updates}"
+        log0(
+            f"optimizer_scalar_groups stage:{stage} mlp_scale_split_active:True "
+            f"scalar_tensors:{scalar_tensor_count} scalar_numel:{scalar_numel} "
+            f"mlp_scale_tensors:{mlp_scale_tensor_count} mlp_scale_numel:{mlp_scale_numel} "
+            f"scalar_lr:{scalar_lr:.8f} mlp_scale_lr:{mlp_scale_lr:.8f}"
+            f"{updates_suffix}"
+        )
+        log0(
+            f"optimizer_betas stage:{stage} scalar:({scalar_beta1:.5f},{scalar_beta2:.5f}) "
+            f"mlp_scale:({mlp_scale_beta1:.5f},{mlp_scale_beta2:.5f})"
+        )
+        mlp_scale_names = ",".join(block_param_names[id(p)] for group in optimizer_mlp_scale.param_groups for p in group["params"])
+        log0(f"optimizer_mlp_scale_names stage:{stage} {mlp_scale_names}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1269,6 +1320,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_mlp_scale_optimizer_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1372,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_mlp_scale_optimizer_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1472,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_mlp_scale_optimizer_audit("final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
