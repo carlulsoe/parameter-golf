@@ -88,29 +88,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-
-def muon_momentum_at_step(args: Hyperparameters, step: int) -> float:
-    if args.muon_momentum_warmup_steps <= 0:
-        return args.muon_momentum
-    frac = min(step / args.muon_momentum_warmup_steps, 1.0)
-    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-
-
-def muon_momentum_trace_steps(args: Hyperparameters) -> tuple[int, ...]:
-    if args.muon_momentum_warmup_steps <= 0:
-        return (0, 1, 9, 199)
-    trace_steps = {
-        0,
-        1,
-        9,
-        args.muon_momentum_warmup_steps // 4,
-        args.muon_momentum_warmup_steps // 2,
-        max(args.muon_momentum_warmup_steps - 1, 0),
-        args.muon_momentum_warmup_steps,
-        199,
-    }
-    return tuple(sorted(step for step in trace_steps if step >= 0))
-
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1194,21 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.muon_momentum_warmup_start):
-        raise ValueError(f"MUON_MOMENTUM_WARMUP_START must be finite, got {args.muon_momentum_warmup_start}")
-    if not math.isfinite(args.muon_momentum):
-        raise ValueError(f"MUON_MOMENTUM must be finite, got {args.muon_momentum}")
-    if not (0.0 <= args.muon_momentum_warmup_start < 1.0):
-        raise ValueError(
-            "MUON_MOMENTUM_WARMUP_START must be in [0, 1), "
-            f"got {args.muon_momentum_warmup_start}"
-        )
-    if not (0.0 <= args.muon_momentum < 1.0):
-        raise ValueError(f"MUON_MOMENTUM must be in [0, 1), got {args.muon_momentum}")
-    if args.muon_momentum_warmup_steps < 0:
-        raise ValueError(
-            f"MUON_MOMENTUM_WARMUP_STEPS must be non-negative, got {args.muon_momentum_warmup_steps}"
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1306,18 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    muon_trace_steps = muon_momentum_trace_steps(args)
-    warmup_end_step = args.muon_momentum_warmup_steps if args.muon_momentum_warmup_steps > 0 else 0
-    log0(
-        "muon_momentum_schedule: "
-        f"step_semantics:applied_step_zero_based "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_end_applied_step:{warmup_end_step} "
-        f"step0_momentum:{muon_momentum_at_step(args, 0):.5f} "
-        f"trace_steps:{','.join(str(step) for step in muon_trace_steps)}"
-    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1370,13 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    log0(
-        "muon_momentum_schedule_post_restore: "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"step0_momentum:{muon_momentum_at_step(args, 0):.5f}"
-    )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1436,18 +1379,10 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        muon_momentum = muon_momentum_at_step(args, step)
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-        if step in muon_trace_steps:
-            log0(
-                "muon_momentum_trace: "
-                f"applied_step:{step} "
-                f"live_momentum:{muon_momentum:.5f} "
-                f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-                f"target:{args.muon_momentum:.5f} "
-                f"warmup_steps:{args.muon_momentum_warmup_steps}"
-            )
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1483,17 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    last_applied_step = max(step - 1, 0)
-    log0(
-        "muon_momentum_audit: "
-        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
-        f"target:{args.muon_momentum:.5f} "
-        f"warmup_steps:{args.muon_momentum_warmup_steps} "
-        f"warmup_end_applied_step:{warmup_end_step} "
-        f"last_applied_step:{last_applied_step} "
-        f"last_applied_momentum:{muon_momentum_at_step(args, last_applied_step):.5f} "
-        f"trace_steps_reached:{','.join(str(trace_step) for trace_step in muon_trace_steps if trace_step <= last_applied_step)}"
     )
 
     # -----------------------------
