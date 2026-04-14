@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    scalar_beta2 = float(os.environ.get("SCALAR_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -1089,6 +1090,22 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    for name, value in (
+        ("BETA1", args.beta1),
+        ("BETA2", args.beta2),
+        ("SCALAR_BETA2", args.scalar_beta2),
+        ("ADAM_EPS", args.adam_eps),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value}")
+    if not 0.0 <= args.beta1 < 1.0:
+        raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
+    if not 0.0 <= args.beta2 < 1.0:
+        raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
+    if not 0.0 <= args.scalar_beta2 < 1.0:
+        raise ValueError(f"SCALAR_BETA2 must be in [0, 1), got {args.scalar_beta2}")
+    if args.adam_eps <= 0.0:
+        raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1238,7 +1255,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.scalar_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1252,11 +1269,56 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    param_name_map_lists: dict[int, list[str]] = {}
+    for name, param in base_model.named_parameters():
+        param_name_map_lists.setdefault(id(param), []).append(name)
+    param_name_map = {param_id: tuple(names) for param_id, names in param_name_map_lists.items()}
+
+    def log_optimizer_scalar_audit(stage: str) -> None:
+        base_lrs: list[float] = []
+        lrs: list[float] = []
+        beta2s: list[float] = []
+        total_tensors = 0
+        total_numel = 0
+        named_tensors = 0
+        missing_name_tensors = 0
+        unique_names: set[str] = set()
+        for group in optimizer_scalar.param_groups:
+            base_lrs.append(float(group.get("base_lr", group["lr"])))
+            lrs.append(float(group["lr"]))
+            beta2s.append(float(group["betas"][1]))
+            for param in group["params"]:
+                total_tensors += 1
+                total_numel += int(param.numel())
+                param_names = param_name_map.get(id(param))
+                if param_names is None:
+                    missing_name_tensors += 1
+                    continue
+                named_tensors += 1
+                unique_names.update(param_names)
+        sample_names = ",".join(sorted(unique_names)[:8]) if unique_names else "none"
+        log0(
+            "optimizer_scalar_audit: "
+            f"stage:{stage} optimizer:{optimizer_scalar.__class__.__name__} "
+            f"scope:block_scalar_control_params groups:{len(optimizer_scalar.param_groups)} "
+            f"tensors:{total_tensors} numel:{total_numel} "
+            f"named_tensors:{named_tensors} missing_name_tensors:{missing_name_tensors} "
+            f"contains_skip_weights:{'skip_weights' in unique_names} "
+            f"base_lr_min:{min(base_lrs):.8f} base_lr_max:{max(base_lrs):.8f} "
+            f"lr_min:{min(lrs):.8f} lr_max:{max(lrs):.8f} "
+            f"beta1:{args.beta1:.5f} beta2_min:{min(beta2s):.5f} beta2_max:{max(beta2s):.5f} "
+            f"adam_eps:{args.adam_eps:.8f} sample_names:{sample_names}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"optimizer_adam_config: beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"scalar_beta2:{args.scalar_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1269,6 +1331,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_optimizer_scalar_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1383,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_scalar_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1483,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_scalar_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
