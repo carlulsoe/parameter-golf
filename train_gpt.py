@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_lr_warmup_steps = int(os.environ.get("SCALAR_LR_WARMUP_STEPS", 0))
+    scalar_lr_warmup_start_mult = float(os.environ.get("SCALAR_LR_WARMUP_START_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1269,6 +1271,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        "scalar_lr_warmup_schedule: "
+        f"warmup_steps:{args.scalar_lr_warmup_steps} "
+        f"warmup_start_mult:{args.scalar_lr_warmup_start_mult:.5f} "
+        f"warmup_end_applied_step:{max(args.scalar_lr_warmup_steps - 1, 0)} "
+        f"scope:optimizer_scalar"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1292,6 +1301,22 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    if args.scalar_lr_warmup_steps < 0:
+        raise ValueError(f"SCALAR_LR_WARMUP_STEPS must be non-negative, got {args.scalar_lr_warmup_steps}")
+    if not math.isfinite(args.scalar_lr_warmup_start_mult) or args.scalar_lr_warmup_start_mult <= 0.0:
+        raise ValueError(
+            f"SCALAR_LR_WARMUP_START_MULT must be positive and finite, got {args.scalar_lr_warmup_start_mult}"
+        )
+
+    def scalar_lr_warmup_mult(step: int) -> float:
+        if args.scalar_lr_warmup_steps <= 0:
+            return 1.0
+        if args.scalar_lr_warmup_steps == 1:
+            return 1.0
+        capped_step = min(step, args.scalar_lr_warmup_steps - 1)
+        frac = capped_step / max(args.scalar_lr_warmup_steps - 1, 1)
+        return (1.0 - frac) * args.scalar_lr_warmup_start_mult + frac
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1367,6 +1392,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        scalar_scale = scale * scalar_lr_warmup_mult(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1387,6 +1413,8 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        for group in optimizer_scalar.param_groups:
+            group["lr"] = group["base_lr"] * scalar_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1403,7 +1431,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"lr_mult:{scale:.5f} scalar_lr_mult:{scalar_scale:.5f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1447,13 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log0(
+        "scalar_lr_audit: "
+        f"warmup_steps:{args.scalar_lr_warmup_steps} "
+        f"warmup_start_mult:{args.scalar_lr_warmup_start_mult:.5f} "
+        f"last_scalar_lr_mult:{scalar_scale if step > 0 else scalar_lr_warmup_mult(0):.5f} "
+        f"completed_updates:{step}"
     )
 
     # -----------------------------
