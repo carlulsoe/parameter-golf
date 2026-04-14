@@ -87,8 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
-    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -759,42 +757,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-@torch.no_grad()
-def init_ema_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    ema_state: dict[str, Tensor] = {}
-    for name, tensor in state_dict.items():
-        if tensor.is_floating_point():
-            ema_state[name] = tensor.detach().float().clone()
-    return ema_state
-
-
-@torch.no_grad()
-def update_ema_state_dict(ema_state: dict[str, Tensor], state_dict: dict[str, Tensor], decay: float) -> None:
-    one_minus_decay = 1.0 - decay
-    for name, tensor in state_dict.items():
-        if tensor.is_floating_point():
-            ema_state[name].mul_(decay).add_(tensor.detach().float(), alpha=one_minus_decay)
-
-
-@torch.no_grad()
-def clone_state_dict_to_cpu(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
-
-
-@torch.no_grad()
-def build_export_state_dict(
-    raw_state_dict: dict[str, Tensor],
-    ema_state: dict[str, Tensor] | None,
-) -> dict[str, Tensor]:
-    export_state: dict[str, Tensor] = {}
-    for name, tensor in raw_state_dict.items():
-        if tensor.is_floating_point() and ema_state is not None and name in ema_state:
-            export_state[name] = ema_state[name].to(dtype=tensor.dtype, device="cpu").contiguous()
-        else:
-            export_state[name] = tensor.clone()
-    return export_state
-
-
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1307,15 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
-    if args.ema_start_step < 0:
-        raise ValueError(f"EMA_START_STEP must be non-negative, got {args.ema_start_step}")
-    ema_enabled = args.ema_decay > 0.0
-    log0(
-        f"ema_export:enabled:{ema_enabled} decay:{args.ema_decay:.5f} "
-        f"start_step:{args.ema_start_step}"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1374,8 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    ema_state: dict[str, Tensor] | None = None
-    ema_updates = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1444,13 +1395,6 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        if ema_enabled and step >= args.ema_start_step:
-            current_state = base_model.state_dict()
-            if ema_state is None:
-                ema_state = init_ema_state_dict(current_state)
-            else:
-                update_ema_state_dict(ema_state, current_state, args.ema_decay)
-            ema_updates += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1479,78 +1423,18 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Preserve the true last-step checkpoint and evaluate it exactly, then optionally
-    # build a separate export state (for example EMA) for serialization and audit it.
-
-    torch.cuda.synchronize()
-    t_raw_eval = time.perf_counter()
-    raw_val_loss, raw_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_raw val_loss:{raw_val_loss:.4f} val_bpb:{raw_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_raw_eval):.0f}ms"
-    )
-    log0(f"final_raw_exact val_loss:{raw_val_loss:.8f} val_bpb:{raw_val_bpb:.8f}")
-
-    raw_state_dict = clone_state_dict_to_cpu(base_model.state_dict())
-    export_source = "ema" if ema_state is not None and ema_updates > 0 else "raw"
-    export_state_dict = build_export_state_dict(raw_state_dict, ema_state if export_source == "ema" else None)
-    export_val_loss = raw_val_loss
-    export_val_bpb = raw_val_bpb
-    if export_source != "raw":
-        base_model.load_state_dict(export_state_dict, strict=True)
-        torch.cuda.synchronize()
-        t_export_eval = time.perf_counter()
-        export_val_loss, export_val_bpb = eval_val(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_export source:{export_source} val_loss:{export_val_loss:.4f} "
-            f"val_bpb:{export_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_export_eval):.0f}ms"
-        )
-        log0(
-            f"final_export_exact source:{export_source} val_loss:{export_val_loss:.8f} "
-            f"val_bpb:{export_val_bpb:.8f}"
-        )
-
-    log0(
-        f"export_state source:{export_source} completed_updates:{step} "
-        f"ema_start_step:{args.ema_start_step} ema_updates:{ema_updates}"
-    )
+    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
+    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(raw_state_dict, "final_model_raw.pt")
-        torch.save(export_state_dict, "final_model.pt")
-        raw_model_bytes = os.path.getsize("final_model_raw.pt")
+        torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized raw model: {raw_model_bytes} bytes")
-        log0(f"Serialized export model: {model_bytes} bytes")
+        log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1665,10 +1549,6 @@ def main() -> None:
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(
-        f"final_int8_zlib_roundtrip_source:{export_source} "
-        f"completed_updates:{step} ema_updates:{ema_updates}"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
