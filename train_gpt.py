@@ -78,7 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_lr_mult = float(os.environ.get("MATRIX_LR_MULT", 1.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -357,10 +356,6 @@ INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEAN_GAIN = float(
 INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN = float(
     os.environ.get("INT8_KEEP_FLOAT_FP32_AUDIT_MIN_MEDIAN_GAIN", 0.0)
 )
-MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED = os.environ.get("MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED", "").strip()
-MATRIX_LR_EXPECT_FP32_SCALE_TENSORS = os.environ.get("MATRIX_LR_EXPECT_FP32_SCALE_TENSORS", "").strip()
-MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS = os.environ.get("MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS", "").strip()
-MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS = os.environ.get("MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS", "").strip()
 
 int8_min_clip_name_value_pairs: list[tuple[str, float]] = []
 for entry in INT8_MIN_CLIP_NAME_VALUE_OVERRIDES:
@@ -1176,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.matrix_lr_mult) or args.matrix_lr_mult <= 0.0:
-        raise ValueError(f"MATRIX_LR_MULT must be finite and positive, got {args.matrix_lr_mult}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1237,12 +1230,12 @@ def main() -> None:
     )
     optimizer_muon = Muon(
         matrix_params,
-        lr=args.matrix_lr * args.matrix_lr_mult,
+        lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr * args.matrix_lr_mult
+        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1267,8 +1260,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} matrix_lr_mult:{args.matrix_lr_mult} "
-        f"realized_matrix_base_lr:{args.matrix_lr * args.matrix_lr_mult} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1277,42 +1269,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if any(
-        (
-            MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED,
-            MATRIX_LR_EXPECT_FP32_SCALE_TENSORS,
-            MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS,
-            MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS,
-        )
-    ):
-        log0(
-            "matrix_lr_export_policy: "
-            f"expect_auto_keep_selected:{MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED or 'unset'} "
-            f"expect_fp32_scale_tensors:{MATRIX_LR_EXPECT_FP32_SCALE_TENSORS or 'unset'} "
-            f"expect_min_clip_override_tensors:{MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS or 'unset'} "
-            f"expect_extra_fp32_keep_tensors:{MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS or 'unset'}"
-        )
-
-    def log_optimizer_lr_groups(stage: str, lr_scale: float) -> None:
-        head_group = optimizer_head.param_groups[0] if base_model.lm_head is not None else None
-        log0(
-            "optimizer_lr_groups: "
-            f"stage:{stage} "
-            f"lr_scale:{lr_scale:.8f} "
-            f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
-            f"token_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-            f"matrix_baseline_lr:{args.matrix_lr:.8f} "
-            f"matrix_lr_mult:{args.matrix_lr_mult:.8f} "
-            f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
-            f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
-            f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-            f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-            f"head_base_lr:{head_group['base_lr'] if head_group is not None else 0.0:.8f} "
-            f"head_lr:{head_group['lr'] if head_group is not None else 0.0:.8f}"
-        )
-
-    last_applied_lr_scale = 1.0
-    log_optimizer_lr_groups(stage="startup", lr_scale=last_applied_lr_scale)
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1364,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_lr_groups(stage="post_restore_startup", lr_scale=last_applied_lr_scale)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1397,9 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"lr_scale:{last_applied_lr_scale:.8f} "
-                f"matrix_baseline_lr:{args.matrix_lr:.8f} matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1434,7 +1387,6 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        last_applied_lr_scale = scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1451,9 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"lr_scale:{last_applied_lr_scale:.8f} "
-                f"matrix_baseline_lr:{args.matrix_lr:.8f} matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1469,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_lr_groups(stage="final", lr_scale=last_applied_lr_scale)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1562,43 +1511,6 @@ def main() -> None:
             )
             if quant_stats["keep_float_fp32_audit_candidate_summary"]:
                 log0(f"Int8 kept-float fp32 candidates: {quant_stats['keep_float_fp32_audit_candidate_summary']}")
-        if any(
-            (
-                MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED,
-                MATRIX_LR_EXPECT_FP32_SCALE_TENSORS,
-                MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS,
-                MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS,
-            )
-        ):
-            attribution_ready = True
-            if (
-                MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED
-                and quant_stats["auto_keep_selected_name"] != MATRIX_LR_EXPECT_AUTO_KEEP_SELECTED
-            ):
-                attribution_ready = False
-            if (
-                MATRIX_LR_EXPECT_FP32_SCALE_TENSORS
-                and quant_stats["fp32_scale_tensor_count"] != int(MATRIX_LR_EXPECT_FP32_SCALE_TENSORS)
-            ):
-                attribution_ready = False
-            if (
-                MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS
-                and quant_stats["min_clip_override_tensor_count"] != int(MATRIX_LR_EXPECT_MIN_CLIP_OVERRIDE_TENSORS)
-            ):
-                attribution_ready = False
-            if (
-                MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS
-                and quant_stats["extra_fp32_keep_tensor_count"] != int(MATRIX_LR_EXPECT_EXTRA_FP32_KEEP_TENSORS)
-            ):
-                attribution_ready = False
-            log0(
-                "matrix_lr_export_guard: "
-                f"attribution_ready:{attribution_ready} "
-                f"auto_keep_selected:{quant_stats['auto_keep_selected_name'] or 'none'} "
-                f"fp32_scale_tensors:{quant_stats['fp32_scale_tensor_count']} "
-                f"min_clip_override_tensors:{quant_stats['min_clip_override_tensor_count']} "
-                f"extra_fp32_keep_tensors:{quant_stats['extra_fp32_keep_tensor_count']}"
-            )
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
