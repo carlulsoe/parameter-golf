@@ -58,7 +58,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
-    eval_audit_stride = int(os.environ.get("EVAL_AUDIT_STRIDE", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -77,7 +76,6 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    token_lr_mult = float(os.environ.get("TOKEN_LR_MULT", 1.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -282,91 +280,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-def eval_val_suffix_audit(
-    args: Hyperparameters,
-    model: nn.Module,
-    loss_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int,
-) -> tuple[float, float, int, int]:
-    if stride <= 0:
-        raise ValueError(f"EVAL_AUDIT_STRIDE must be positive, got {stride}")
-    if args.eval_seq_len <= 0:
-        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if stride > args.eval_seq_len:
-        raise ValueError(
-            f"EVAL_AUDIT_STRIDE must be <= EVAL_SEQ_LEN for suffix accounting, got "
-            f"EVAL_AUDIT_STRIDE={stride} EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-
-    total_targets = val_tokens.numel() - 1
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    local_window_count = 0
-    local_scored_target_count = 0
-
-    model.eval()
-    loss_model.eval()
-    with torch.inference_mode():
-        for window_idx, raw_start in enumerate(range(0, total_targets, stride)):
-            if window_idx % world_size != rank:
-                continue
-            window_len = min(args.eval_seq_len, total_targets - raw_start)
-            if window_len <= 0:
-                continue
-            local = val_tokens[raw_start : raw_start + window_len + 1].to(
-                device=device, dtype=torch.int64, non_blocking=True
-            )
-            x = local[:-1][None, :]
-            y = local[1:][None, :]
-            score_start = 0 if raw_start == 0 else max(args.eval_seq_len - stride, 0)
-            score_start = min(score_start, window_len)
-            if score_start >= window_len:
-                continue
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                token_losses = loss_model(x, y, reduction="none").detach().reshape(-1)
-            suffix_losses = token_losses[score_start:]
-            batch_token_count = int(suffix_losses.numel())
-            val_loss_sum += suffix_losses.to(torch.float64).sum()
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)[score_start:]
-            tgt_ids = y.reshape(-1)[score_start:]
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
-            local_window_count += 1
-            local_scored_target_count += batch_token_count
-
-    counts = torch.tensor(
-        [local_window_count, local_scored_target_count],
-        device=device,
-        dtype=torch.int64,
-    )
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
-    loss_model.train()
-    return (
-        float(val_loss.item()),
-        float(bits_per_token * tokens_per_byte),
-        int(counts[0].item()),
-        int(counts[1].item()),
-    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1140,7 +1053,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _logits_and_targets(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1164,11 +1077,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return logits.float(), targets
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
-        logits, targets = self._logits_and_targets(input_ids, target_ids)
-        return F.cross_entropy(logits, targets, reduction=reduction)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -1262,17 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if args.eval_audit_stride < 0:
-        raise ValueError(f"EVAL_AUDIT_STRIDE must be non-negative, got {args.eval_audit_stride}")
-    if args.eval_audit_stride > 0 and args.eval_audit_stride > args.eval_seq_len:
-        raise ValueError(
-            f"EVAL_AUDIT_STRIDE must be <= EVAL_SEQ_LEN, got "
-            f"EVAL_AUDIT_STRIDE={args.eval_audit_stride} EVAL_SEQ_LEN={args.eval_seq_len}"
-        )
-    if args.token_lr_mult <= 0.0:
-        raise ValueError(f"TOKEN_LR_MULT must be positive, got {args.token_lr_mult}")
-    if args.token_lr_mult != 1.0 and not args.tie_embeddings:
-        raise ValueError("TOKEN_LR_MULT overrides require TIE_EMBEDDINGS=1")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1324,7 +1222,6 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_lr *= args.token_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1354,7 +1251,6 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
-    head_base_lr = optimizers[1].param_groups[0]["base_lr"] if base_model.lm_head is not None else 0.0
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1366,27 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        "optimizer_lr_groups stage:startup "
-        f"token_lr_mult:{args.token_lr_mult:.8f} "
-        f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
-        f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
-        f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-        f"head_base_lr:{head_base_lr:.8f}"
-    )
-    log0(
-        "optimizer_tok_scope stage:startup "
-        f"tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_only' if args.tie_embeddings else 'embedding_only'} "
-        "tensors:1 names:tok_emb.weight"
-    )
-    if args.eval_audit_stride > 0:
-        log0(
-            "eval_suffix_audit stage:startup "
-            f"stride:{args.eval_audit_stride} "
-            f"eval_seq_len:{args.eval_seq_len} "
-            "rule:stride_aligned_suffix_accounting final_only:True"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1445,20 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log0(
-            "optimizer_lr_groups stage:post_restore_startup "
-            f"token_lr_mult:{args.token_lr_mult:.8f} "
-            f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
-            f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
-            f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-            f"head_base_lr:{head_base_lr:.8f}"
-        )
-        log0(
-            "optimizer_tok_scope stage:post_restore_startup "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{'tied_only' if args.tie_embeddings else 'embedding_only'} "
-            "tensors:1 names:tok_emb.weight"
-        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1491,10 +1352,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
-                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1545,10 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"tok_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-                f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
-                f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1563,23 +1418,6 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    log0(
-        "optimizer_lr_groups stage:final "
-        f"token_lr_mult:{args.token_lr_mult:.8f} "
-        f"token_base_lr:{optimizer_tok.param_groups[0]['base_lr']:.8f} "
-        f"matrix_base_lr:{optimizer_muon.param_groups[0]['base_lr']:.8f} "
-        f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-        f"token_lr:{optimizer_tok.param_groups[0]['lr']:.8f} "
-        f"matrix_lr:{optimizer_muon.param_groups[0]['lr']:.8f} "
-        f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
-        f"head_base_lr:{head_base_lr:.8f}"
-    )
-    log0(
-        "optimizer_tok_scope stage:final "
-        f"tie_embeddings:{args.tie_embeddings} "
-        f"scope:{'tied_only' if args.tie_embeddings else 'embedding_only'} "
-        "tensors:1 names:tok_emb.weight"
     )
 
     # -----------------------------
@@ -1713,31 +1551,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    if args.eval_audit_stride > 0:
-        torch.cuda.synchronize()
-        t_qaudit = time.perf_counter()
-        audit_val_loss, audit_val_bpb, audit_windows, audit_scored_targets = eval_val_suffix_audit(
-            args,
-            model,
-            base_model,
-            rank,
-            world_size,
-            device,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            args.eval_audit_stride,
-        )
-        torch.cuda.synchronize()
-        log0(
-            "final_int8_zlib_roundtrip_suffix_audit_exact "
-            f"val_loss:{audit_val_loss:.8f} val_bpb:{audit_val_bpb:.8f} "
-            f"stride:{args.eval_audit_stride} windows:{audit_windows} "
-            f"scored_targets:{audit_scored_targets} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_qaudit):.0f}ms "
-            "rule:stride_aligned_suffix_accounting"
-        )
 
     if distributed:
         dist.destroy_process_group()
