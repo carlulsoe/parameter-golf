@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    attn_scale_audit = bool(int(os.environ.get("ATTN_SCALE_AUDIT", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -216,6 +217,46 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+SCALAR_AUDIT_FAMILIES = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weights")
+
+
+def build_scalar_audit_named_params(base_model: nn.Module) -> dict[str, list[tuple[str, nn.Parameter]]]:
+    families: dict[str, list[tuple[str, nn.Parameter]]] = {name: [] for name in SCALAR_AUDIT_FAMILIES}
+    for name, param in base_model.blocks.named_parameters():
+        family_name = name.rsplit(".", 1)[-1]
+        if family_name in families:
+            families[family_name].append((name, param))
+    if hasattr(base_model, "skip_weights"):
+        families["skip_weights"].append(("skip_weights", base_model.skip_weights))
+    return families
+
+
+def tensor_group_l2_norm(tensors: list[Tensor], *, device: torch.device) -> Tensor:
+    total = torch.zeros((), device=device, dtype=torch.float32)
+    for tensor in tensors:
+        total += torch.sum(tensor.detach().float().square())
+    return total.sqrt()
+
+
+def snapshot_named_param_tensors(
+    named_params: list[tuple[str, nn.Parameter]], *, device: torch.device | None = None
+) -> list[Tensor]:
+    snapshots = []
+    for _, param in named_params:
+        tensor = param.detach().float()
+        if device is None:
+            tensor = tensor.cpu()
+        else:
+            tensor = tensor.to(device=device)
+        snapshots.append(tensor.clone())
+    return snapshots
+
+
+def format_scalar_audit_leader(metric_name: str, ratios: dict[str, float]) -> str:
+    leader_family, leader_value = max(ratios.items(), key=lambda item: item[1])
+    return f"{metric_name}_leader:{leader_family} {metric_name}_leader_value:{leader_value:.8f}"
 
 
 def eval_val(
@@ -1221,6 +1262,14 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_audit_named_params = build_scalar_audit_named_params(base_model)
+    scalar_audit_counts = {
+        family_name: (
+            len(named_params),
+            sum(param.numel() for _, param in named_params),
+        )
+        for family_name, named_params in scalar_audit_named_params.items()
+    }
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1252,6 +1301,24 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_scalar_optimizer_audit(stage: str, *, completed_updates: int | None = None) -> None:
+        if not args.attn_scale_audit:
+            return
+        scalar_group_params = optimizer_scalar.param_groups[0]["params"]
+        scalar_tensor_count = len(scalar_group_params)
+        scalar_numel = sum(param.numel() for param in scalar_group_params)
+        scalar_lr_min = min(float(group["lr"]) for group in optimizer_scalar.param_groups)
+        scalar_lr_max = max(float(group["lr"]) for group in optimizer_scalar.param_groups)
+        completed_updates_text = (
+            f" completed_updates:{completed_updates}" if completed_updates is not None else ""
+        )
+        log0(
+            f"optimizer_scalar_group stage:{stage} scalar_tensors:{scalar_tensor_count} "
+            f"scalar_numel:{scalar_numel} attn_scale_in_scalar_group:{all(any(candidate is param for candidate in scalar_group_params) for _, param in scalar_audit_named_params['attn_scale'])} "
+            f"attn_scale_tensors:{scalar_audit_counts['attn_scale'][0]} attn_scale_numel:{scalar_audit_counts['attn_scale'][1]} "
+            f"scalar_lr_min:{scalar_lr_min:.8f} scalar_lr_max:{scalar_lr_max:.8f}{completed_updates_text}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1269,6 +1336,18 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.attn_scale_audit:
+        log0(
+            "attn_scale_audit_startup "
+            f"attn_scale_tensors:{scalar_audit_counts['attn_scale'][0]} attn_scale_numel:{scalar_audit_counts['attn_scale'][1]} "
+            f"mlp_scale_tensors:{scalar_audit_counts['mlp_scale'][0]} mlp_scale_numel:{scalar_audit_counts['mlp_scale'][1]} "
+            f"resid_mix_tensors:{scalar_audit_counts['resid_mix'][0]} resid_mix_numel:{scalar_audit_counts['resid_mix'][1]} "
+            f"q_gain_tensors:{scalar_audit_counts['q_gain'][0]} q_gain_numel:{scalar_audit_counts['q_gain'][1]} "
+            f"skip_weights_tensors:{scalar_audit_counts['skip_weights'][0]} skip_weights_numel:{scalar_audit_counts['skip_weights'][1]} "
+            f"grad_clip_norm:{args.grad_clip_norm:.5f} "
+            "ratio_denominators:step=pre_step_param_norm final=init_param_norm"
+        )
+        log_scalar_optimizer_audit("startup")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1399,15 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    scalar_audit_init_snapshots = (
+        {
+            family_name: snapshot_named_param_tensors(named_params, device=None)
+            for family_name, named_params in scalar_audit_named_params.items()
+        }
+        if args.attn_scale_audit
+        else None
+    )
+    log_scalar_optimizer_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1367,8 +1455,23 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        should_log_train = (
+            args.train_log_every > 0
+            and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        scalar_audit_pre_step_snapshots = None
+        scalar_audit_pre_step_norms = None
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        if args.attn_scale_audit and should_log_train:
+            scalar_audit_pre_step_snapshots = {
+                family_name: snapshot_named_param_tensors(named_params, device=device)
+                for family_name, named_params in scalar_audit_named_params.items()
+            }
+            scalar_audit_pre_step_norms = {
+                family_name: tensor_group_l2_norm(snapshots, device=device)
+                for family_name, snapshots in scalar_audit_pre_step_snapshots.items()
+            }
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1387,24 +1490,58 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-
+        scalar_audit_grad_ratios = None
+        if args.attn_scale_audit and should_log_train and scalar_audit_pre_step_norms is not None:
+            scalar_audit_grad_ratios = {}
+            for family_name, named_params in scalar_audit_named_params.items():
+                grad_tensors = [param.grad for _, param in named_params if param.grad is not None]
+                grad_norm = tensor_group_l2_norm(grad_tensors, device=device) if grad_tensors else torch.zeros((), device=device)
+                denom = scalar_audit_pre_step_norms[family_name].clamp_min(1e-12)
+                scalar_audit_grad_ratios[family_name] = (grad_norm / denom).item()
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        scalar_audit_update_ratios = None
+        if (
+            args.attn_scale_audit
+            and should_log_train
+            and scalar_audit_pre_step_snapshots is not None
+            and scalar_audit_pre_step_norms is not None
+        ):
+            scalar_audit_update_ratios = {}
+            for family_name, named_params in scalar_audit_named_params.items():
+                update_sq = torch.zeros((), device=device, dtype=torch.float32)
+                for (_, param), snapshot in zip(named_params, scalar_audit_pre_step_snapshots[family_name], strict=True):
+                    update_sq += torch.sum((param.detach().float() - snapshot).square())
+                denom = scalar_audit_pre_step_norms[family_name].clamp_min(1e-12)
+                scalar_audit_update_ratios[family_name] = (update_sq.sqrt() / denom).item()
         zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if scalar_audit_grad_ratios is not None and scalar_audit_update_ratios is not None:
+                log0(
+                    "attn_scale_audit_step "
+                    f"step:{step} "
+                    f"attn_scale_grad_to_param:{scalar_audit_grad_ratios['attn_scale']:.8f} "
+                    f"attn_scale_update_to_param:{scalar_audit_update_ratios['attn_scale']:.8f} "
+                    f"mlp_scale_grad_to_param:{scalar_audit_grad_ratios['mlp_scale']:.8f} "
+                    f"mlp_scale_update_to_param:{scalar_audit_update_ratios['mlp_scale']:.8f} "
+                    f"resid_mix_grad_to_param:{scalar_audit_grad_ratios['resid_mix']:.8f} "
+                    f"resid_mix_update_to_param:{scalar_audit_update_ratios['resid_mix']:.8f} "
+                    f"q_gain_grad_to_param:{scalar_audit_grad_ratios['q_gain']:.8f} "
+                    f"q_gain_update_to_param:{scalar_audit_update_ratios['q_gain']:.8f} "
+                    f"skip_weights_grad_to_param:{scalar_audit_grad_ratios['skip_weights']:.8f} "
+                    f"skip_weights_update_to_param:{scalar_audit_update_ratios['skip_weights']:.8f} "
+                    f"{format_scalar_audit_leader('grad_to_param', scalar_audit_grad_ratios)} "
+                    f"{format_scalar_audit_leader('update_to_param', scalar_audit_update_ratios)}"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1419,6 +1556,24 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.attn_scale_audit and scalar_audit_init_snapshots is not None:
+        scalar_audit_drift_ratios = {}
+        final_fields = []
+        for family_name, named_params in scalar_audit_named_params.items():
+            drift_sq = torch.zeros((), dtype=torch.float32)
+            init_sq = torch.zeros((), dtype=torch.float32)
+            for (_, param), init_snapshot in zip(named_params, scalar_audit_init_snapshots[family_name], strict=True):
+                final_tensor = param.detach().float().cpu()
+                drift_sq += torch.sum((final_tensor - init_snapshot).square())
+                init_sq += torch.sum(init_snapshot.square())
+            drift_ratio = (drift_sq.sqrt() / init_sq.sqrt().clamp_min(1e-12)).item()
+            scalar_audit_drift_ratios[family_name] = drift_ratio
+            final_fields.append(f"{family_name}_drift_to_init:{drift_ratio:.8f}")
+        log0(
+            f"attn_scale_audit_final completed_updates:{step} {' '.join(final_fields)} "
+            f"{format_scalar_audit_leader('drift_to_init', scalar_audit_drift_ratios)}"
+        )
+        log_scalar_optimizer_audit("final", completed_updates=step)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
