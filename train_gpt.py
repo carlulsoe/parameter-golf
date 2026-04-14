@@ -84,7 +84,6 @@ class Hyperparameters:
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    scalar_beta1 = float(os.environ.get("SCALAR_BETA1", os.environ.get("BETA1", 0.9)))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -1140,47 +1139,6 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    def validate_adam_hparams() -> None:
-        if not 0.0 <= args.beta1 < 1.0:
-            raise ValueError(f"BETA1 must be in [0, 1), got {args.beta1}")
-        if not 0.0 <= args.scalar_beta1 < 1.0:
-            raise ValueError(f"SCALAR_BETA1 must be in [0, 1), got {args.scalar_beta1}")
-        if not 0.0 <= args.beta2 < 1.0:
-            raise ValueError(f"BETA2 must be in [0, 1), got {args.beta2}")
-        if args.adam_eps <= 0.0:
-            raise ValueError(f"ADAM_EPS must be positive, got {args.adam_eps}")
-
-    def log_optimizer_adam_betas(stage: str) -> None:
-        tok_beta1, tok_beta2 = optimizer_tok.param_groups[0]["betas"]
-        scalar_beta1, scalar_beta2 = optimizer_scalar.param_groups[0]["betas"]
-        head_summary = "head:inactive"
-        if base_model.lm_head is not None:
-            head_beta1, head_beta2 = optimizer_head.param_groups[0]["betas"]
-            head_summary = f"head:({head_beta1:.5f},{head_beta2:.5f})"
-        log0(
-            "optimizer_adam_betas "
-            f"stage:{stage} "
-            f"tok:({tok_beta1:.5f},{tok_beta2:.5f}) "
-            f"scalar:({scalar_beta1:.5f},{scalar_beta2:.5f}) "
-            f"{head_summary}"
-        )
-
-    def log_scalar_optimizer_scope(stage: str) -> None:
-        scalar_names = [
-            f"blocks.{name}"
-            for name, p in block_named_params
-            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        if base_model.skip_weights.numel() > 0:
-            scalar_names.append("skip_weights")
-        log0(
-            "optimizer_scalar_scope "
-            f"stage:{stage} "
-            f"tensors:{len(scalar_params)} "
-            f"numel:{sum(int(p.numel()) for p in scalar_params)} "
-            f"names:{','.join(scalar_names)}"
-        )
-
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1224,8 +1182,6 @@ def main() -> None:
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
-
-    validate_adam_hparams()
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1282,7 +1238,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.scalar_beta1, args.beta2),
+        betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1306,12 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"optimizer_adam_config beta1:{args.beta1:.5f} scalar_beta1:{args.scalar_beta1:.5f} "
-        f"beta2:{args.beta2:.5f} adam_eps:{args.adam_eps:.8f}"
-    )
-    log_optimizer_adam_betas(stage="startup")
-    log_scalar_optimizer_scope(stage="startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1370,8 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_adam_betas(stage="post_restore_startup")
-        log_scalar_optimizer_scope(stage="post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1471,8 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_adam_betas(stage="final")
-    log_scalar_optimizer_scope(stage="final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
