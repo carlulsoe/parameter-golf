@@ -85,6 +85,7 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    token_beta2 = float(os.environ.get("TOKEN_BETA2", os.environ.get("BETA2", 0.95)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -757,6 +758,33 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def validate_adam_beta(name: str, value: float) -> None:
+    if not math.isfinite(value) or not (0.0 <= value < 1.0):
+        raise ValueError(f"{name} must be finite and in [0, 1), got {value}")
+
+
+def format_optimizer_betas(optimizer: torch.optim.Optimizer | None) -> str:
+    if optimizer is None or not optimizer.param_groups:
+        return "(inactive)"
+    beta1, beta2 = optimizer.param_groups[0]["betas"]
+    return f"({beta1:.5f},{beta2:.5f})"
+
+
+def log_optimizer_betas(
+    log_fn,
+    stage: str,
+    optimizer_tok: torch.optim.Optimizer,
+    optimizer_head: torch.optim.Optimizer | None,
+    optimizer_scalar: torch.optim.Optimizer,
+) -> None:
+    log_fn(
+        f"optimizer_betas stage:{stage} "
+        f"tok:{format_optimizer_betas(optimizer_tok)} "
+        f"head:{format_optimizer_betas(optimizer_head)} "
+        f"scalar:{format_optimizer_betas(optimizer_scalar)}"
+    )
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1221,10 +1249,15 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    validate_adam_beta("BETA1", args.beta1)
+    validate_adam_beta("BETA2", args.beta2)
+    validate_adam_beta("TOKEN_BETA2", args.token_beta2)
+    if args.token_beta2 != args.beta2 and not args.tie_embeddings:
+        raise ValueError("TOKEN_BETA2 requires TIE_EMBEDDINGS=1 when it differs from BETA2")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
+        betas=(args.beta1, args.token_beta2),
         eps=args.adam_eps,
         fused=True,
     )
@@ -1251,6 +1284,8 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    else:
+        optimizer_head = None
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1258,10 +1293,15 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
+        f"optimizer_beta_config beta1:{args.beta1:.5f} beta2:{args.beta2:.5f} "
+        f"token_beta2:{args.token_beta2:.5f} adam_eps:{args.adam_eps:.8f}"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log_optimizer_betas(log0, "startup", optimizer_tok, optimizer_head, optimizer_scalar)
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1320,6 +1360,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_optimizer_betas(log0, "post_restore_startup", optimizer_tok, optimizer_head, optimizer_scalar)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1419,6 +1460,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log_optimizer_betas(log0, "final", optimizer_tok, optimizer_head, optimizer_scalar)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
