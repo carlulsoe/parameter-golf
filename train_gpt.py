@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    skip_weights_lr_mult = float(os.environ.get("SKIP_WEIGHTS_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1210,8 +1209,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    if args.skip_weights_lr_mult <= 0.0:
-        raise ValueError(f"SKIP_WEIGHTS_LR_MULT must be positive, got {args.skip_weights_lr_mult}")
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1222,8 +1219,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    split_skip_weights = base_model.skip_weights.numel() > 0 and not math.isclose(args.skip_weights_lr_mult, 1.0)
-    if base_model.skip_weights.numel() > 0 and not split_skip_weights:
+    if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1247,16 +1243,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    optimizer_skip_weights = None
-    if split_skip_weights:
-        skip_weights_lr = args.scalar_lr * args.skip_weights_lr_mult
-        optimizer_skip_weights = torch.optim.Adam(
-            [{"params": [base_model.skip_weights], "lr": skip_weights_lr, "base_lr": skip_weights_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_skip_weights)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1266,23 +1252,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    def log_optimizer_scope(stage: str) -> None:
-        scalar_numel = sum(int(p.numel()) for p in scalar_params)
-        skip_numel = int(base_model.skip_weights.numel())
-        skip_lr = optimizer_skip_weights.param_groups[0]["base_lr"] if optimizer_skip_weights is not None else args.scalar_lr
-        log0(
-            f"optimizer_scalar_groups stage:{stage} "
-            f"skip_weights_split_active:{split_skip_weights} "
-            f"scalar_tensors:{len(scalar_params)} scalar_numel:{scalar_numel} "
-            f"skip_weights_tensors:{1 if base_model.skip_weights.numel() > 0 else 0} "
-            f"skip_weights_numel:{skip_numel} "
-            f"scalar_base_lr:{optimizer_scalar.param_groups[0]['base_lr']:.8f} "
-            f"skip_weights_base_lr:{skip_lr:.8f} "
-            f"skip_weights_lr_mult:{args.skip_weights_lr_mult:.8f}"
-        )
-        if base_model.skip_weights.numel() > 0:
-            log0("optimizer_skip_weights_names: skip_weights")
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1291,10 +1260,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"skip_weights_lr_mult:{args.skip_weights_lr_mult}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log_optimizer_scope("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1353,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_optimizer_scope("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1453,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_optimizer_scope("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
