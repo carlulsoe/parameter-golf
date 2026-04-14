@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1283,9 +1282,6 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
-
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -1324,19 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-
-    ema_state: dict[str, Tensor] = {}
-    if args.ema_decay > 0.0:
-        for name, tensor in base_model.state_dict().items():
-            if tensor.is_floating_point():
-                ema_state[name] = tensor.detach().clone()
-        log0(
-            f"ema_decay:{args.ema_decay:.6f} "
-            f"ema_float_tensors:{len(ema_state)} "
-            f"ema_float_numel:{sum(int(t.numel()) for t in ema_state.values())}"
-        )
-    else:
-        log0("ema_decay:0.000000 ema_float_tensors:0 ema_float_numel:0")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1409,13 +1392,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if ema_state:
-            ema_mix = 1.0 - args.ema_decay
-            with torch.no_grad():
-                for name, tensor in base_model.state_dict().items():
-                    ema_tensor = ema_state.get(name)
-                    if ema_tensor is not None:
-                        ema_tensor.lerp_(tensor.detach(), ema_mix)
         zero_grad_all()
 
         step += 1
@@ -1449,27 +1425,6 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-
-    if ema_state:
-        raw_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
-        delta_sum = 0.0
-        raw_sum = 0.0
-        export_state = dict(raw_state)
-        for name, ema_tensor in ema_state.items():
-            raw_tensor = raw_state[name]
-            delta_sum += float((ema_tensor.float() - raw_tensor.float()).abs().sum().item())
-            raw_sum += float(raw_tensor.float().abs().sum().item())
-            export_state[name] = ema_tensor.detach().clone()
-        delta_to_raw_ratio = delta_sum / max(raw_sum, 1e-12)
-        log0(
-            "ema_export: "
-            f"enabled:True decay:{args.ema_decay:.6f} "
-            f"float_tensors:{len(ema_state)} "
-            f"delta_to_raw_ratio:{delta_to_raw_ratio:.8f}"
-        )
-        base_model.load_state_dict(export_state, strict=True)
-    else:
-        log0("ema_export: enabled:False decay:0.000000 float_tensors:0 delta_to_raw_ratio:0.00000000")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
