@@ -78,7 +78,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    matrix_lr_min_scale = float(os.environ.get("MATRIX_LR_MIN_SCALE", 0.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1172,8 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if not math.isfinite(args.matrix_lr_min_scale) or not (0.0 <= args.matrix_lr_min_scale <= 1.0):
-        raise ValueError(f"MATRIX_LR_MIN_SCALE must be finite and in [0, 1], got {args.matrix_lr_min_scale}")
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1271,7 +1268,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"warmdown_schedule:warmdown_iters:{args.warmdown_iters} matrix_lr_min_scale:{args.matrix_lr_min_scale:.5f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1331,10 +1327,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    matrix_lr_floor_active_steps = 0
-    matrix_lr_floor_first_active_step: int | None = None
-    last_shared_scale = 1.0
-    last_matrix_scale = 1.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1374,14 +1366,7 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        shared_scale = lr_mul(step, elapsed_ms)
-        matrix_scale = max(shared_scale, args.matrix_lr_min_scale)
-        if matrix_scale > shared_scale:
-            matrix_lr_floor_active_steps += 1
-            if matrix_lr_floor_first_active_step is None:
-                matrix_lr_floor_first_active_step = step
-        last_shared_scale = shared_scale
-        last_matrix_scale = matrix_scale
+        scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1401,7 +1386,6 @@ def main() -> None:
 
         for opt in optimizers:
             for group in opt.param_groups:
-                scale = matrix_scale if opt is optimizer_muon else shared_scale
                 group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
@@ -1419,8 +1403,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"lr_shared_scale:{last_shared_scale:.5f} lr_matrix_scale:{last_matrix_scale:.5f}"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1432,12 +1415,6 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        f"matrix_lr_floor_audit:min_scale:{args.matrix_lr_min_scale:.5f} "
-        f"first_active_step:{matrix_lr_floor_first_active_step if matrix_lr_floor_first_active_step is not None else 'none'} "
-        f"active_steps:{matrix_lr_floor_active_steps} last_shared_scale:{last_shared_scale:.5f} "
-        f"last_matrix_scale:{last_matrix_scale:.5f}"
-    )
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
