@@ -87,7 +87,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    control_weight_decay = float(os.environ.get("CONTROL_WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1090,10 +1089,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not math.isfinite(args.control_weight_decay) or args.control_weight_decay < 0.0:
-        raise ValueError(
-            f"CONTROL_WEIGHT_DECAY must be finite and non-negative, got {args.control_weight_decay}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1219,20 +1214,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    control_named_params = [
-        (name, p)
-        for name, p in block_named_params
-        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    control_params = [p for _, p in control_named_params]
     if base_model.skip_weights.numel() > 0:
-        control_named_params.append(("skip_weights", base_model.skip_weights))
-        control_params.append(base_model.skip_weights)
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1248,43 +1236,12 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    scalar_group_specs: list[dict[str, object]] = []
-    if scalar_params:
-        scalar_group_specs.append({"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr})
-    scalar_optimizer_name = "Adam"
-    if args.control_weight_decay > 0.0:
-        scalar_optimizer_name = "AdamW"
-        if scalar_group_specs:
-            scalar_group_specs[0]["weight_decay"] = 0.0
-        if control_params:
-            scalar_group_specs.append(
-                {
-                    "params": control_params,
-                    "lr": args.scalar_lr,
-                    "base_lr": args.scalar_lr,
-                    "weight_decay": args.control_weight_decay,
-                }
-            )
-        optimizer_scalar = torch.optim.AdamW(
-            scalar_group_specs,
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-    else:
-        if control_params:
-            if scalar_group_specs:
-                scalar_group_specs[0]["params"] = scalar_params + control_params
-            else:
-                scalar_group_specs.append(
-                    {"params": control_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}
-                )
-        optimizer_scalar = torch.optim.Adam(
-            scalar_group_specs,
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1305,34 +1262,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    control_param_numel = sum(int(p.numel()) for p in control_params)
-    scalar_param_numel = sum(int(p.numel()) for p in scalar_params)
-
-    def log_scalar_optimizer_audit(stage: str) -> None:
-        control_names = ",".join(name for name, _ in control_named_params)
-        log0(
-            "optimizer_control_scope: "
-            f"stage:{stage} active:{args.control_weight_decay > 0.0} "
-            f"patterns:{','.join(CONTROL_TENSOR_NAME_PATTERNS)} "
-            f"tensors:{len(control_named_params)} numel:{control_param_numel} "
-            f"names:{control_names or 'none'}"
-        )
-        group_parts: list[str] = []
-        for idx, group in enumerate(optimizer_scalar.param_groups):
-            group_parts.append(
-                f"group{idx}_tensors:{len(group['params'])} "
-                f"group{idx}_numel:{sum(int(p.numel()) for p in group['params'])} "
-                f"group{idx}_betas:({group['betas'][0]:.5f},{group['betas'][1]:.5f}) "
-                f"group{idx}_weight_decay:{float(group.get('weight_decay', 0.0)):.8f}"
-            )
-        log0(
-            "optimizer_scalar_groups: "
-            f"stage:{stage} optimizer:{scalar_optimizer_name} groups:{len(optimizer_scalar.param_groups)} "
-            f"scalar_tensors:{len(scalar_params)} scalar_numel:{scalar_param_numel} "
-            + " ".join(group_parts)
-        )
-
-    log_scalar_optimizer_audit("startup")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
@@ -1391,7 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_scalar_optimizer_audit("post_restore_startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1491,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_scalar_optimizer_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
