@@ -170,6 +170,42 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+def muon_momentum_for_update(args: Hyperparameters, update_idx: int) -> float:
+    if args.muon_momentum_warmup_steps <= 0:
+        return args.muon_momentum
+    frac = min(update_idx / args.muon_momentum_warmup_steps, 1.0)
+    return (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+
+
+def muon_momentum_schedule_state(args: Hyperparameters, completed_updates: int) -> dict[str, object]:
+    target_reached_update = max(args.muon_momentum_warmup_steps, 0)
+    last_subtarget_update = target_reached_update - 1 if target_reached_update > 0 else -1
+    last_applied_update = completed_updates - 1 if completed_updates > 0 else -1
+    target_applied_by_last_update = last_applied_update >= target_reached_update and completed_updates > 0
+    if target_reached_update <= 0:
+        applied_fraction = 1.0 if target_applied_by_last_update else 0.0
+    else:
+        applied_fraction = min(max(last_applied_update, 0) / target_reached_update, 1.0)
+    return {
+        "update_semantics": "applied_update_zero_based",
+        "target_reached_update": target_reached_update,
+        "last_subtarget_update": last_subtarget_update,
+        "completed_updates": completed_updates,
+        "last_applied_update": last_applied_update,
+        "last_applied_momentum": (
+            muon_momentum_for_update(args, last_applied_update) if last_applied_update >= 0 else float("nan")
+        ),
+        "next_update_momentum": muon_momentum_for_update(args, completed_updates),
+        "target_applied_by_last_update": target_applied_by_last_update,
+        "applied_warmup_fraction": applied_fraction,
+        "update0_momentum": muon_momentum_for_update(args, 0),
+    }
+
+
+def format_muon_momentum(value: float) -> str:
+    return "none" if not math.isfinite(value) else f"{value:.5f}"
+
+
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
@@ -1268,6 +1304,17 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    muon_schedule = muon_momentum_schedule_state(args, completed_updates=0)
+    log0(
+        "muon_momentum_schedule: "
+        f"update_semantics:{muon_schedule['update_semantics']} "
+        f"warmup_start:{args.muon_momentum_warmup_start:.5f} "
+        f"target:{args.muon_momentum:.5f} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps} "
+        f"last_subtarget_update:{muon_schedule['last_subtarget_update']} "
+        f"target_reached_update:{muon_schedule['target_reached_update']} "
+        f"update0_momentum:{format_muon_momentum(float(muon_schedule['update0_momentum']))}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1379,8 +1426,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        muon_momentum = muon_momentum_for_update(args, step)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1401,9 +1447,12 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            muon_schedule = muon_momentum_schedule_state(args, completed_updates=step)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"applied_muon_momentum:{format_muon_momentum(float(muon_schedule['last_applied_momentum']))} "
+                f"next_muon_momentum:{format_muon_momentum(float(muon_schedule['next_update_momentum']))}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1418,6 +1467,19 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    muon_schedule = muon_momentum_schedule_state(args, completed_updates=step)
+    log0(
+        "muon_momentum_audit: "
+        f"update_semantics:{muon_schedule['update_semantics']} "
+        f"completed_updates:{muon_schedule['completed_updates']} "
+        f"last_subtarget_update:{muon_schedule['last_subtarget_update']} "
+        f"target_reached_update:{muon_schedule['target_reached_update']} "
+        f"last_applied_update:{muon_schedule['last_applied_update']} "
+        f"last_applied_momentum:{format_muon_momentum(float(muon_schedule['last_applied_momentum']))} "
+        f"next_update_momentum:{format_muon_momentum(float(muon_schedule['next_update_momentum']))} "
+        f"target_applied_by_last_update:{int(bool(muon_schedule['target_applied_by_last_update']))} "
+        f"applied_warmup_fraction:{float(muon_schedule['applied_warmup_fraction']):.5f}"
     )
 
     # -----------------------------
