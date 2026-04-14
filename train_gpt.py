@@ -87,6 +87,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    mlp_scale_lr_mult = float(os.environ.get("MLP_SCALE_LR_MULT", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -778,6 +779,22 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
+def optimizer_group_membership(
+    optimizer: torch.optim.Optimizer | None,
+    param_name_by_id: dict[int, str],
+) -> tuple[list[str], int]:
+    if optimizer is None:
+        return [], 0
+    names: list[str] = []
+    numel = 0
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            names.append(param_name_by_id.get(id(param), "<unknown>"))
+            numel += int(param.numel())
+    names.sort()
+    return names, numel
+
+
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -1183,6 +1200,9 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.mlp_scale_lr_mult <= 0.0:
+        raise ValueError(f"MLP_SCALE_LR_MULT must be positive, got {args.mlp_scale_lr_mult}")
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1208,20 +1228,32 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    param_name_by_id = {id(param): name for name, param in base_model.named_parameters()}
     block_named_params = list(base_model.blocks.named_parameters())
+    mlp_scale_param_names = sorted(
+        f"blocks.{name}" for name, _ in block_named_params if name.endswith("mlp_scale")
+    )
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    scalar_params: list[Tensor] = []
+    mlp_scale_params: list[Tensor] = []
+    for name, p in block_named_params:
+        if p.ndim >= 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            continue
+        if name.endswith("mlp_scale"):
+            mlp_scale_params.append(p)
+        else:
+            scalar_params.append(p)
+    mlp_scale_split_active = not math.isclose(args.mlp_scale_lr_mult, 1.0)
+    if not mlp_scale_split_active:
+        scalar_params.extend(mlp_scale_params)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    mlp_scale_lr = args.scalar_lr * args.mlp_scale_lr_mult
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1242,7 +1274,17 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    optimizer_mlp_scale = None
+    if mlp_scale_split_active:
+        optimizer_mlp_scale = torch.optim.Adam(
+            [{"params": mlp_scale_params, "lr": mlp_scale_lr, "base_lr": mlp_scale_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if optimizer_mlp_scale is not None:
+        optimizers.append(optimizer_mlp_scale)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1252,6 +1294,29 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    def log_mlp_scale_group_audit(stage: str, completed_updates: int, cumulative_scalar_lr: float, cumulative_mlp_scale_lr: float) -> None:
+        scalar_names, scalar_numel = optimizer_group_membership(optimizer_scalar, param_name_by_id)
+        mlp_scale_group_names, mlp_scale_group_numel = optimizer_group_membership(optimizer_mlp_scale, param_name_by_id)
+        live_scalar_lr = float(optimizer_scalar.param_groups[0]["lr"])
+        live_mlp_scale_lr = float(optimizer_mlp_scale.param_groups[0]["lr"]) if optimizer_mlp_scale is not None else live_scalar_lr
+        log0(
+            "optimizer_scalar_groups: "
+            f"stage:{stage} "
+            f"mlp_scale_split_active:{mlp_scale_split_active} "
+            f"scalar_tensors:{len(scalar_names)} scalar_numel:{scalar_numel} "
+            f"mlp_scale_tensors:{len(mlp_scale_group_names) if optimizer_mlp_scale is not None else len(mlp_scale_param_names)} "
+            f"mlp_scale_numel:{mlp_scale_group_numel if optimizer_mlp_scale is not None else sum(int(base_model.get_parameter(name).numel()) for name in mlp_scale_param_names)} "
+            f"scalar_lr:{live_scalar_lr:.8f} mlp_scale_lr:{live_mlp_scale_lr:.8f} "
+            f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult:.8f} "
+            f"completed_updates:{completed_updates} "
+            f"cumulative_scalar_lr:{cumulative_scalar_lr:.8f} "
+            f"cumulative_mlp_scale_lr:{cumulative_mlp_scale_lr:.8f}"
+        )
+        log0(
+            "optimizer_mlp_scale_names: "
+            f"stage:{stage} names:{','.join(mlp_scale_group_names if optimizer_mlp_scale is not None else mlp_scale_param_names)}"
+        )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1260,7 +1325,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1269,6 +1335,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log_mlp_scale_group_audit(
+        stage="startup",
+        completed_updates=0,
+        cumulative_scalar_lr=0.0,
+        cumulative_mlp_scale_lr=0.0,
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1320,6 +1392,12 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log_mlp_scale_group_audit(
+            stage="post_restore_startup",
+            completed_updates=0,
+            cumulative_scalar_lr=0.0,
+            cumulative_mlp_scale_lr=0.0,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1327,6 +1405,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    cumulative_scalar_lr = 0.0
+    cumulative_mlp_scale_lr = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1387,6 +1467,10 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        cumulative_scalar_lr += float(optimizer_scalar.param_groups[0]["lr"])
+        cumulative_mlp_scale_lr += (
+            float(optimizer_mlp_scale.param_groups[0]["lr"]) if optimizer_mlp_scale is not None else float(optimizer_scalar.param_groups[0]["lr"])
+        )
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
@@ -1405,6 +1489,16 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if mlp_scale_split_active:
+                log0(
+                    "mlp_scale_lr_trace: "
+                    f"applied_step:{step - 1} "
+                    f"scalar_lr:{optimizer_scalar.param_groups[0]['lr']:.8f} "
+                    f"mlp_scale_lr:{optimizer_mlp_scale.param_groups[0]['lr']:.8f} "
+                    f"mlp_scale_lr_mult:{args.mlp_scale_lr_mult:.8f} "
+                    f"cumulative_scalar_lr:{cumulative_scalar_lr:.8f} "
+                    f"cumulative_mlp_scale_lr:{cumulative_mlp_scale_lr:.8f}"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1418,6 +1512,12 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    log_mlp_scale_group_audit(
+        stage="final",
+        completed_updates=step,
+        cumulative_scalar_lr=cumulative_scalar_lr,
+        cumulative_mlp_scale_lr=cumulative_mlp_scale_lr,
     )
 
     # -----------------------------
