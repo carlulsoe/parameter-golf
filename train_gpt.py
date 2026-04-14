@@ -28,8 +28,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-DEFAULT_TIED_EMBED_LR = 0.05
-
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -77,7 +75,7 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", DEFAULT_TIED_EMBED_LR))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -1173,14 +1171,6 @@ def main() -> None:
         raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
     if args.eval_seq_len <= 0:
         raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-    if (
-        not args.tie_embeddings
-        and not math.isclose(args.tied_embed_lr, DEFAULT_TIED_EMBED_LR, rel_tol=0.0, abs_tol=0.0)
-    ):
-        raise ValueError(
-            "Non-default TIED_EMBED_LR requires TIE_EMBEDDINGS=1 so the override stays scoped "
-            "to the shared embedding/logit matrix."
-        )
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1280,26 +1270,6 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    token_optimizer_tensor_count = len(optimizer_tok.param_groups[0]["params"])
-    token_optimizer_numel = sum(int(p.numel()) for p in optimizer_tok.param_groups[0]["params"])
-
-    def log_token_optimizer_audit(stage: str) -> None:
-        group = optimizer_tok.param_groups[0]
-        log0(
-            "optimizer_tok audit: "
-            f"stage:{stage} "
-            f"optimizer:{optimizer_tok.__class__.__name__} "
-            f"tie_embeddings:{args.tie_embeddings} "
-            f"scope:{'tied_shared_matrix' if args.tie_embeddings else 'input_embedding_only'} "
-            f"tensors:{token_optimizer_tensor_count} "
-            f"numel:{token_optimizer_numel} "
-            f"names:tok_emb.weight "
-            f"configured_tied_embed_lr:{args.tied_embed_lr:.8f} "
-            f"active_token_lr:{token_lr:.8f} "
-            f"base_lr:{float(group['base_lr']):.8f} "
-            f"lr:{float(group['lr']):.8f}"
-        )
-
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1326,7 +1296,6 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
-        log_token_optimizer_audit("startup")
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1351,9 +1320,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log_token_optimizer_audit("post_restore_startup")
-    else:
-        log_token_optimizer_audit("startup")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1453,7 +1419,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    log_token_optimizer_audit("final")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
